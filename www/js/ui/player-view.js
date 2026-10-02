@@ -13,6 +13,7 @@ const JUMP_MODES = [
 export function outputLabels(output) {
   if (output.mode === 'split') return output.swap ? ['Pistas', 'Click y guía'] : ['Click y guía', 'Pistas'];
   if (output.mode === 'monitor') return output.swap ? ['Sala', 'Monitor'] : ['Monitor', 'Sala'];
+  if (output.mode === 'multi') return ['Click y guía', 'Pistas'];
   return ['Izquierdo', 'Derecho'];
 }
 
@@ -240,7 +241,7 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
   const syncStatic = (snap) => {
     const player = entry.player;
     const output = app.settings.output;
-    const labels = outputLabels(output);
+    const labels = outputLabels({ ...output, mode: app.engine.effectiveMode });
     setText(meterLabelLeft, labels[0]);
     setText(meterLabelRight, labels[1]);
     const playing = snap.state === 'playing';

@@ -152,6 +152,7 @@ async function boot() {
 
   controls.init();
   installPlatform();
+  app.startDevices();
   store.requestPersistence();
 
   window.addEventListener('unhandledrejection', (event) => {

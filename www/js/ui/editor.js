@@ -444,8 +444,9 @@ export function openEditor(song, tab = 'general') {
       },
     });
     const hasOwnClick = song.tracks.some((track) => isClickName(track.name));
+    const ownClickNotice = h('div', { class: 'notice info' }, icon('info', 20), h('div', {}, h('b', { text: 'Esta canción trae su propia pista de click' }), h('p', { text: 'El click de Escena está silenciado durante la canción para no duplicarlo; el pre-conteo sí suena.' })));
     content.replaceChildren(
-      hasOwnClick ? h('div', { class: 'notice info' }, icon('info', 20), h('div', {}, h('b', { text: 'Esta canción trae su propia pista de click' }), h('p', { text: 'El click de Escena está silenciado durante la canción para no duplicarlo; el pre-conteo sí suena.' }))) : null,
+      ...(hasOwnClick ? [ownClickNotice] : []),
       h('h3', { class: 'sub', text: 'Click' }),
       settingRow('Click durante la canción', 'Metrónomo generado desde el mapa de tempo', clickOn.el),
       field('Sonido', h('div', { class: 'inline' }, soundSwitch.el, preview)),

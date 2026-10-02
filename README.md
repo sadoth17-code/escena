@@ -6,6 +6,7 @@ Reproductor profesional de secuencias multitrack para músicos, bandas, iglesias
 - Click con mapa de tempo y pre-conteo.
 - Guías de voz por secciones (Intro, Verso, Coro, Puente…) que avisan antes de cada cambio.
 - Salida estéreo dividida: click y guía por el canal izquierdo, pistas por el derecho (se puede invertir).
+- Salidas múltiples: con una interfaz de audio de varias salidas, eliges por cuáles suenan las pistas (por ejemplo la 1 y la 2) y por cuál el click y la guía (por ejemplo la 3). Si desconectas la interfaz y la vuelves a conectar, la app la recupera sola.
 - Setlist, modo escenario y control con pedal Bluetooth, teclado o MIDI.
 - Funciona sin internet una vez instalada. Tus canciones se quedan en tu dispositivo y no se suben a ningún servidor.
 

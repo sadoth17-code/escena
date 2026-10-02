@@ -4,7 +4,12 @@ import { isClickName, isGuideName } from '../library.js';
 import { createFader, createPan, createMeterBar, icon, dbLabel, setText, setClass } from './kit.js';
 
 const AMBER = '#ffb020';
-const PAN_HINT = 'El paneo funciona en el modo Estéreo. Cámbialo en Ajustes → Salida';
+const PAN_HINT = 'El paneo funciona en el modo Estéreo y en Salidas múltiples. Cámbialo en Ajustes → Salida';
+const PAN_HINT_CUE = 'En Salidas múltiples el paneo mueve solo las pistas de Sala; el click y las guías salen en mono';
+
+function canPan(mode, dest) {
+  return mode === 'stereo' || (mode === 'multi' && dest !== 'cue');
+}
 
 function destLabel(dest) {
   return dest === 'cue' ? 'CUE' : 'SALA';
@@ -29,7 +34,7 @@ function buildStrip(node, kind, label) {
       setText(panValue, fmtPan(value));
     },
   });
-  const panBox = h('div', { class: 'pan-box', onClick: () => strip.classList.contains('nopan') && app.toast(PAN_HINT) }, pan.el, panValue);
+  const panBox = h('div', { class: 'pan-box', onClick: () => strip.classList.contains('nopan') && app.toast(def.dest === 'cue' && app.engine.effectiveMode === 'multi' ? PAN_HINT_CUE : PAN_HINT) }, pan.el, panValue);
   const mute = h('button', { type: 'button', class: 'ms m', 'aria-label': `Silenciar ${shown}`, title: 'Silenciar', onClick: () => app.toggleTrackFlag(node, 'mute') }, 'M');
   const solo = h('button', { type: 'button', class: 'ms s', 'aria-label': `Solo ${shown}`, title: 'Solo', onClick: () => app.toggleTrackFlag(node, 'solo') }, 'S');
   const meter = createMeterBar();
@@ -140,8 +145,8 @@ export function createMixer({ onEdit }) {
 
   const frame = (snap, now) => {
     if (!entry || !snap) return;
-    const nopan = app.settings.output.mode !== 'stereo';
-    for (const item of items) item.frame(now, nopan);
+    const mode = app.engine.effectiveMode;
+    for (const item of items) item.frame(now, !canPan(mode, item.node.def.dest));
     const levels = app.engine.readLevels();
     for (const out of outputs) out.frame(now, levels);
     const playing = snap.state === 'playing';

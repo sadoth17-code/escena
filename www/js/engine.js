@@ -2,11 +2,18 @@ import { faderToGain, FADER_DEFAULT } from './util.js';
 import { loadVoiceBank } from './voices.js';
 import { SongPlayer } from './player.js';
 
+export const MAX_OUTPUTS = 32;
+
 export const OUTPUT_MODES = [
   { id: 'split', name: 'Dividido', detail: 'Click y guía a un lado, pistas al otro' },
   { id: 'monitor', name: 'Monitor + sala', detail: 'Un lado con todo para el músico, el otro solo pistas para la sala' },
   { id: 'stereo', name: 'Estéreo', detail: 'Todo en estéreo, con paneo por pista' },
+  { id: 'multi', name: 'Salidas múltiples', detail: 'Tú eliges por qué salidas de tu interfaz suena cada cosa' },
 ];
+
+export const ROUTE_KEYS = ['salaL', 'salaR', 'cue'];
+
+export const DEFAULT_ROUTES = { salaL: [0], salaR: [1], cue: [2] };
 
 export const DEFAULT_OUTPUT = {
   mode: 'split',
@@ -16,7 +23,36 @@ export const DEFAULT_OUTPUT = {
   cueLevel: FADER_DEFAULT,
   limiter: true,
   cueDelayMs: 0,
+  routes: DEFAULT_ROUTES,
 };
+
+export function normalizeRoutes(routes) {
+  const source = routes && typeof routes === 'object' ? routes : {};
+  const result = {};
+  for (const key of ROUTE_KEYS) {
+    const list = Array.isArray(source[key]) ? source[key] : DEFAULT_ROUTES[key];
+    const clean = new Set();
+    for (const value of list) {
+      if (Number.isInteger(value) && value >= 0 && value < MAX_OUTPUTS) clean.add(value);
+    }
+    result[key] = Array.from(clean).sort((a, b) => a - b);
+  }
+  return result;
+}
+
+export function routeGains(routes, count) {
+  const left = new Set(routes.salaL);
+  const right = new Set(routes.salaR);
+  const cue = new Set(routes.cue);
+  const result = { salaL: [], salaR: [], cue: [] };
+  for (let k = 0; k < count; k++) {
+    const shared = left.has(k) && right.has(k);
+    result.salaL.push(left.has(k) ? (shared ? 0.5 : 1) : 0);
+    result.salaR.push(right.has(k) ? (shared ? 0.5 : 1) : 0);
+    result.cue.push(cue.has(k) ? 1 : 0);
+  }
+  return result;
+}
 
 export function routingMatrix(mode, swap) {
   if (mode === 'monitor') {
@@ -51,6 +87,36 @@ function createLimiter(ctx) {
   return node;
 }
 
+function createMeter(ctx) {
+  const meter = ctx.createAnalyser();
+  meter.fftSize = 512;
+  meter.smoothingTimeConstant = 0;
+  return meter;
+}
+
+function playEnvelope(ctx, frequency, seconds, attach) {
+  const start = ctx.currentTime + 0.03;
+  const oscillator = ctx.createOscillator();
+  oscillator.frequency.value = frequency;
+  const envelope = ctx.createGain();
+  envelope.gain.setValueAtTime(0, start);
+  envelope.gain.linearRampToValueAtTime(0.3, start + 0.03);
+  envelope.gain.setValueAtTime(0.3, start + seconds - 0.06);
+  envelope.gain.linearRampToValueAtTime(0, start + seconds);
+  oscillator.connect(envelope);
+  const release = attach(envelope);
+  oscillator.start(start);
+  oscillator.stop(start + seconds + 0.05);
+  oscillator.onended = () => {
+    try {
+      release();
+      envelope.disconnect();
+    } catch (error) {
+      void error;
+    }
+  };
+}
+
 export class Engine {
   constructor({ ctx } = {}) {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -58,6 +124,8 @@ export class Engine {
     this.offline = typeof OfflineAudioContext !== 'undefined' && this.ctx instanceof OfflineAudioContext;
     this.output = { ...DEFAULT_OUTPUT };
     this.voiceBank = null;
+    this.multi = null;
+    this.multiActive = false;
     this.buildGraph();
     this.applyOutput(true);
   }
@@ -116,14 +184,117 @@ export class Engine {
     this.limiterMerge.connect(ctx.destination);
     this.meterSplit = ctx.createChannelSplitter(2);
     this.limiterMerge.connect(this.meterSplit);
-    this.meters = [ctx.createAnalyser(), ctx.createAnalyser()];
-    for (const meter of this.meters) {
-      meter.fftSize = 512;
-      meter.smoothingTimeConstant = 0;
-    }
+    this.meters = [createMeter(ctx), createMeter(ctx)];
     this.meterSplit.connect(this.meters[0], 0);
     this.meterSplit.connect(this.meters[1], 1);
     this.meterData = new Float32Array(512);
+  }
+
+  get maxChannels() {
+    const value = Math.floor(Number(this.ctx.destination.maxChannelCount));
+    if (!Number.isFinite(value) || value < 2) return 2;
+    return Math.min(MAX_OUTPUTS, value);
+  }
+
+  get multiAvailable() {
+    return this.maxChannels > 2;
+  }
+
+  get effectiveMode() {
+    return this.output.mode === 'multi' && !this.multiActive ? 'split' : this.output.mode;
+  }
+
+  buildMulti(count) {
+    const ctx = this.ctx;
+    this.disposeMulti();
+    const merger = ctx.createChannelMerger(count);
+    const mainSplit = ctx.createChannelSplitter(2);
+    this.delays.mainStereo.connect(mainSplit);
+    const gains = { salaL: [], salaR: [], cue: [] };
+    for (let k = 0; k < count; k++) {
+      const left = ctx.createGain();
+      const right = ctx.createGain();
+      const cue = ctx.createGain();
+      left.gain.value = 0;
+      right.gain.value = 0;
+      cue.gain.value = 0;
+      mainSplit.connect(left, 0);
+      mainSplit.connect(right, 1);
+      this.delays.cueMono.connect(cue);
+      left.connect(merger, 0, k);
+      right.connect(merger, 0, k);
+      cue.connect(merger, 0, k);
+      gains.salaL.push(left);
+      gains.salaR.push(right);
+      gains.cue.push(cue);
+    }
+    const master = ctx.createGain();
+    master.channelCount = count;
+    master.channelCountMode = 'explicit';
+    master.channelInterpretation = 'discrete';
+    master.gain.value = 0;
+    merger.connect(master);
+    const limiterSplit = ctx.createChannelSplitter(count);
+    const limiterMerge = ctx.createChannelMerger(count);
+    const limiters = [];
+    master.connect(limiterSplit);
+    for (let k = 0; k < count; k++) {
+      const limiter = createLimiter(ctx);
+      limiterSplit.connect(limiter, k);
+      limiter.connect(limiterMerge, 0, k);
+      limiters.push(limiter);
+    }
+    limiterMerge.connect(ctx.destination);
+    const meterSplit = ctx.createChannelSplitter(count);
+    limiterMerge.connect(meterSplit);
+    const meters = [];
+    for (let k = 0; k < count; k++) {
+      const meter = createMeter(ctx);
+      meterSplit.connect(meter, k);
+      meters.push(meter);
+    }
+    this.multi = { count, merger, mainSplit, gains, master, limiterSplit, limiterMerge, limiters, meterSplit, meters, routeKey: '', limiterOn: null };
+  }
+
+  disposeMulti() {
+    const multi = this.multi;
+    this.multi = null;
+    this.multiActive = false;
+    if (!multi) return;
+    const detach = (fn) => {
+      try {
+        fn();
+      } catch (error) {
+        void error;
+      }
+    };
+    detach(() => this.delays.mainStereo.disconnect(multi.mainSplit));
+    for (const gain of multi.gains.cue) detach(() => this.delays.cueMono.disconnect(gain));
+    detach(() => multi.limiterMerge.disconnect());
+    detach(() => multi.master.disconnect());
+  }
+
+  syncChannels() {
+    const wanted = this.output.mode === 'multi' && this.multiAvailable;
+    const target = wanted ? this.maxChannels : 2;
+    if (wanted && (!this.multi || this.multi.count !== target)) this.buildMulti(target);
+    const destination = this.ctx.destination;
+    if (destination.channelCount !== target) {
+      try {
+        destination.channelCount = target;
+      } catch (error) {
+        void error;
+      }
+    }
+    const interpretation = wanted ? 'discrete' : 'speakers';
+    if (destination.channelInterpretation !== interpretation) {
+      try {
+        destination.channelInterpretation = interpretation;
+      } catch (error) {
+        void error;
+      }
+    }
+    this.multiActive = wanted && Boolean(this.multi) && destination.channelCount === target;
   }
 
   setOutput(patch) {
@@ -132,21 +303,25 @@ export class Engine {
   }
 
   applyOutput(immediate = false) {
+    this.syncChannels();
     const output = this.output;
     const now = this.ctx.currentTime;
     const set = (param, value) => {
       if (immediate) param.setValueAtTime(value, now);
       else param.setTargetAtTime(value, now, 0.015);
     };
-    const stereo = output.mode === 'stereo';
+    const mode = this.effectiveMode;
+    const stereo = mode === 'stereo';
+    const multi = mode === 'multi';
     set(this.stereoOut.gain, stereo ? 1 : 0);
-    set(this.splitOut.gain, stereo ? 0 : 1);
-    const matrix = routingMatrix(output.mode, output.swap);
+    set(this.splitOut.gain, stereo || multi ? 0 : 1);
+    const matrix = routingMatrix(mode, output.swap);
     set(this.matrix.mainToL.gain, matrix.mainL);
     set(this.matrix.cueToL.gain, matrix.cueL);
     set(this.matrix.mainToR.gain, matrix.mainR);
     set(this.matrix.cueToR.gain, matrix.cueR);
     set(this.master.gain, faderToGain(output.master));
+    this.applyRoutes(set, multi, immediate);
     const main = faderToGain(output.mainLevel);
     const cue = faderToGain(output.cueLevel);
     set(this.mainStereo.gain, main);
@@ -162,6 +337,31 @@ export class Engine {
       set(limiter.threshold, output.limiter ? -1.5 : 0);
       set(limiter.ratio, output.limiter ? 20 : 1);
     }
+    const chain = this.multi;
+    if (chain && (immediate || chain.limiterOn !== Boolean(output.limiter))) {
+      chain.limiterOn = Boolean(output.limiter);
+      for (const limiter of chain.limiters) {
+        set(limiter.threshold, output.limiter ? -1.5 : 0);
+        set(limiter.ratio, output.limiter ? 20 : 1);
+      }
+    }
+  }
+
+  applyRoutes(set, active, immediate) {
+    const chain = this.multi;
+    if (!chain) return;
+    const routes = normalizeRoutes(this.output.routes);
+    const key = JSON.stringify(routes);
+    if (immediate || key !== chain.routeKey) {
+      chain.routeKey = key;
+      const gains = routeGains(routes, chain.count);
+      for (let k = 0; k < chain.count; k++) {
+        set(chain.gains.salaL[k].gain, gains.salaL[k]);
+        set(chain.gains.salaR[k].gain, gains.salaR[k]);
+        set(chain.gains.cue[k].gain, gains.cue[k]);
+      }
+    }
+    set(chain.master.gain, active ? faderToGain(this.output.master) : 0);
   }
 
   async resume() {
@@ -176,7 +376,19 @@ export class Engine {
   }
 
   async setSinkId(id) {
-    if (typeof this.ctx.setSinkId === 'function') await this.ctx.setSinkId(id);
+    if (typeof this.ctx.setSinkId !== 'function') return false;
+    this.multiActive = false;
+    try {
+      if (this.ctx.destination.channelCount !== 2) this.ctx.destination.channelCount = 2;
+    } catch (error) {
+      void error;
+    }
+    try {
+      await this.ctx.setSinkId(id);
+    } finally {
+      this.applyOutput(true);
+    }
+    return true;
   }
 
   async loadVoices() {
@@ -215,45 +427,54 @@ export class Engine {
     return new SongPlayer(this, song, { buffers, voices });
   }
 
-  readLevels() {
-    const levels = [0, 0];
-    for (let i = 0; i < 2; i++) {
-      this.meters[i].getFloatTimeDomainData(this.meterData);
-      let max = 0;
-      for (let j = 0; j < this.meterData.length; j++) {
-        const value = Math.abs(this.meterData[j]);
-        if (value > max) max = value;
-      }
-      levels[i] = max;
+  peakOf(analyser) {
+    analyser.getFloatTimeDomainData(this.meterData);
+    let max = 0;
+    for (let j = 0; j < this.meterData.length; j++) {
+      const value = Math.abs(this.meterData[j]);
+      if (value > max) max = value;
     }
-    return levels;
+    return max;
+  }
+
+  readLevels() {
+    if (this.multiActive && this.multi) {
+      const chain = this.multi;
+      const routes = normalizeRoutes(this.output.routes);
+      const peaks = new Map();
+      const level = (list) => {
+        let max = 0;
+        for (const k of list) {
+          if (k >= chain.count) continue;
+          if (!peaks.has(k)) peaks.set(k, this.peakOf(chain.meters[k]));
+          max = Math.max(max, peaks.get(k));
+        }
+        return max;
+      };
+      return [level(routes.cue), level([...routes.salaL, ...routes.salaR])];
+    }
+    return [this.peakOf(this.meters[0]), this.peakOf(this.meters[1])];
   }
 
   playTone(side, seconds = 1.2) {
     const ctx = this.ctx;
-    const start = ctx.currentTime + 0.03;
-    const oscillator = ctx.createOscillator();
-    oscillator.frequency.value = side === 'both' ? 523.25 : 440;
-    const envelope = ctx.createGain();
-    envelope.gain.setValueAtTime(0, start);
-    envelope.gain.linearRampToValueAtTime(0.3, start + 0.03);
-    envelope.gain.setValueAtTime(0.3, start + seconds - 0.06);
-    envelope.gain.linearRampToValueAtTime(0, start + seconds);
     const panner = ctx.createStereoPanner();
     panner.pan.value = side === 'L' ? -1 : side === 'R' ? 1 : 0;
-    oscillator.connect(envelope);
-    envelope.connect(panner);
     panner.connect(this.preMaster);
-    oscillator.start(start);
-    oscillator.stop(start + seconds + 0.05);
-    oscillator.onended = () => {
-      try {
-        panner.disconnect();
-        envelope.disconnect();
-      } catch (error) {
-        void error;
-      }
-    };
+    playEnvelope(ctx, side === 'both' ? 523.25 : 440, seconds, (envelope) => {
+      envelope.connect(panner);
+      return () => panner.disconnect();
+    });
+  }
+
+  playChannelTone(index, seconds = 1.2) {
+    const chain = this.multi;
+    if (!this.multiActive || !chain || !(index >= 0 && index < chain.count)) return false;
+    playEnvelope(this.ctx, 440, seconds, (envelope) => {
+      envelope.connect(chain.merger, 0, index);
+      return () => {};
+    });
+    return true;
   }
 
   async previewBuffer(buffer, dest = 'cue') {

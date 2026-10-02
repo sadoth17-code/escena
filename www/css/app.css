@@ -411,6 +411,14 @@ p {
   color: #ff8d8d;
 }
 
+.field-hint.warn {
+  color: var(--amber);
+}
+
+.sub + .field-hint {
+  margin-bottom: 12px;
+}
+
 .field-hint.center {
   text-align: center;
   margin-top: 10px;
@@ -2354,11 +2362,24 @@ p {
   box-shadow: inset 0 0 0 1px var(--accent);
 }
 
+.mode-card.wide {
+  grid-column: 1 / -1;
+}
+
+.mode-card:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .mode-detail {
   font-size: 12.5px;
   color: var(--text-2);
   line-height: 1.35;
   min-height: 3.4em;
+}
+
+.mode-card.wide .mode-detail {
+  min-height: 0;
 }
 
 .diagram {
@@ -2396,6 +2417,69 @@ p {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.tone-n {
+  min-width: 64px;
+}
+
+.route-box {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 2px 0 8px;
+}
+
+.route-grid {
+  display: grid;
+  grid-template-columns: minmax(124px, 160px) repeat(var(--cols), 40px);
+  gap: 6px;
+  align-items: center;
+  width: max-content;
+}
+
+.route-col {
+  text-align: center;
+  font: 800 12px var(--mono);
+  color: var(--text-2);
+}
+
+.route-col.off {
+  opacity: 0.4;
+}
+
+.route-name {
+  padding-left: 10px;
+  border-left: 3px solid var(--c);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--text);
+}
+
+.route-cell {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 36px;
+  border-radius: 9px;
+  background: #0a0e13;
+  border: 1px solid var(--line-2);
+  color: var(--c);
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.route-cell:hover {
+  border-color: var(--c);
+}
+
+.route-cell.on {
+  background: color-mix(in srgb, var(--c) 20%, #0a0e13);
+  border-color: var(--c);
+}
+
+.route-cell.off {
+  opacity: 0.45;
 }
 
 .device-box {

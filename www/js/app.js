@@ -1,6 +1,6 @@
 import { createEmitter, debounce, isIOS, clamp } from './util.js';
 import { store } from './store.js';
-import { Engine, DEFAULT_OUTPUT } from './engine.js';
+import { Engine, DEFAULT_OUTPUT, normalizeRoutes } from './engine.js';
 import { normalizeSong, serializableSong, createSong, createTrackDef, createSetlist } from './library.js';
 import { normalizeTempoEntries, detectTempoFromBuffer } from './tempo.js';
 import { renderPreview } from './synth.js';
@@ -16,6 +16,7 @@ export const DEFAULT_SETTINGS = {
   autoCountIn: true,
   keepAwake: true,
   sinkId: '',
+  sinkLabel: '',
   midiProgramChange: true,
   midiEnabled: false,
   bindings: null,
@@ -23,7 +24,8 @@ export const DEFAULT_SETTINGS = {
 
 function mergeSettings(saved) {
   const merged = { ...DEFAULT_SETTINGS, ...saved };
-  merged.output = { ...DEFAULT_OUTPUT, ...(saved && saved.output ? saved.output : {}) };
+  const savedOutput = saved && saved.output ? saved.output : {};
+  merged.output = { ...DEFAULT_OUTPUT, ...savedOutput, routes: normalizeRoutes(savedOutput.routes) };
   return merged;
 }
 
@@ -44,6 +46,8 @@ class App {
     this.engine = null;
     this.ready = false;
     this.stageLocked = false;
+    this.sinkState = 'default';
+    this.reviewing = Promise.resolve();
     this.saveSettings = debounce(() => store.setMeta('settings', this.settings).catch(() => {}), 300);
     this.persistSongSoon = debounce((song) => this.saveSong(song, true).catch((error) => this.toast(error.message, 'error')), 400);
   }
@@ -74,7 +78,6 @@ class App {
     this.engine = new Engine();
     this.engine.output = this.settings.output;
     this.engine.applyOutput(true);
-    if (this.settings.sinkId) this.engine.setSinkId(this.settings.sinkId).catch(() => {});
     this.startTicker();
     this.ready = true;
     this.emit('ready');
@@ -95,8 +98,11 @@ class App {
     this.engine.output = this.settings.output;
     this.engine.applyOutput(false);
     this.saveSettings();
+    this.sinkState = 'default';
+    this.engine.setSinkId('').catch(() => {});
     this.emit('settings', 'bindings');
     this.emit('settings', 'output');
+    this.emit('outputs');
   }
 
   setOutput(patch) {
@@ -104,6 +110,104 @@ class App {
     this.engine.applyOutput(false);
     this.saveSettings();
     this.emit('settings', 'output');
+  }
+
+  get canPickDevice() {
+    return Boolean(this.engine) && typeof this.engine.ctx.setSinkId === 'function';
+  }
+
+  async outputDevices() {
+    const media = navigator.mediaDevices;
+    if (!media || typeof media.enumerateDevices !== 'function') return [];
+    try {
+      return (await media.enumerateDevices()).filter((device) => device.kind === 'audiooutput' && device.deviceId);
+    } catch (error) {
+      return [];
+    }
+  }
+
+  async chooseSink(id, label = '') {
+    this.settings.sinkId = id;
+    this.settings.sinkLabel = id ? label : '';
+    this.saveSettings();
+    try {
+      await this.engine.setSinkId(id);
+      this.sinkState = id ? 'ok' : 'default';
+    } catch (error) {
+      this.settings.sinkId = '';
+      this.settings.sinkLabel = '';
+      this.sinkState = 'default';
+      this.engine.setSinkId('').catch(() => {});
+      this.toast('No se pudo usar ese dispositivo. Suena por la salida del sistema', 'error');
+    }
+    this.saveSettings();
+    this.emit('settings', 'sinkId');
+    this.emit('outputs');
+  }
+
+  async connectSink({ startup = false } = {}) {
+    const id = this.settings.sinkId;
+    if (!id || !this.canPickDevice) {
+      this.sinkState = 'default';
+      this.emit('outputs');
+      return;
+    }
+    const before = this.sinkState;
+    try {
+      await this.engine.setSinkId(id);
+      this.sinkState = 'ok';
+      if (before === 'missing') this.toast(`Salida conectada: ${this.settings.sinkLabel || 'dispositivo de audio'}`);
+    } catch (error) {
+      this.sinkState = 'missing';
+      if (startup) this.toast(`${this.settings.sinkLabel || 'La salida de audio guardada'} no está conectada. Suena por la salida del sistema`, 'error');
+    }
+    this.emit('outputs');
+  }
+
+  startDevices() {
+    if (!this.engine) return;
+    const media = navigator.mediaDevices;
+    if (media && typeof media.addEventListener === 'function') {
+      let timer = 0;
+      media.addEventListener('devicechange', () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => this.queueReview(), 400);
+      });
+    }
+    this.engine.ctx.addEventListener('sinkchange', () => {
+      this.engine.applyOutput(true);
+      this.emit('outputs');
+    });
+    if (this.settings.sinkId) this.connectSink({ startup: true });
+    else this.emit('outputs');
+  }
+
+  queueReview() {
+    this.reviewing = this.reviewing.then(() => this.reviewDevices()).catch(() => {});
+    return this.reviewing;
+  }
+
+  async reviewDevices() {
+    const id = this.settings.sinkId;
+    if (id && this.canPickDevice) {
+      const list = await this.outputDevices();
+      const trusted = list.some((device) => device.label);
+      const present = list.some((device) => device.deviceId === id);
+      if (this.sinkState === 'ok' && trusted && !present) {
+        this.sinkState = 'missing';
+        try {
+          await this.engine.setSinkId('');
+        } catch (error) {
+          void error;
+        }
+        this.toast(`Se desconectó ${this.settings.sinkLabel || 'la salida de audio'}. Ahora suena por la salida del sistema`, 'error');
+      } else if (this.sinkState === 'missing' && (present || !trusted)) {
+        await this.connectSink();
+        return;
+      }
+    }
+    this.engine.applyOutput(true);
+    this.emit('outputs');
   }
 
   songList() {

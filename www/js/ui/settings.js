@@ -1,7 +1,7 @@
-import { h, fmtBytes } from '../util.js';
+import { h, fmtBytes, isIOS } from '../util.js';
 import { app } from '../app.js';
 import { store } from '../store.js';
-import { OUTPUT_MODES } from '../engine.js';
+import { OUTPUT_MODES, ROUTE_KEYS, normalizeRoutes } from '../engine.js';
 import { controls, ACTIONS } from '../controls.js';
 import { platform } from '../platform.js';
 import { icon, openModal, createSegmented, createSwitch, createRange, settingRow, field, dbLabel, confirmDialog } from './kit.js';
@@ -12,12 +12,40 @@ const DIAGRAMS = {
   stereo: () => ['Mezcla estéreo', 'Mezcla estéreo'],
 };
 
+const ROUTE_ROWS = [
+  { key: 'salaL', label: 'Pistas · izquierda', color: '#35c9ff' },
+  { key: 'salaR', label: 'Pistas · derecha', color: '#35c9ff' },
+  { key: 'cue', label: 'Click y guía', color: '#ffb020' },
+];
+
+const PHONE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || isIOS();
+
+function rangesText(list) {
+  const parts = [];
+  let start = list[0];
+  let prev = list[0];
+  for (let i = 1; i <= list.length; i++) {
+    if (list[i] === prev + 1) {
+      prev = list[i];
+      continue;
+    }
+    parts.push(start === prev ? String(start + 1) : `${start + 1}-${prev + 1}`);
+    start = list[i];
+    prev = list[i];
+  }
+  return parts.join(', ');
+}
+
+function outputsText(list) {
+  if (!list.length) return 'Sin salida';
+  return `${list.length > 1 ? 'Salidas' : 'Salida'} ${rangesText(list)}`;
+}
+
 function section(title, detail, ...children) {
   return h('section', { class: 'settings-section' }, h('h3', { class: 'sub', text: title }), detail ? h('p', { class: 'field-hint', text: detail }) : null, ...children);
 }
 
 export function openSettings() {
-  const output = app.settings.output;
   const unsubscribe = [];
   const modal = openModal({
     title: 'Ajustes',
@@ -30,113 +58,232 @@ export function openSettings() {
       unsubscribe.forEach((fn) => fn());
     },
   });
+  const current = () => app.settings.output;
 
   const cards = new Map();
   const modeGrid = h('div', { class: 'mode-grid', role: 'radiogroup', 'aria-label': 'Modo de salida' });
+  const diagramFor = (id) => {
+    const output = current();
+    if (id === 'multi') {
+      const pistas = Array.from(new Set([...output.routes.salaL, ...output.routes.salaR])).sort((a, b) => a - b);
+      return { tags: ['Pistas', 'Click y guía'], texts: [outputsText(pistas), outputsText(output.routes.cue)] };
+    }
+    return { tags: ['L', 'R'], texts: DIAGRAMS[id](output.swap) };
+  };
+  const multiDetail = (mode) => {
+    const output = current();
+    const max = app.engine.maxChannels;
+    if (app.engine.multiAvailable) return `${mode.detail}. Tu salida tiene ${max} canales.`;
+    if (output.mode === 'multi') return `En espera: la salida actual tiene ${max} canales. Suena como Dividido hasta que conectes tu interfaz.`;
+    return `Necesita una salida con más de 2 canales. La actual tiene ${max}.`;
+  };
   const refreshModes = () => {
-    for (const [id, card] of cards) {
-      const on = output.mode === id;
+    const output = current();
+    for (const mode of OUTPUT_MODES) {
+      const card = cards.get(mode.id);
+      const on = output.mode === mode.id;
       card.classList.toggle('active', on);
       card.setAttribute('aria-checked', on ? 'true' : 'false');
-      const [left, right] = DIAGRAMS[id](output.swap);
-      card.querySelector('.d-left').textContent = left;
-      card.querySelector('.d-right').textContent = right;
+      const { tags, texts } = diagramFor(mode.id);
+      card.querySelector('.d-tag-left').textContent = tags[0];
+      card.querySelector('.d-tag-right').textContent = tags[1];
+      card.querySelector('.d-left').textContent = texts[0];
+      card.querySelector('.d-right').textContent = texts[1];
+      if (mode.id === 'multi') {
+        card.disabled = !app.engine.multiAvailable && output.mode !== 'multi';
+        card.querySelector('.mode-detail').textContent = multiDetail(mode);
+      }
     }
-    swapRow.hidden = output.mode === 'stereo';
+    swapRow.hidden = output.mode === 'stereo' || output.mode === 'multi';
   };
   for (const mode of OUTPUT_MODES) {
     const card = h(
       'button',
       {
         type: 'button',
-        class: 'mode-card',
+        class: `mode-card${mode.id === 'multi' ? ' wide' : ''}`,
         role: 'radio',
         onClick: () => {
           app.setOutput({ mode: mode.id });
-          refreshModes();
+          refreshAll();
         },
       },
       h('b', { text: mode.name }),
       h('span', { class: 'mode-detail', text: mode.detail }),
-      h('div', { class: 'diagram' }, h('div', { class: 'd-cell' }, h('i', { text: 'L' }), h('span', { class: 'd-left' })), h('div', { class: 'd-cell' }, h('i', { text: 'R' }), h('span', { class: 'd-right' })))
+      h(
+        'div',
+        { class: 'diagram' },
+        h('div', { class: 'd-cell' }, h('i', { class: 'd-tag-left' }), h('span', { class: 'd-left' })),
+        h('div', { class: 'd-cell' }, h('i', { class: 'd-tag-right' }), h('span', { class: 'd-right' }))
+      )
     );
     cards.set(mode.id, card);
     modeGrid.append(card);
   }
-  const swap = createSwitch({ value: output.swap, label: 'Invertir lados', onChange: (value) => { app.setOutput({ swap: value }); refreshModes(); } });
+  const swap = createSwitch({ value: current().swap, label: 'Invertir lados', onChange: (value) => { app.setOutput({ swap: value }); refreshAll(); } });
   const swapRow = settingRow('Invertir lados', 'Cambia qué lado lleva el click/monitor y cuál la sala', swap.el);
 
   const level = (label, key, hint) => {
-    const range = createRange({ min: 0, max: 1, step: 0.005, value: output[key], label, format: (value) => `${dbLabel(value)} dB`, onInput: (value) => app.setOutput({ [key]: value }) });
+    const range = createRange({ min: 0, max: 1, step: 0.005, value: current()[key], label, format: (value) => `${dbLabel(value)} dB`, onInput: (value) => app.setOutput({ [key]: value }) });
     return field(label, range.el, hint);
   };
-  const limiter = createSwitch({ value: output.limiter, label: 'Limitador', onChange: (value) => app.setOutput({ limiter: value }) });
-  const delay = createRange({ min: -150, max: 150, step: 1, value: output.cueDelayMs, label: 'Desfase del click y guías', format: (value) => `${value > 0 ? '+' : ''}${value} ms`, onInput: (value) => app.setOutput({ cueDelayMs: value }) });
+  const limiter = createSwitch({ value: current().limiter, label: 'Limitador', onChange: (value) => app.setOutput({ limiter: value }) });
+  const delay = createRange({ min: -150, max: 150, step: 1, value: current().cueDelayMs, label: 'Desfase del click y guías', format: (value) => `${value > 0 ? '+' : ''}${value} ms`, onInput: (value) => app.setOutput({ cueDelayMs: value }) });
 
-  const toneRow = h(
-    'div',
-    { class: 'tone-row' },
-    ...[
-      ['L', 'Izquierdo'],
-      ['R', 'Derecho'],
-      ['both', 'Ambos'],
-    ].map(([side, label]) => h('button', { type: 'button', class: 'btn', onClick: () => app.engine.resume().then(() => app.engine.playTone(side)) }, icon('speaker', 18), label))
-  );
+  const routeBox = h('div', { class: 'route-box' });
+  const routeHint = h('span', { class: 'field-hint' });
+  const routeField = h('div', { class: 'field route-field' }, h('span', { class: 'field-label', text: 'Salidas de tu interfaz' }), routeBox, routeHint);
+  const toggleRoute = (key, index) => {
+    const routes = current().routes;
+    const next = new Set(routes[key]);
+    if (next.has(index)) next.delete(index);
+    else next.add(index);
+    app.setOutput({ routes: normalizeRoutes({ ...routes, [key]: Array.from(next) }) });
+    refreshAll();
+  };
+  const renderRoutes = () => {
+    const output = current();
+    routeField.hidden = output.mode !== 'multi';
+    if (routeField.hidden) return;
+    const routes = output.routes;
+    const available = app.engine.maxChannels;
+    const highest = Math.max(-1, ...ROUTE_KEYS.flatMap((key) => routes[key]));
+    const columns = Math.max(available, highest + 1, 2);
+    const grid = h('div', { class: 'route-grid', style: { '--cols': String(columns) }, role: 'group', 'aria-label': 'Salidas de tu interfaz para cada señal' });
+    grid.append(h('span', { class: 'route-corner' }));
+    for (let k = 0; k < columns; k++) grid.append(h('span', { class: `route-col${k >= available ? ' off' : ''}`, text: String(k + 1) }));
+    for (const row of ROUTE_ROWS) {
+      grid.append(h('span', { class: 'route-name', style: { '--c': row.color }, text: row.label }));
+      for (let k = 0; k < columns; k++) {
+        const on = routes[row.key].includes(k);
+        grid.append(
+          h(
+            'button',
+            {
+              type: 'button',
+              class: `route-cell${on ? ' on' : ''}${k >= available ? ' off' : ''}`,
+              style: { '--c': row.color },
+              'aria-pressed': on ? 'true' : 'false',
+              'aria-label': `${row.label} por la salida ${k + 1}`,
+              title: k >= available ? 'Esta salida no existe en el dispositivo actual' : `${row.label} · salida ${k + 1}`,
+              onClick: () => toggleRoute(row.key, k),
+            },
+            on ? icon('check', 16) : null
+          )
+        );
+      }
+    }
+    routeBox.replaceChildren(grid);
+    const empty = ROUTE_ROWS.filter((row) => !routes[row.key].length).map((row) => row.label.toLowerCase());
+    const beyond = highest >= available;
+    const parts = ['Marca por qué salidas de tu interfaz suena cada fila; puedes marcar varias. Ejemplo: pistas por 1 y 2 para la sala, y click y guía por 3 para el baterista.'];
+    if (empty.length) parts.push(`Sin salida asignada, no se oirá: ${empty.join(', ')}.`);
+    if (beyond) parts.push('Hay rutas hacia salidas que el dispositivo actual no tiene; se ignoran hasta que conectes tu interfaz.');
+    if (new Set(routes.salaL).size && routes.salaL.some((k) => routes.salaR.includes(k))) parts.push('Si izquierda y derecha comparten una salida, esa salida lleva las pistas en mono.');
+    routeHint.textContent = parts.join(' ');
+  };
 
-  const deviceSelect = h('select', { class: 'select', 'aria-label': 'Dispositivo de salida' });
-  const deviceBox = h('div', { class: 'device-box' });
-  const loadDevices = async () => {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices || typeof app.engine.ctx.setSinkId !== 'function') {
-      deviceBox.replaceChildren(h('p', { class: 'field-hint', text: 'Este dispositivo usa la salida de audio que elijas en el sistema (Bluetooth, auriculares, interfaz).' }));
+  const toneLabel = h('span', { class: 'field-label' });
+  const toneBox = h('div', { class: 'tone-row' });
+  const toneHint = h('span', { class: 'field-hint' });
+  const toneField = h('div', { class: 'field' }, toneLabel, toneBox, toneHint);
+  const play = (fn) => app.engine.resume().then(fn);
+  const renderTones = () => {
+    if (app.engine.multiActive && current().mode === 'multi') {
+      toneLabel.textContent = 'Prueba de salidas';
+      toneHint.textContent = 'Pulsa un número: suena un tono solo por esa salida de tu interfaz. Compruébalo con tus audífonos o altavoces conectados.';
+      const count = app.engine.multi.count;
+      toneBox.replaceChildren(...Array.from({ length: count }, (_, k) => h('button', { type: 'button', class: 'btn tone-n', 'aria-label': `Probar la salida ${k + 1}`, onClick: () => play(() => app.engine.playChannelTone(k)) }, icon('speaker', 16), String(k + 1))));
       return;
     }
-    const devices = (await navigator.mediaDevices.enumerateDevices()).filter((device) => device.kind === 'audiooutput');
-    const labelled = devices.some((device) => device.label);
-    deviceSelect.replaceChildren(h('option', { value: '', text: 'Predeterminado del sistema' }), ...devices.filter((device) => device.deviceId !== 'default').map((device, index) => h('option', { value: device.deviceId, text: device.label || `Salida ${index + 1}`, selected: device.deviceId === app.settings.sinkId })));
-    deviceSelect.value = app.settings.sinkId || '';
-    deviceBox.replaceChildren(
-      deviceSelect,
-      labelled
-        ? null
-        : h('button', {
-            type: 'button',
-            class: 'btn small',
-            onClick: async () => {
-              try {
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                stream.getTracks().forEach((track) => track.stop());
-              } catch (error) {
-                app.toast('No se concedió el permiso para ver los nombres', 'error');
-              }
-              loadDevices();
-            },
-          }, 'Mostrar nombres de los dispositivos')
+    toneLabel.textContent = 'Prueba de canales';
+    toneHint.textContent = 'Debes oír cada tono solo en el lado indicado.';
+    toneBox.replaceChildren(
+      ...[
+        ['L', 'Izquierdo'],
+        ['R', 'Derecho'],
+        ['both', 'Ambos'],
+      ].map(([side, label]) => h('button', { type: 'button', class: 'btn', onClick: () => play(() => app.engine.playTone(side)) }, icon('speaker', 18), label))
     );
   };
-  deviceSelect.addEventListener('change', async () => {
-    app.setSetting('sinkId', deviceSelect.value);
-    try {
-      await app.engine.setSinkId(deviceSelect.value);
-    } catch (error) {
-      app.toast('No se pudo usar ese dispositivo', 'error');
+
+  const deviceSelect = h('select', { class: 'select', 'aria-label': 'Dispositivo de salida' });
+  const deviceNote = h('span', { class: 'field-hint' });
+  const deviceBox = h('div', { class: 'device-box' });
+  const renderNote = () => {
+    const max = app.engine.maxChannels;
+    if (app.sinkState === 'missing') {
+      deviceNote.className = 'field-hint warn';
+      deviceNote.textContent = `${app.settings.sinkLabel || 'La salida guardada'} no está conectada. Mientras tanto suena por la salida del sistema; cuando la conectes se usa sola.`;
+      return;
     }
+    deviceNote.className = 'field-hint';
+    deviceNote.textContent = max > 2 ? `Esta salida tiene ${max} canales (salidas 1 a ${max}).` : 'Esta salida tiene 2 canales (estéreo).';
+  };
+  const loadDevices = async () => {
+    if (PHONE || !app.canPickDevice || !navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+      deviceBox.replaceChildren(h('p', { class: 'field-hint', text: 'Este dispositivo usa la salida de audio que elijas en el sistema (Bluetooth, auriculares, interfaz USB).' }));
+      return;
+    }
+    const found = await app.outputDevices();
+    const devices = found.filter((device) => device.deviceId !== 'default' && device.deviceId !== 'communications');
+    const labelled = found.some((device) => device.label);
+    const saved = app.settings.sinkId;
+    const options = [h('option', { value: '', text: 'Predeterminado del sistema' })];
+    devices.forEach((device, index) => options.push(h('option', { value: device.deviceId, text: device.label || `Salida ${index + 1}` })));
+    if (saved && !devices.some((device) => device.deviceId === saved)) options.push(h('option', { value: saved, text: `${app.settings.sinkLabel || 'Salida guardada'} (no conectada)` }));
+    deviceSelect.replaceChildren(...options);
+    deviceSelect.value = saved || '';
+    renderNote();
+    const showNames = h('button', {
+      type: 'button',
+      class: 'btn small',
+      onClick: async () => {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          stream.getTracks().forEach((track) => track.stop());
+        } catch (error) {
+          app.toast('No se concedió el permiso para ver los nombres', 'error');
+        }
+        loadDevices();
+      },
+    }, 'Mostrar nombres de los dispositivos');
+    deviceBox.replaceChildren(...[deviceSelect, deviceNote, devices.length && !labelled ? showNames : null].filter(Boolean));
+  };
+  deviceSelect.addEventListener('change', () => {
+    const label = deviceSelect.selectedOptions.length ? deviceSelect.selectedOptions[0].textContent : '';
+    app.chooseSink(deviceSelect.value, label);
   });
+
+  const refreshAll = () => {
+    refreshModes();
+    renderRoutes();
+    renderTones();
+    if (deviceNote.isConnected) renderNote();
+  };
+  unsubscribe.push(
+    app.on('outputs', () => {
+      refreshAll();
+      loadDevices();
+    })
+  );
   loadDevices();
 
   const outputSection = section(
     'Salida de audio',
-    'Elige cómo se reparte el sonido entre los dos canales de tu salida.',
+    'Elige tu dispositivo de audio y cómo se reparte el sonido entre sus salidas.',
+    field('Dispositivo de salida', deviceBox),
     modeGrid,
+    routeField,
     swapRow,
     level('Nivel Master', 'master'),
     level('Nivel Sala (pistas)', 'mainLevel'),
     level('Nivel Cue (click y guías)', 'cueLevel'),
     settingRow('Limitador', 'Evita saturación en la salida (recomendado)', limiter.el),
     field('Desfase del cue', delay.el, 'Mueve el click y las guías respecto a las pistas, útil si usas auriculares inalámbricos.'),
-    field('Prueba de canales', toneRow, 'Debes oír cada tono solo en el lado indicado.'),
-    field('Dispositivo de salida', deviceBox)
+    toneField
   );
-  refreshModes();
+  refreshAll();
 
   const jump = createSegmented({
     options: [

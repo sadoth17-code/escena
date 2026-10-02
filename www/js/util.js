@@ -7,7 +7,12 @@ export function h(tag, props = {}, ...children) {
     if (value === undefined || value === null || value === false) continue;
     if (key === 'class') el.className = value;
     else if (key === 'text') el.textContent = value;
-    else if (key === 'style' && typeof value === 'object') Object.assign(el.style, value);
+    else if (key === 'style' && typeof value === 'object') {
+      for (const [name, item] of Object.entries(value)) {
+        if (name.startsWith('--')) el.style.setProperty(name, String(item));
+        else el.style[name] = item;
+      }
+    }
     else if (key === 'dataset') Object.assign(el.dataset, value);
     else if (key.startsWith('on') && typeof value === 'function') el.addEventListener(key.slice(2).toLowerCase(), value);
     else if (key === 'value') el.value = value;
