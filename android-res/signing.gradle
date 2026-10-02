@@ -1,0 +1,21 @@
+def runNumber = System.getenv('GITHUB_RUN_NUMBER') ?: '1'
+
+android {
+    defaultConfig {
+        versionCode = runNumber.toInteger()
+        versionName = '1.0.' + runNumber
+    }
+    signingConfigs {
+        release {
+            storeFile rootProject.file('../android-res/escena.keystore')
+            storePassword 'escena2026'
+            keyAlias 'escena'
+            keyPassword 'escena2026'
+        }
+    }
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+        }
+    }
+}

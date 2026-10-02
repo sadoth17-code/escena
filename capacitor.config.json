@@ -1,0 +1,17 @@
+{
+  "appId": "com.ingvelarde.escena",
+  "appName": "Escena",
+  "webDir": "www",
+  "backgroundColor": "#0b0d10",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false
+  },
+  "plugins": {
+    "SystemBars": {
+      "style": "DARK"
+    }
+  }
+}
