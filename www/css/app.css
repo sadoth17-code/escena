@@ -689,8 +689,12 @@ p {
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
   font-size: 14px;
   font-weight: 600;
-  pointer-events: auto;
+  pointer-events: none;
   animation: rise 0.2s ease-out;
+}
+
+.toast.has-action {
+  pointer-events: auto;
 }
 
 .toast.error {
@@ -2302,6 +2306,223 @@ p {
   gap: 8px;
 }
 
+.section-table .trow.sel {
+  background: rgba(53, 201, 255, 0.08);
+  border-radius: 10px;
+  box-shadow: 0 0 0 6px rgba(53, 201, 255, 0.08);
+}
+
+.smap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 10px 0 20px;
+}
+
+.smap-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 14px;
+}
+
+.smap-transport,
+.smap-zoombox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.smap-zoombox {
+  flex-wrap: wrap;
+}
+
+.smap-play {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-ink);
+  flex: none;
+  transition: background 0.12s, transform 0.08s;
+}
+
+.smap-play:hover {
+  background: #5ad3ff;
+}
+
+.smap-play:active {
+  transform: scale(0.95);
+}
+
+.smap-play-icon {
+  display: inline-flex;
+  line-height: 0;
+}
+
+.smap-clock {
+  font: 700 13px var(--mono);
+  color: var(--text);
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.smap-zoom {
+  min-width: 104px;
+  text-align: center;
+  font: 600 12px var(--mono);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.smap-follow.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.smap-stage {
+  position: relative;
+  height: 180px;
+  border-radius: var(--radius-sm);
+  background: #0a0e13;
+  border: 1px solid var(--line);
+  overflow: hidden;
+  touch-action: none;
+  cursor: crosshair;
+}
+
+.smap-stage:focus {
+  outline: none;
+}
+
+.smap-stage:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.smap-stage.over-grip {
+  cursor: grab;
+}
+
+.smap-stage.grabbing {
+  cursor: grabbing;
+}
+
+.smap-canvas,
+.smap-ov-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.smap-tip {
+  position: absolute;
+  top: 26px;
+  transform: translateX(-50%);
+  padding: 3px 9px;
+  border-radius: 6px;
+  background: rgba(10, 14, 19, 0.94);
+  border: 1px solid var(--line-2);
+  font: 600 11px var(--mono);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.smap-wait {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.smap-overview {
+  position: relative;
+  height: 42px;
+  border-radius: 8px;
+  background: #0a0e13;
+  border: 1px solid var(--line);
+  overflow: hidden;
+  touch-action: none;
+  cursor: pointer;
+}
+
+.smap-sel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--line-2);
+}
+
+.smap-sel-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.smap-sel-title b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 15px;
+}
+
+.smap-sel-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 4px;
+  flex: none;
+}
+
+.smap-sel-bar {
+  font: 600 12px var(--mono);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.smap-sel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.smap-add {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.smap-add-label {
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.smap-notice {
+  margin: 10px 0 16px;
+}
+
+.smap-notice .btn {
+  margin-top: 10px;
+}
+
 .row-actions {
   display: flex;
   align-items: center;
@@ -3299,6 +3520,55 @@ body.stage-open .toasts {
     display: none;
   }
 
+  .smap-stage {
+    height: 160px;
+  }
+
+  .smap-zoombox {
+    width: 100%;
+    flex-wrap: nowrap;
+  }
+
+  .smap-zoom {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    white-space: normal;
+    line-height: 1.2;
+  }
+
+  .smap-zoom-sep {
+    display: none;
+  }
+
+  .smap-zoombox .btn {
+    min-height: 40px;
+    flex: none;
+  }
+
+  .smap-follow {
+    width: 44px;
+    padding: 0;
+  }
+
+  .smap-follow-text {
+    display: none;
+  }
+
+  .smap-sel-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .smap-sel-actions .btn {
+    min-height: 40px;
+    padding: 0 8px;
+  }
+
   .tempo-table .trow {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 0.9fr) 76px 38px;
     gap: 6px;
@@ -3617,6 +3887,23 @@ body.stage-open .toasts {
 
   .stage-veil {
     padding-bottom: calc(var(--safe-bottom) + 10px);
+  }
+
+  .sections-intro {
+    display: none;
+  }
+
+  .smap-stage {
+    height: 104px;
+  }
+
+  .smap-overview {
+    height: 32px;
+  }
+
+  .smap-play {
+    width: 44px;
+    height: 44px;
   }
 }
 

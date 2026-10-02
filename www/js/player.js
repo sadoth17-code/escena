@@ -5,6 +5,19 @@ import { faderToGain, clamp } from './util.js';
 const START_LEAD = 0.07;
 const SPLICE = 0.003;
 const END_EPSILON = 0.004;
+const WAVE_BLOCK = 256;
+const WAVE_SLICE = 3000000;
+
+function yieldNow() {
+  return new Promise((resolve) => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => {
+      channel.port1.close();
+      resolve();
+    };
+    channel.port2.postMessage(0);
+  });
+}
 
 export class TrackNode {
   constructor(engine, def, buffer, kind) {
@@ -292,6 +305,7 @@ export class SongPlayer {
         src.loop = true;
       }
       const fade = this.ctx.createGain();
+      if (fadeIn > 0) fade.gain.value = 0;
       src.connect(fade);
       fade.connect(track.input);
       let startAt = when;
@@ -572,6 +586,64 @@ export class SongPlayer {
     if (top > 0) for (let i = 0; i < buckets; i++) out[i] = Math.pow(out[i] / top, 0.7);
     this.peakCache = out;
     return out;
+  }
+
+  resync() {
+    if (this.state !== 'playing' || this.disposed || !this.run || this.pending) return;
+    const now = this.ctx.currentTime;
+    if (now < this.run.ctxStart) return;
+    this.seek(this.position(now + 0.03), 'now');
+  }
+
+  waveSources() {
+    let sources = this.fileTracks.filter((track) => track.def.dest !== 'cue' && track.buffer);
+    if (!sources.length) sources = this.fileTracks.filter((track) => track.buffer);
+    return sources;
+  }
+
+  prepareWaveform() {
+    const sources = this.waveSources();
+    const key = sources.map((track) => track.def.id).join('|');
+    if (!this.wavePromise || this.waveKey !== key) {
+      this.waveKey = key;
+      this.wavePromise = this.computeWaveform(sources);
+    }
+    return this.wavePromise;
+  }
+
+  async computeWaveform(sources) {
+    const channels = [];
+    let length = 0;
+    let rate = this.ctx.sampleRate;
+    for (const track of sources) {
+      rate = track.buffer.sampleRate || rate;
+      length = Math.max(length, track.buffer.length);
+      for (let c = 0; c < track.buffer.numberOfChannels; c++) channels.push(track.buffer.getChannelData(c));
+    }
+    const data = new Float32Array(Math.max(1, Math.ceil(length / WAVE_BLOCK)));
+    let spent = 0;
+    for (const samples of channels) {
+      const count = Math.ceil(samples.length / WAVE_BLOCK);
+      for (let b = 0; b < count; b++) {
+        const end = Math.min(samples.length, (b + 1) * WAVE_BLOCK);
+        let max = data[b];
+        for (let i = b * WAVE_BLOCK; i < end; i += 2) {
+          const value = samples[i];
+          const level = value < 0 ? -value : value;
+          if (level > max) max = level;
+        }
+        data[b] = max;
+        spent += WAVE_BLOCK >> 1;
+        if (spent >= WAVE_SLICE) {
+          spent = 0;
+          await yieldNow();
+          if (this.disposed) return null;
+        }
+      }
+    }
+    let top = 0;
+    for (let b = 0; b < data.length; b++) if (data[b] > top) top = data[b];
+    return { rate, block: WAVE_BLOCK, data, top: top || 1, channels, length };
   }
 
   memoryBytes() {

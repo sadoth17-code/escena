@@ -5,6 +5,7 @@ import { SECTION_VOICES, SECTION_COLORS, voiceKeyForName } from '../voices.js';
 import { CLICK_SOUNDS } from '../synth.js';
 import { gatherAudio, draftTracks, isClickName, songBytes, songDuration } from '../library.js';
 import { icon, iconButton, openModal, confirmDialog, createSegmented, createSwitch, field, settingRow } from './kit.js';
+import { createSectionMap } from './section-map.js';
 
 const TABS = [
   { id: 'general', label: 'General' },
@@ -43,13 +44,26 @@ function numberInput({ value, min, max, step = 1, label, onChange, disabled = fa
 }
 
 export function openEditor(song, tab = 'general') {
-  if (app.player && app.current && app.current.song === song && app.player.state === 'playing') app.pause();
   const entry = () => (app.current && app.current.song === song ? app.current : null);
   let active = TABS.some((item) => item.id === tab) ? tab : 'general';
   let dirty = false;
+  let sectionMap = null;
+  let sectionTable = null;
+  let selectedMarkerId = null;
+
+  const destroyMap = () => {
+    if (sectionMap) sectionMap.destroy();
+    sectionMap = null;
+    sectionTable = null;
+  };
 
   const content = h('div', { class: 'editor-content' });
   const tabBar = h('div', { class: 'tabs', role: 'tablist' });
+  const reopenSections = () => {
+    if (active === 'sections') renderSections();
+  };
+  const offLoaded = app.on('song:loaded', reopenSections);
+  const offUnloaded = app.on('song:unloaded', reopenSections);
   const modal = openModal({
     title: song.title,
     size: 'xl',
@@ -57,6 +71,9 @@ export function openEditor(song, tab = 'general') {
     body: h('div', { class: 'editor-body' }, tabBar, content),
     actions: [{ label: 'Listo', kind: 'primary', icon: 'check', onClick: (api) => api.close() }],
     onClose: () => {
+      destroyMap();
+      offLoaded();
+      offUnloaded();
       const current = entry();
       if (current && dirty) app.emit('song:refresh', current);
     },
@@ -224,88 +241,171 @@ export function openEditor(song, tab = 'general') {
     );
   };
 
+  const markerById = (id) => song.markers.find((marker) => marker.id === id) || null;
+  const markerAtBar = (bar, except = null) => song.markers.find((marker) => marker !== except && marker.bar === bar) || null;
+  const sortMarkers = () => song.markers.sort((a, b) => a.bar - b.bar);
+  const duplicateToast = (bar, other) => app.toast(`Ya hay una sección en el compás ${bar}: ${other.name}`, 'error');
+
   const nextSectionBar = () => {
-    const current = entry();
-    if (current) {
-      const snap = app.snapshot();
-      if (snap && snap.time > 0.05 && !song.markers.some((marker) => marker.bar === snap.bar)) return snap.bar;
-    }
     const last = song.markers[song.markers.length - 1];
     return last ? last.bar + 8 : 1;
   };
 
-  const renderSections = () => {
+  const markSelectedRow = () => {
+    if (!sectionTable) return;
+    for (const row of sectionTable.querySelectorAll('.trow[data-id]')) row.classList.toggle('sel', row.dataset.id === selectedMarkerId);
+  };
+
+  const pickMarker = (marker) => {
+    const id = marker ? marker.id : null;
+    if (id === selectedMarkerId) return;
+    selectedMarkerId = id;
+    markSelectedRow();
+    if (sectionMap) sectionMap.select(id);
+  };
+
+  const refreshSections = () => {
+    if (active !== 'sections' || !sectionTable) return;
+    renderSectionTable();
+    if (sectionMap) sectionMap.refresh();
+  };
+
+  const moveMarker = (marker, bar) => {
+    if (!marker) return false;
+    const next = Math.max(1, Math.round(bar));
+    if (next === marker.bar) {
+      refreshSections();
+      return true;
+    }
+    const other = markerAtBar(next, marker);
+    if (other) {
+      duplicateToast(next, other);
+      refreshSections();
+      return false;
+    }
+    marker.bar = next;
+    sortMarkers();
+    changed('markers');
+    refreshSections();
+    return true;
+  };
+
+  const slotAfterLast = () => {
+    const current = entry();
+    let bar = nextSectionBar();
+    if (current) bar = Math.min(bar, current.player.tempo.barCount(current.player.duration - current.player.offset));
+    return markerAtBar(bar) ? null : bar;
+  };
+
+  const addMarker = (label, wanted) => {
+    const other = markerAtBar(wanted);
+    const bar = other ? slotAfterLast() : wanted;
+    if (!bar) {
+      duplicateToast(wanted, other);
+      return null;
+    }
+    const key = voiceKeyForName(label);
+    const marker = { id: uid(), name: label, bar, voice: key, color: SECTION_COLORS[key] || '#35c9ff' };
+    song.markers.push(marker);
+    sortMarkers();
+    changed('markers');
+    refreshSections();
+    if (other) app.toast(`El compás ${wanted} ya tiene «${other.name}». «${label}» se añadió en el compás ${bar}: arrastra su banderín o cambia su compás.`);
+    return marker;
+  };
+
+  const removeMarker = (marker) => {
+    const index = song.markers.indexOf(marker);
+    if (index < 0) return;
+    song.markers.splice(index, 1);
+    if (selectedMarkerId === marker.id) selectedMarkerId = null;
+    changed('markers');
+    refreshSections();
+  };
+
+  const renderSectionTable = () => {
     const rows = h('div', { class: 'table section-table' });
     rows.append(h('div', { class: 'trow thead' }, h('span', { text: 'Nombre' }), h('span', { text: 'Compás' }), h('span', { text: 'Voz de guía' }), h('span', { text: 'Color' }), h('span')));
     const datalistId = `sections-${uid()}`;
     const list = h('datalist', { id: datalistId }, SECTION_VOICES.map((voice) => h('option', { value: voice.label })));
-    song.markers.forEach((marker, index) => {
+    for (const marker of song.markers) {
       const name = h('input', { type: 'text', class: 'input', value: marker.name, maxlength: '30', list: datalistId, 'aria-label': 'Nombre de la sección' });
       const voice = h('select', { class: 'select', 'aria-label': 'Voz de guía' }, [h('option', { value: '', text: 'Sin voz', selected: !marker.voice }), ...SECTION_VOICES.map((item) => h('option', { value: item.key, text: item.label, selected: item.key === marker.voice }))]);
       const preview = iconButton({ name: 'speaker', label: 'Escuchar voz', onClick: () => marker.voice && app.previewVoice(marker.voice) });
-      name.addEventListener('change', () => {
-        const before = voiceKeyForName(marker.name);
-        marker.name = name.value.trim() || 'Sección';
-        const found = voiceKeyForName(marker.name);
-        if (!marker.voice || marker.voice === before) {
-          marker.voice = found;
-          if (found && SECTION_COLORS[found]) marker.color = SECTION_COLORS[found];
-        }
-        changed('markers');
-        renderSections();
-      });
+      const color = h('input', { type: 'color', class: 'color', value: marker.color, 'aria-label': 'Color de la sección' });
       const bar = numberInput({
         value: marker.bar,
         min: 1,
         step: 1,
         label: 'Compás de la sección',
-        onChange: (value) => {
-          const next = Math.max(1, Math.round(value));
-          if (song.markers.some((other) => other !== marker && other.bar === next)) {
-            app.toast('Ya hay una sección en ese compás', 'error');
-            renderSections();
-            return;
-          }
-          marker.bar = next;
-          song.markers.sort((a, b) => a.bar - b.bar);
-          changed('markers');
-          renderSections();
-        },
+        onChange: (value) => moveMarker(marker, value),
+      });
+      name.addEventListener('change', () => {
+        const before = voiceKeyForName(marker.name);
+        marker.name = name.value.trim() || 'Sección';
+        name.value = marker.name;
+        const found = voiceKeyForName(marker.name);
+        if (!marker.voice || marker.voice === before) {
+          marker.voice = found;
+          if (found && SECTION_COLORS[found]) marker.color = SECTION_COLORS[found];
+          voice.value = marker.voice;
+          color.value = marker.color;
+        }
+        changed('markers');
+        if (sectionMap) sectionMap.refresh();
       });
       voice.addEventListener('change', () => {
         marker.voice = voice.value;
         changed('markers');
         if (marker.voice) app.previewVoice(marker.voice);
       });
-      const color = h('input', { type: 'color', class: 'color', value: marker.color, 'aria-label': 'Color de la sección' });
       color.addEventListener('change', () => {
         marker.color = color.value;
         changed('markers');
+        if (sectionMap) sectionMap.refresh();
       });
-      const del = iconButton({ name: 'trash', label: 'Quitar sección', onClick: () => { song.markers.splice(index, 1); changed('markers'); renderSections(); } });
-      rows.append(h('div', { class: 'trow' }, name, bar, h('div', { class: 'voice-cell' }, voice, preview), color, del));
-    });
+      const del = iconButton({ name: 'trash', label: 'Quitar sección', onClick: () => removeMarker(marker) });
+      const row = h('div', { class: marker.id === selectedMarkerId ? 'trow sel' : 'trow', dataset: { id: marker.id } }, name, bar, h('div', { class: 'voice-cell' }, voice, preview), color, del);
+      row.addEventListener('focusin', () => pickMarker(marker));
+      rows.append(row);
+    }
     if (!song.markers.length) rows.append(h('div', { class: 'table-empty', text: 'Aún no hay secciones. Añade Intro, Verso, Coro… con el compás donde empiezan.' }));
-    const quick = h('div', { class: 'quick-add' }, QUICK_SECTIONS.map((label) => h('button', {
-      type: 'button',
-      class: 'chip small',
-      onClick: () => {
-        const key = voiceKeyForName(label);
-        const bar = nextSectionBar();
-        song.markers.push({ id: uid(), name: label, bar, voice: key, color: SECTION_COLORS[key] || '#35c9ff' });
-        song.markers.sort((a, b) => a.bar - b.bar);
-        changed('markers');
-        renderSections();
-      },
-    }, label)));
-    const where = entry() ? 'Se añade en el compás actual (o 8 compases después de la última sección).' : 'Se añade 8 compases después de la última sección; cambia el compás en la tabla.';
+    sectionTable.replaceChildren(rows, list);
+  };
+
+  const renderSections = () => {
+    destroyMap();
+    const current = entry();
+    const intro = h('p', { class: 'field-hint sections-intro', text: 'Cada sección tiene un compás de inicio. La guía de voz anuncia la sección con anticipación, y puedes saltar entre secciones al tocar.' });
+    const heading = h('h3', { class: 'sub', text: 'Todas las secciones' });
+    sectionTable = h('div', { class: 'section-host' });
+    if (selectedMarkerId && !markerById(selectedMarkerId)) selectedMarkerId = null;
+    renderSectionTable();
+    if (current) {
+      sectionMap = createSectionMap({
+        song,
+        entry: current,
+        quick: QUICK_SECTIONS,
+        addMarker,
+        moveMarker,
+        removeMarker,
+        selectMarker: pickMarker,
+      });
+      if (selectedMarkerId) sectionMap.select(selectedMarkerId);
+      content.replaceChildren(intro, sectionMap.el, heading, sectionTable);
+      return;
+    }
+    const load = h('button', { type: 'button', class: 'btn small', onClick: () => app.loadSong(song.id) }, icon('play', 16), 'Cargar canción');
+    const notice = h('div', { class: 'notice info smap-notice' }, icon('info', 20), h('div', {}, h('b', { text: 'Carga la canción para ver su onda' }), h('p', { text: 'Con la canción cargada verás la forma de onda con zoom y podrás colocar las secciones escuchando. Al cargarla se detiene la que esté sonando.' }), load));
+    const quick = h('div', { class: 'quick-add' }, QUICK_SECTIONS.map((label) => h('button', { type: 'button', class: 'chip small', onClick: () => addMarker(label, nextSectionBar()) }, label)));
     content.replaceChildren(
-      h('p', { class: 'field-hint', text: 'Cada sección tiene un compás de inicio. La guía de voz anuncia la sección con anticipación, y puedes saltar entre secciones al tocar.' }),
-      rows,
-      list,
+      intro,
+      notice,
+      heading,
+      sectionTable,
       h('h3', { class: 'sub', text: 'Añadir sección' }),
       quick,
-      h('p', { class: 'field-hint', text: where })
+      h('p', { class: 'field-hint', text: 'Se añade 8 compases después de la última sección; cambia el compás en la tabla.' })
     );
   };
 
@@ -463,6 +563,7 @@ export function openEditor(song, tab = 'general') {
 
   const showTab = (id) => {
     active = id;
+    destroyMap();
     for (const button of tabBar.children) {
       const on = button.dataset.tab === id;
       button.classList.toggle('active', on);

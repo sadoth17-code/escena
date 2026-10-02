@@ -293,6 +293,7 @@ class App {
         for (const track of player.allTracks()) track.route();
         player.refreshSolo();
       }
+      if (kind === 'tempo' || kind === 'markers' || kind === 'guide' || kind === 'click') player.resync();
       this.emit('transport', entry);
     }
     this.persistSongSoon(song);
@@ -545,7 +546,14 @@ class App {
   }
 
   async reloadIfCurrent(id) {
-    if (this.current && this.current.song.id === id) await this.loadSong(id, { force: true });
+    if (!this.current || this.current.song.id !== id) return;
+    const before = this.current.player;
+    const resume = { time: before.position(), playing: before.state === 'playing' };
+    await this.loadSong(id, { force: true });
+    const after = this.current && this.current.song.id === id ? this.current.player : null;
+    if (!after) return;
+    if (resume.time > 0.05) after.seek(resume.time, 'now');
+    if (resume.playing) await after.play({ countIn: false });
   }
 
   discardNext() {
@@ -685,6 +693,15 @@ class App {
     const section = player.sectionAt(clamp(target, 0, player.duration));
     if (this.loopMode && section) player.armLoop(this.sectionRange(section));
     player.seek(clamp(target, 0, player.duration), this.settings.jumpMode);
+  }
+
+  seekExact(time) {
+    const player = this.player;
+    if (!player) return;
+    const target = clamp(time, 0, player.duration);
+    const section = player.sectionAt(target);
+    if (this.loopMode && section) player.armLoop(this.sectionRange(section));
+    player.seek(target, 'now');
   }
 
   toggleLoop() {

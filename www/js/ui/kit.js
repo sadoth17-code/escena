@@ -210,7 +210,7 @@ export function showToast({ message, kind = 'info', action, duration }) {
     toastHost = h('div', { class: 'toasts', 'aria-live': 'polite', role: 'status' });
     document.body.append(toastHost);
   }
-  const toast = h('div', { class: `toast ${kind}` }, h('span', { class: 'toast-text', text: message }));
+  const toast = h('div', { class: `toast ${kind}${action ? ' has-action' : ''}` }, h('span', { class: 'toast-text', text: message }));
   const remove = () => toast.remove();
   toast.addEventListener('click', remove);
   if (action) {
