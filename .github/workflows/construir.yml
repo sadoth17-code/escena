@@ -1,0 +1,171 @@
+name: Construir Escena
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: construir-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    name: Página web
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Preparar modo sin internet
+        run: node scripts/preparar-web.mjs www "${{ github.sha }}"
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: www
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+  android:
+    name: Android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Instalar dependencias
+        run: npm ci --ignore-scripts
+      - name: Crear proyecto Android
+        run: npx cap add android
+      - name: Aplicar iconos y firma
+        run: |
+          cp -r android-res/res/. android/app/src/main/res/
+          echo 'apply from: "../../android-res/signing.gradle"' >> android/app/build.gradle
+          chmod +x android/gradlew
+      - name: Aceptar licencias del SDK
+        run: yes | sdkmanager --licenses > /dev/null || true
+      - name: Compilar APK
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+      - name: Nombrar APK
+        run: |
+          mkdir -p salida
+          cp android/app/build/outputs/apk/release/app-release.apk "salida/Escena-Android-1.0.${{ github.run_number }}.apk"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android
+          path: salida/*.apk
+          if-no-files-found: error
+          retention-days: 3
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - name: Instalar dependencias
+        run: npm ci
+      - name: Crear instalador y versión portátil
+        run: npx electron-builder --win --publish never "-c.extraMetadata.version=1.0.${{ github.run_number }}"
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: dist/Escena-*.exe
+          if-no-files-found: error
+          retention-days: 3
+
+  mac:
+    name: Mac
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - name: Instalar dependencias
+        run: npm ci
+      - name: Crear instalador para Mac
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          VERSION: 1.0.${{ github.run_number }}
+        run: |
+          for intento in 1 2; do
+            npx electron-builder --mac --publish never "-c.extraMetadata.version=$VERSION" && exit 0
+            rm -rf dist
+          done
+          exit 1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mac
+          path: dist/Escena-*.dmg
+          if-no-files-found: error
+          retention-days: 3
+
+  descargas:
+    name: Publicar descargas
+    needs: [android, windows, mac]
+    if: ${{ !cancelled() && (needs.android.result == 'success' || needs.windows.result == 'success' || needs.mac.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: salida
+      - name: Publicar versión
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          TAG: v1.0.${{ github.run_number }}
+        run: |
+          cat > notas.md <<'NOTAS'
+          Android: descarga el archivo .apk en tu celular o tablet, ábrelo e instálalo. Si el teléfono lo pide, permite instalar apps desde esta fuente.
+
+          Windows: el Instalador deja la app en tu menú Inicio; la versión Portátil funciona sin instalar. Si Windows muestra "Windows protegió su PC", pulsa "Más información" y luego "Ejecutar de todas formas".
+
+          Mac: abre el archivo .dmg y arrastra Escena a Aplicaciones. La primera vez macOS la bloquea: abre Configuración del Sistema, Privacidad y seguridad, y pulsa "Abrir de todos modos".
+
+          iPhone, iPad y cualquier navegador: abre https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/ y usa Compartir, Añadir a pantalla de inicio.
+          NOTAS
+          mapfile -t archivos < <(find salida -type f \( -name '*.apk' -o -name '*.exe' -o -name '*.dmg' \) | sort)
+          if [ "${#archivos[@]}" -eq 0 ]; then
+            echo "No hay archivos para publicar"
+            exit 1
+          fi
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            gh release upload "$TAG" "${archivos[@]}" --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" "${archivos[@]}" \
+              --repo "$REPO" \
+              --target "$SHA" \
+              --title "Escena ${TAG#v}" \
+              --notes-file notas.md \
+              --latest
+          fi
