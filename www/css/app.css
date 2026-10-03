@@ -2409,6 +2409,10 @@ p {
   cursor: grab;
 }
 
+.smap-stage.over-flag {
+  cursor: pointer;
+}
+
 .smap-stage.grabbing {
   cursor: grabbing;
 }
@@ -2453,6 +2457,38 @@ p {
   overflow: hidden;
   touch-action: none;
   cursor: pointer;
+}
+
+.smap-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 32px;
+  font-size: 13px;
+  line-height: 1.35;
+  color: var(--text-3);
+}
+
+.smap-status.pick {
+  color: var(--text);
+}
+
+.smap-status.armed {
+  color: #ffb020;
+  font-weight: 700;
+}
+
+.smap-status-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.smap-status .btn {
+  flex: none;
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 12.5px;
 }
 
 .smap-sel {
@@ -3524,6 +3560,14 @@ body.stage-open .toasts {
     height: 160px;
   }
 
+  .smap-status {
+    min-height: 38px;
+  }
+
+  .smap-status .btn {
+    min-height: 36px;
+  }
+
   .smap-zoombox {
     width: 100%;
     flex-wrap: nowrap;
@@ -3895,6 +3939,14 @@ body.stage-open .toasts {
 
   .smap-stage {
     height: 104px;
+  }
+
+  .smap-status {
+    min-height: 28px;
+  }
+
+  .smap-status .btn {
+    min-height: 26px;
   }
 
   .smap-overview {

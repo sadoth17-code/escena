@@ -5,7 +5,7 @@ Reproductor profesional de secuencias multitrack para músicos, bandas, iglesias
 - Mezclador por pista: volumen, paneo, mute y solo.
 - Click con mapa de tempo y pre-conteo.
 - Guías de voz por secciones (Intro, Verso, Coro, Puente…) que avisan antes de cada cambio.
-- Editor de secciones sobre la onda de la canción: zoom hasta ver cada golpe, cursor con reproducción y marcadores que se arrastran al compás exacto. La canción no se detiene mientras editas y los cambios de tempo, click y guía se oyen al instante.
+- Editor de secciones sobre la onda de la canción: zoom hasta ver cada golpe, compases dibujados como bloques y marcadores que se arrastran al compás exacto. Al tocar la onda se elige siempre un compás completo, y si la canción suena el salto espera al final del compás (o del tiempo, según el ajuste de salto). La canción no se detiene mientras editas y los cambios de tempo, click y guía se oyen al instante.
 - Salida estéreo dividida: click y guía por el canal izquierdo, pistas por el derecho (se puede invertir).
 - Salidas múltiples: con una interfaz de audio de varias salidas, eliges por cuáles suenan las pistas (por ejemplo la 1 y la 2) y por cuál el click y la guía (por ejemplo la 3). Si desconectas la interfaz y la vuelves a conectar, la app la recupera sola.
 - Setlist, modo escenario y control con pedal Bluetooth, teclado o MIDI.
@@ -27,7 +27,7 @@ Entra a [Descargas (Releases)](../../releases/latest) y baja el archivo de tu di
 1. Abre la app y pulsa **Crear canción de prueba**: genera una canción de cuatro pistas con click y guía de voz para que pruebes todo sin archivos propios.
 2. Para usar tus canciones pulsa **Importar canciones** y elige una pista por archivo (WAV, MP3, FLAC, M4A, OGG, AIFF) o un ZIP con todas las pistas. Todas deben empezar en el mismo punto.
 3. Las pistas que se llamen «Click» o «Guía», «Cue» o «Conteo» van a la salida Cue (músicos); las demás van a Sala (público). Si hay una pista de click, el tempo se detecta solo.
-4. Entra a **Editar canción** para revisar el tempo, colocar las secciones sobre la onda con zoom (con su guía de voz) y ajustar el destino de cada pista. La reproducción sigue mientras editas.
+4. Entra a **Editar canción** para revisar el tempo, colocar las secciones sobre la onda con zoom (con su guía de voz) y ajustar el destino de cada pista. La reproducción sigue mientras editas. Toca un compás de la onda para elegirlo y pulsa el nombre de una sección (Intro, Verso, Coro…) para marcarlo exactamente ahí.
 5. Arma tu setlist y usa el **Modo escenario** durante el servicio o el concierto.
 
 ## Compilación automática

@@ -11,6 +11,7 @@ const MIN_SPAN = 0.25;
 const SLOP = 5;
 const DIRECT = 512;
 const ZOOM = 2;
+const ZEBRA_MIN = 10;
 
 export function waveColumns(wave, t0, span, columns) {
   const out = new Float32Array(columns);
@@ -123,7 +124,10 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     h('div', { class: 'smap-sel-actions' }, nudgeBack, nudgeForward, listenButton, removeButton)
   );
 
-  const help = h('p', { class: 'field-hint smap-help', text: 'Rueda del mouse o pellizco: acercar. Arrastra la onda: moverte. Toca la onda: poner el cursor. Arrastra el puntito de una sección (⋮⋮): moverla de compás.' });
+  const help = h('p', { class: 'field-hint smap-help', text: 'Rueda del mouse o pellizco: acercar. Arrastra la onda: moverte. Toca un compás para ir a su inicio y elegirlo. Toca el nombre de una sección para saltar a ella. Arrastra el puntito de una sección (⋮⋮): moverla de compás.' });
+  const statusText = h('span', { class: 'smap-status-text' });
+  const clearButton = h('button', { type: 'button', class: 'btn small', hidden: true, onClick: () => clearPick() }, 'Quitar elección');
+  const status = h('div', { class: 'smap-status idle', role: 'status' }, statusText, clearButton);
   const addLabel = h('span', { class: 'smap-add-label' });
   const addRow = h(
     'div',
@@ -131,7 +135,7 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     addLabel,
     h('div', { class: 'quick-add' }, quick.map((label) => h('button', { type: 'button', class: 'chip small', onClick: () => add(label) }, label)))
   );
-  const el = h('div', { class: 'smap' }, bar, stage, overview, selBar, addRow, help);
+  const el = h('div', { class: 'smap' }, bar, stage, overview, status, selBar, addRow, help);
 
   const under = document.createElement('canvas');
   const litLayer = document.createElement('canvas');
@@ -156,15 +160,23 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
   let raf = 0;
   let destroyed = false;
   let lastClock = '';
-  let lastCursorBar = 0;
+  let lastLabel = '';
   let lastZoom = '';
+  let lastStatus = '';
+  let lastTone = '';
+  let pickedBar = null;
+  let armedBar = null;
+  let hoverY = null;
+  let hoverFlag = false;
   const pointers = new Map();
 
   const maxBar = () => Math.max(1, player.tempo.barCount(Math.max(0, duration - player.offset)));
   const xCss = (time) => ((time - view.t0) / view.span) * size.w;
   const tOf = (x) => view.t0 + (x / Math.max(1, size.w)) * view.span;
   const barAtTime = (time) => clamp(Math.round(player.tempo.barFloat(Math.max(0, time - player.offset))), 1, maxBar());
-  const cursorBar = () => barAtTime(player.position());
+  const blockAt = (time) => clamp(Math.floor(player.tempo.barFloat(Math.max(0, time - player.offset)) + 1e-6), 1, maxBar());
+  const barTime = (bar) => player.tempo.barStart(bar) + player.offset;
+  const cursorBar = () => blockAt(player.position());
   const markerOf = (id) => song.markers.find((item) => item.id === id) || null;
   const sectionOf = (id) => player.sections().find((item) => item.id === id) || null;
 
@@ -265,9 +277,27 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
 
   const select = (id) => {
     selectedId = id;
+    if (id) pickedBar = null;
     renderSelection();
     staticDirty = true;
     selectMarker(id ? markerOf(id) : null);
+  };
+
+  const clearPick = () => {
+    pickedBar = null;
+  };
+
+  const pickBar = (bar) => {
+    pickedBar = bar;
+    if (selectedId) select(null);
+    const inside = player.state === 'playing' && player.jumpTarget() === null && cursorBar() === bar;
+    if (!inside) app.seekTo(barTime(bar));
+  };
+
+  const chooseSection = (id) => {
+    select(id);
+    const section = sectionOf(id);
+    if (section) app.jumpToSection(section.index);
   };
 
   const nudge = (delta) => {
@@ -278,12 +308,16 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
   const listen = () => {
     const section = selectedId ? sectionOf(selectedId) : null;
     if (!section) return;
-    app.seekExact(section.start);
-    reveal(section.start);
-    if (player.state !== 'playing') player.play({ countIn: false });
+    const idle = player.state !== 'playing';
+    app.jumpToSection(section.index);
+    if (idle) {
+      reveal(section.start);
+      player.play({ countIn: false });
+    }
   };
 
   const toStart = () => {
+    pickedBar = null;
     app.seekExact(0);
     reveal(0);
   };
@@ -294,8 +328,9 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
   };
 
   const add = (label) => {
-    const marker = addMarker(label, cursorBar());
+    const marker = addMarker(label, pickedBar !== null ? pickedBar : cursorBar());
     if (!marker) return;
+    pickedBar = null;
     select(marker.id);
     const section = sectionOf(marker.id);
     if (section) {
@@ -323,6 +358,12 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     const list = player.sections();
     const tempo = player.tempo;
     const offset = player.offset;
+    const firstBar = Math.max(1, Math.floor(tempo.barFloat(Math.max(0, view.t0 - offset))));
+    const lastBar = Math.ceil(tempo.barFloat(Math.max(0, view.t0 + view.span - offset))) + 1;
+    const first = tempo.segmentAtBar(firstBar);
+    const pxPerBar = (size.w * first.barDur) / view.span;
+    const step = barStep(pxPerBar);
+    const hair = Math.max(1, px(1));
 
     for (const section of list) {
       if (section.implicit) continue;
@@ -334,6 +375,18 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
       u.fillRect(Math.max(0, x0), flagH, Math.min(W, x1) - Math.max(0, x0), H - flagH);
     }
     u.globalAlpha = 1;
+
+    if (pxPerBar >= ZEBRA_MIN) {
+      u.fillStyle = 'rgba(255, 255, 255, 0.07)';
+      for (let number = firstBar + (firstBar % 2); number <= lastBar; number += 2) {
+        const start = tempo.barStart(number) + offset;
+        if (start >= duration) break;
+        const x0 = Math.round(toX(start));
+        const x1 = Math.round(toX(Math.min(duration, tempo.barStart(number + 1) + offset)));
+        if (x1 < 0 || x0 > W) continue;
+        u.fillRect(Math.max(0, x0), flagH, Math.min(W, x1) - Math.max(0, x0), H - flagH);
+      }
+    }
 
     if (wave) {
       const colW = Math.max(1, Math.round(dpr));
@@ -352,12 +405,6 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     o.fillRect(0, bottom, W, rulerH);
     o.fillStyle = '#242c36';
     o.fillRect(0, bottom, W, Math.max(1, px(1)));
-    const firstBar = Math.max(1, Math.floor(tempo.barFloat(Math.max(0, view.t0 - offset))));
-    const lastBar = Math.ceil(tempo.barFloat(Math.max(0, view.t0 + view.span - offset))) + 1;
-    const first = tempo.segmentAtBar(firstBar);
-    const pxPerBar = (size.w * first.barDur) / view.span;
-    const step = barStep(pxPerBar);
-    const hair = Math.max(1, px(1));
     o.textBaseline = 'alphabetic';
     for (let number = firstBar; number <= lastBar; number++) {
       const segment = tempo.segmentAtBar(number);
@@ -501,6 +548,48 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     ctx.drawImage(over, 0, 0);
     const flagH = px(FLAG);
     const bottom = H - px(RULER);
+    const block = (bar) => {
+      const a = Math.round(toX(barTime(bar)));
+      const b = Math.round(toX(Math.min(duration, barTime(bar + 1))));
+      return { a, b, w: Math.max(px(2), b - a) };
+    };
+    const fillBlock = (rect, color) => {
+      ctx.fillStyle = color;
+      ctx.fillRect(rect.a, flagH, rect.w, bottom - flagH);
+    };
+    const frameBlock = (rect, color, dashed) => {
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = px(2);
+      if (dashed) ctx.setLineDash([px(6), px(4)]);
+      ctx.strokeRect(rect.a + px(1), flagH + px(1), Math.max(px(2), rect.w - px(2)), bottom - flagH - px(2));
+      ctx.restore();
+    };
+    const pill = (rect, text, back, ink) => {
+      const left = Math.max(0, rect.a);
+      const right = Math.min(W, rect.a + rect.w);
+      ctx.font = `700 ${px(10.5)}px system-ui, sans-serif`;
+      const padX = px(7);
+      const width = Math.ceil(ctx.measureText(text).width) + padX * 2;
+      if (right - left < width + px(6)) return;
+      const height = px(16);
+      const x0 = Math.round((left + right) / 2 - width / 2);
+      const y0 = bottom - height - px(5);
+      const r = px(8);
+      ctx.fillStyle = back;
+      ctx.beginPath();
+      ctx.moveTo(x0 + r, y0);
+      ctx.arcTo(x0 + width, y0, x0 + width, y0 + height, r);
+      ctx.arcTo(x0 + width, y0 + height, x0, y0 + height, r);
+      ctx.arcTo(x0, y0 + height, x0, y0, r);
+      ctx.arcTo(x0, y0, x0 + width, y0, r);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = ink;
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, x0 + padX, y0 + height / 2 + px(0.5));
+      ctx.textBaseline = 'alphabetic';
+    };
     if (snap.loop) {
       const a = Math.round(toX(snap.loop.a));
       const b = Math.round(toX(snap.loop.b));
@@ -509,6 +598,20 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
       ctx.fillStyle = '#ffb020';
       ctx.fillRect(a, flagH, px(2), bottom - flagH);
       ctx.fillRect(b - px(2), flagH, px(2), bottom - flagH);
+    }
+    fillBlock(block(blockAt(snap.time)), 'rgba(53, 201, 255, 0.07)');
+    if (hoverX !== null && hoverY !== null && !hoverFlag && !drag && !pinch) fillBlock(block(blockAt(tOf(hoverX))), 'rgba(255, 255, 255, 0.09)');
+    if (armedBar !== null && armedBar !== pickedBar) {
+      const rect = block(armedBar);
+      fillBlock(rect, 'rgba(255, 176, 32, 0.1)');
+      frameBlock(rect, '#ffb020', true);
+      pill(rect, 'Saltará aquí', '#ffb020', '#0b0d10');
+    }
+    if (pickedBar !== null) {
+      const rect = block(pickedBar);
+      fillBlock(rect, 'rgba(255, 255, 255, 0.13)');
+      frameBlock(rect, '#ffffff', false);
+      pill(rect, 'Elegido', '#ffffff', '#0b0d10');
     }
     const jump = player.jumpTarget();
     if (jump !== null) {
@@ -524,21 +627,17 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
       ctx.restore();
     }
     if (preview) {
-      const pxTime = player.tempo.barStart(preview.bar) + player.offset;
+      fillBlock(block(preview.bar), 'rgba(255, 255, 255, 0.1)');
       ctx.save();
       ctx.strokeStyle = '#ffffff';
       ctx.lineWidth = px(2);
       ctx.setLineDash([px(5), px(4)]);
-      const sx = Math.round(toX(pxTime));
+      const sx = Math.round(toX(barTime(preview.bar)));
       ctx.beginPath();
       ctx.moveTo(sx, 0);
       ctx.lineTo(sx, bottom);
       ctx.stroke();
       ctx.restore();
-    }
-    if (hoverX !== null && !drag && !pinch) {
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
-      ctx.fillRect(Math.round(hoverX * dpr), flagH, Math.max(1, px(1)), bottom - flagH);
     }
     if (x >= -px(8) && x <= W + px(8)) {
       ctx.fillStyle = '#ffffff';
@@ -587,12 +686,23 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     tip.hidden = true;
   };
 
-  const hoverText = (x) => {
+  const hoverText = (x, y) => {
     const time = tOf(x);
-    const position = player.tempo.position(Math.max(0, time - player.offset));
     const section = player.sectionAt(time);
-    const name = section && !section.implicit ? ` · ${section.name}` : '';
-    return `Compás ${position.bar} · tiempo ${position.beat} · ${clockText(time, view.span < 3 ? 3 : 1)}${name}`;
+    const name = section && !section.implicit ? section.name : '';
+    if (y <= FLAG && flagAt(x, y)) return `${name} · compás ${section.bar}`;
+    return `Compás ${blockAt(time)}${name ? ` · ${name}` : ''}`;
+  };
+
+  const flagAt = (x, y) => {
+    if (y > FLAG) return null;
+    const list = player.sections();
+    for (let i = list.length - 1; i >= 0; i--) {
+      const section = list[i];
+      if (section.implicit) continue;
+      if (x >= xCss(section.start) && x < xCss(section.end)) return section;
+    }
+    return null;
   };
 
   const gripAt = (x, y) => {
@@ -611,6 +721,17 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
 
   const localX = (event) => event.clientX - stage.getBoundingClientRect().left - stage.clientLeft;
   const localY = (event) => event.clientY - stage.getBoundingClientRect().top - stage.clientTop;
+
+  const setHover = (x, y) => {
+    hoverX = x;
+    hoverY = y;
+    const grip = gripAt(x, y);
+    const flag = grip ? null : flagAt(x, y);
+    hoverFlag = Boolean(grip || flag);
+    showTip(x, hoverText(x, y));
+    stage.classList.toggle('over-grip', Boolean(grip));
+    stage.classList.toggle('over-flag', Boolean(flag));
+  };
 
   const startPinch = () => {
     const [first, second] = Array.from(pointers.values());
@@ -653,7 +774,8 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
       drag = { type: 'marker', id: grip.id, startX: x, grab: x - xCss(grip.start), moved: false, bar: grip.bar, name: grip.name };
       if (selectedId !== grip.id) select(grip.id);
     } else {
-      drag = { type: 'pan', startX: x, t0: view.t0, moved: false };
+      const flag = flagAt(x, y);
+      drag = { type: flag ? 'flag' : 'pan', id: flag ? flag.id : null, startX: x, t0: view.t0, moved: false };
     }
   };
 
@@ -669,7 +791,8 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
       const dx = x - drag.startX;
       if (!drag.moved && Math.abs(dx) < SLOP) return;
       drag.moved = true;
-      if (drag.type === 'pan') {
+      if (drag.type === 'pan' || drag.type === 'flag') {
+        drag.type = 'pan';
         setView(drag.t0 - (dx / Math.max(1, size.w)) * view.span, view.span);
         releaseFollow();
         stage.classList.add('grabbing');
@@ -680,11 +803,7 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
       }
       return;
     }
-    if (event.pointerType === 'mouse') {
-      hoverX = x;
-      showTip(x, hoverText(x));
-      stage.classList.toggle('over-grip', Boolean(gripAt(x, y)));
-    }
+    if (event.pointerType === 'mouse') setHover(x, y);
   };
 
   const onUp = (event) => {
@@ -698,8 +817,12 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     drag = null;
     stage.classList.remove('grabbing');
     if (!current) return;
+    if (current.type === 'flag') {
+      if (!current.moved) chooseSection(current.id);
+      return;
+    }
     if (current.type === 'pan') {
-      if (!current.moved) app.seekExact(tOf(localX(event)));
+      if (!current.moved) pickBar(blockAt(tOf(localX(event))));
       return;
     }
     preview = null;
@@ -708,8 +831,7 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
       moveMarker(markerOf(current.id), current.bar);
       return;
     }
-    const section = sectionOf(current.id);
-    if (section) app.seekExact(section.start);
+    chooseSection(current.id);
   };
 
   const onCancel = (event) => {
@@ -723,8 +845,11 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
 
   const onLeave = () => {
     hoverX = null;
+    hoverY = null;
+    hoverFlag = false;
     if (!drag) hideTip();
     stage.classList.remove('over-grip');
+    stage.classList.remove('over-flag');
   };
 
   const onWheel = (event) => {
@@ -742,10 +867,7 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
       zoomAround(Math.exp(-dy * rate), tOf(x), x / Math.max(1, size.w));
       releaseFollow();
     }
-    if (!drag && !pinch) {
-      hoverX = x;
-      showTip(x, hoverText(x));
-    }
+    if (!drag && !pinch) setHover(x, localY(event));
   };
 
   const onKey = (event) => {
@@ -823,6 +945,46 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     if (x < 0 || x > size.w * 0.94) setView(snap.time - view.span * 0.1, view.span);
   };
 
+  const jumpInfo = () => {
+    const target = player.jumpTarget();
+    if (target === null || player.state !== 'playing' || app.settings.jumpMode === 'now') return null;
+    const section = player.sectionAt(target + 1e-4);
+    return {
+      bar: blockAt(target + 1e-4),
+      name: section && !section.implicit && Math.abs(section.start - target) < 0.01 ? section.name : '',
+    };
+  };
+
+  const syncStatus = () => {
+    const jump = jumpInfo();
+    let tone = 'idle';
+    let text = 'Toca un compás de la onda para elegirlo y saltar a él.';
+    if (jump) {
+      tone = 'armed';
+      const where = jump.name ? `a «${jump.name}» (compás ${jump.bar})` : `al compás ${jump.bar}`;
+      text = `Saltará ${where} ${app.settings.jumpMode === 'beat' ? 'en el siguiente tiempo' : 'al terminar este compás'}.`;
+    } else if (pickedBar !== null) {
+      tone = 'pick';
+      text = `Compás ${pickedBar} elegido. Pulsa una sección para marcarlo ahí.`;
+    }
+    if (text !== lastStatus) {
+      lastStatus = text;
+      statusText.textContent = text;
+    }
+    if (tone !== lastTone) {
+      lastTone = tone;
+      status.classList.remove('idle', 'pick', 'armed');
+      status.classList.add(tone);
+    }
+    const pick = pickedBar === null ? '' : String(pickedBar);
+    if (stage.dataset.pick !== pick) stage.dataset.pick = pick;
+    armedBar = jump ? jump.bar : null;
+    const armed = jump ? String(jump.bar) : '';
+    if (stage.dataset.armed !== armed) stage.dataset.armed = armed;
+    const showClear = pickedBar !== null;
+    if (clearButton.hidden === showClear) clearButton.hidden = !showClear;
+  };
+
   const syncControls = (snap) => {
     const text = `Compás ${snap.bar} · ${clockText(snap.time)} / ${clockText(duration)}`;
     if (text !== lastClock) {
@@ -835,11 +997,13 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
       playIcon.replaceChildren(icon(playing ? 'pause' : 'play', 24));
       playButton.setAttribute('aria-label', playing ? 'Pausar' : 'Reproducir');
     }
-    const bar = cursorBar();
-    if (bar !== lastCursorBar) {
-      lastCursorBar = bar;
-      addLabel.textContent = `Marcar una sección en el cursor (compás ${bar})`;
+    const target = pickedBar !== null ? pickedBar : cursorBar();
+    const label = `Marcar en el compás ${target} (${pickedBar !== null ? 'elegido' : 'cursor'})`;
+    if (label !== lastLabel) {
+      lastLabel = label;
+      addLabel.textContent = label;
     }
+    syncStatus();
   };
 
   const frame = () => {
@@ -883,7 +1047,8 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     refresh() {
       staticDirty = true;
       overviewDirty = true;
-      lastCursorBar = 0;
+      lastLabel = '';
+      if (pickedBar !== null && pickedBar > maxBar()) pickedBar = null;
       renderSelection();
     },
     select(id) {
