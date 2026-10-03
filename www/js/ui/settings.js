@@ -422,7 +422,7 @@ export function openSettings() {
   };
   unsubscribe.push(platform.on('install', renderInstall));
   renderInstall();
-  const appSection = section('Aplicación', null, installBox, usageText, persistButton, h('p', { class: 'field-hint', text: 'Escena 1.0 · Funciona sin conexión · ingvelarde.com' }));
+  const appSection = section('Aplicación', null, installBox, usageText, persistButton, h('p', { class: 'field-hint', text: 'Escena · Edición Nube v5 · ingvelarde.com' }));
 
   const wipe = h('button', {
     type: 'button',

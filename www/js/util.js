@@ -65,13 +65,21 @@ export function createEmitter() {
 
 export function debounce(fn, wait) {
   let timer = null;
+  let pending = null;
   const wrapped = (...args) => {
     clearTimeout(timer);
-    timer = setTimeout(() => fn(...args), wait);
+    pending = args;
+    timer = setTimeout(() => { pending = null; fn(...args); }, wait);
   };
   wrapped.flush = (...args) => {
     clearTimeout(timer);
+    pending = null;
     fn(...args);
+  };
+  wrapped.flushPending = () => {
+    clearTimeout(timer);
+    const args = pending; pending = null;
+    return args ? fn(...args) : undefined;
   };
   return wrapped;
 }

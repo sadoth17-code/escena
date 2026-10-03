@@ -477,7 +477,7 @@ class App {
         if (onProgress) onProgress(done, total, job.track.name);
       }
     };
-    await Promise.all(Array.from({ length: Math.min(2, total) }, worker));
+    await Promise.all(Array.from({ length: Math.min(MOBILE ? 1 : 2, total) }, worker));
     if (!buffers.size) throw new Error('No se pudo leer ninguna pista de esta canción. Revisa el formato de los archivos');
     this.saveSong(song, true).catch(() => {});
     for (const track of song.tracks) track.solo = false;

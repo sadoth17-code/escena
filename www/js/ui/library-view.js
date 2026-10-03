@@ -2,6 +2,7 @@ import { h, fmtTime, fmtBytes, naturalCompare } from '../util.js';
 import { app } from '../app.js';
 import { songDuration, songBytes } from '../library.js';
 import { icon, iconButton, createSegmented, confirmDialog, promptDialog } from './kit.js';
+import { createCloudView } from './cloud-view.js';
 
 function songMeta(song) {
   const first = song.tempoMap[0];
@@ -19,6 +20,7 @@ export function createLibraryView({ onImport, onEdit }) {
     options: [
       { value: 'setlist', label: 'Setlist', icon: 'list' },
       { value: 'library', label: 'Biblioteca', icon: 'music' },
+      { value: 'cloud', label: 'Nube', icon: 'cloud' },
     ],
     value: mode,
     label: 'Vista',
@@ -26,6 +28,7 @@ export function createLibraryView({ onImport, onEdit }) {
       mode = value;
       ordering = false;
       render();
+      if (value === 'cloud') cloudView.show().catch(error => app.toast(error.message, 'error'));
     },
   });
 
@@ -81,8 +84,9 @@ export function createLibraryView({ onImport, onEdit }) {
   const searchBar = h('div', { class: 'lib-bar' }, search);
 
   const list = h('div', { class: 'song-list', role: 'list' });
+  const cloudView = createCloudView();
   const importButton = h('button', { type: 'button', class: 'btn primary block', onClick: onImport }, icon('upload', 18), 'Importar canciones');
-  const el = h('div', { class: 'lib' }, h('div', { class: 'lib-head' }, modeSwitch.el), setlistBar, searchBar, list, h('div', { class: 'lib-foot' }, importButton));
+  const el = h('div', { class: 'lib' }, h('div', { class: 'lib-head' }, modeSwitch.el), setlistBar, searchBar, list, cloudView.el, h('div', { class: 'lib-foot' }, importButton));
 
   const rowFor = (song, { index, inSetlist }) => {
     const current = app.current && app.current.song.id === song.id;
@@ -145,6 +149,9 @@ export function createLibraryView({ onImport, onEdit }) {
     deleteList.disabled = setlists.length <= 1;
     setlistBar.hidden = mode !== 'setlist';
     searchBar.hidden = mode !== 'library';
+    cloudView.el.hidden = mode !== 'cloud';
+    list.hidden = mode === 'cloud';
+    if (mode === 'cloud') return;
     const songsInList = app.setlistSongs();
     const total = songsInList.reduce((sum, song) => sum + songDuration(song), 0);
     countText.textContent = songsInList.length ? `${songsInList.length} ${songsInList.length === 1 ? 'canción' : 'canciones'}${total > 0 ? ` · ${fmtTime(total)}` : ''}` : 'Sin canciones';

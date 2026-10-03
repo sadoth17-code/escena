@@ -1,6 +1,6 @@
 const DB_NAME = 'escena';
-const DB_VERSION = 1;
-const STORES = ['songs', 'setlists', 'files', 'meta'];
+const DB_VERSION = 2;
+const STORES = ['songs', 'setlists', 'files', 'meta', 'cloudTransfers', 'cloudChunks'];
 
 let dbPromise = null;
 
@@ -20,7 +20,11 @@ function openDb() {
         }
       }
     };
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => {
+      request.result.onversionchange = () => { request.result.close(); dbPromise = null; };
+      resolve(request.result);
+    };
+    request.onblocked = () => reject(new Error('Cierra las otras pestañas de Escena y vuelve a cargar para actualizar la biblioteca'));
     request.onerror = () => reject(request.error);
   });
   return dbPromise;
@@ -51,6 +55,28 @@ function writeRequest(name, build) {
 }
 
 export const store = {
+  async clearPrefix(name, prefix) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(name, 'readwrite');
+      const cursor = tx.objectStore(name).openCursor(IDBKeyRange.bound(prefix, prefix + '\uffff'));
+      cursor.onsuccess = () => { const row = cursor.result; if (row) { row.delete(); row.continue(); } };
+      tx.oncomplete = () => resolve();
+      tx.onerror = tx.onabort = () => reject(tx.error || new Error('No se pudo limpiar la descarga'));
+    });
+  },
+  async commitCloudSong(song, oldFileIds, transferId) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(['songs', 'files', 'cloudTransfers'], 'readwrite');
+      tx.objectStore('songs').put(song);
+      const keep = new Set(song.tracks.map(t => t.fileId));
+      for (const id of oldFileIds) if (!keep.has(id)) tx.objectStore('files').delete(id);
+      tx.objectStore('cloudTransfers').delete(transferId);
+      tx.oncomplete = () => resolve();
+      tx.onerror = tx.onabort = () => reject(tx.error || new Error('No se pudo guardar la canción'));
+    });
+  },
   all(name) {
     return readRequest(name, (s) => s.getAll());
   },

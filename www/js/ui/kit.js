@@ -4,6 +4,7 @@ const STROKE = 'fill="none" stroke="currentColor" stroke-width="2" stroke-lineca
 const SOLID = 'fill="currentColor" stroke="none"';
 
 const PATHS = {
+  cloud: [STROKE, '<path d="M7 18H6a4 4 0 0 1-.6-8A6.5 6.5 0 0 1 18 8.5 4.8 4.8 0 0 1 18 18h-1M12 12v9M9 15l3-3 3 3"/>'],
   play: [SOLID, '<path d="M7 4.5v15l12-7.5z"/>'],
   pause: [SOLID, '<rect x="6" y="4.5" width="4.2" height="15" rx="1.2"/><rect x="13.8" y="4.5" width="4.2" height="15" rx="1.2"/>'],
   stop: [SOLID, '<rect x="6" y="6" width="12" height="12" rx="2"/>'],
