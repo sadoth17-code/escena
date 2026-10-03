@@ -85,13 +85,22 @@ export function createCloudView() {
         h('b', { text: `${progress.kind === 'upload' ? 'Subiendo' : 'Descargando'} · ${progress.title}` }),
         h('progress', { max: 100, value: pct, 'aria-label': 'Progreso de transferencia' }),
         h('span', { class: 'field-hint', text: `${pct}% · ${fmtBytes(progress.done)} de ${fmtBytes(progress.total)}` }),
-        h('span', { class: 'field-hint', text: progress.label }), button('Pausar', () => cloud.pause())));
+        h('span', { class: 'field-hint', text: progress.label }),
+        cloud.retry ? h('p', { class: 'cloud-error', role: 'status', text: cloud.retry.delay
+          ? `Conexión interrumpida${cloud.retry.status ? ` (HTTP ${cloud.retry.status})` : ''}. Reintento automático ${cloud.retry.attempt}/${cloud.retry.maxAttempts} en ${Math.ceil(cloud.retry.delay / 1000)} s. Avance guardado.`
+          : `Reconectando… Intento ${cloud.retry.attempt}/${cloud.retry.maxAttempts}. Avance guardado.` }) : null,
+        button('Pausar', () => cloud.pause())));
     }
     const pending = await cloud.pending().catch(() => []);
     if (current !== seq) return;
     for (const job of pending.filter(item => item.id !== cloud.active?.id)) {
+      const done = cloud.completedBytes(job), pct = job.total ? Math.min(100, Math.floor(done / job.total * 100)) : 0;
       transfers.append(h('div', { class: 'cloud-job' },
         h('b', { text: `${job.kind === 'upload' ? 'Subida' : 'Descarga'} pendiente · ${job.title}` }),
+        h('span', { class: 'field-hint', text: `${pct}% · ${fmtBytes(done)} de ${fmtBytes(job.total)} guardados` }),
+        job.lastError ? h('div', {},
+          h('p', { class: 'cloud-error', role: 'alert', text: job.lastError.message }),
+          h('span', { class: 'field-hint', text: [job.lastError.status ? `HTTP ${job.lastError.status}` : '', job.lastError.code ? `Código ${job.lastError.code}` : '', job.lastError.attempts > 1 ? `${job.lastError.attempts} intentos` : '', job.lastError.label].filter(Boolean).join(' · ') })) : null,
         h('div', { class: 'cloud-tools' },
           button('Reanudar', () => cloud.resume(job), 'primary', !!cloud.active || !cloud.connected),
           button('Descartar', async () => {

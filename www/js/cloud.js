@@ -3,11 +3,11 @@ import { store } from './store.js';
 import { normalizeSong, serializableSong } from './library.js';
 import { createEmitter, fmtBytes } from './util.js';
 import { CLOUD_API_URL } from './cloud-config.js';
+import { cloudRequest, TRANSFER_ATTEMPTS } from './cloud-request.js';
 
 const CHUNK = 8 * 1024 * 1024;
 const newId = () => crypto.randomUUID();
 const stopError = () => new DOMException('Transferencia pausada', 'AbortError');
-const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const hash = async data => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', data)), byte => byte.toString(16).padStart(2, '0')).join('');
 function normalizeUrl(value) {
   const url = new URL(value);
@@ -30,7 +30,7 @@ function validateDownload(m) {
 class Cloud {
   constructor() {
     this.bus = createEmitter(); this.api = ''; this.key = ''; this.ready = false;
-    this.catalog = []; this.active = null; this.progress = null; this.loading = false;
+    this.catalog = []; this.active = null; this.progress = null; this.retry = null; this.loading = false;
     this.initPromise = null;
   }
   on(name, fn) { return this.bus.on(name, fn); }
@@ -68,30 +68,12 @@ class Cloud {
   }
   async request(path, { method = 'GET', data, bytes, headers = {}, signal, binary = false } = {}) {
     if (!this.connected) throw new Error('Conecta tu nube para continuar');
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (signal?.aborted) throw stopError();
-      const controller = new AbortController();
-      const abort = () => controller.abort();
-      signal?.addEventListener('abort', abort, { once: true });
-      const timeout = setTimeout(abort, 180000);
-      try {
-        const response = await fetch(this.api + path, {
-          method, mode: 'cors', cache: 'no-store', credentials: 'omit', redirect: 'error', signal: controller.signal,
-          headers: { Authorization: `Bearer ${this.key}`, ...(data ? { 'Content-Type': 'application/json' } : {}), ...headers },
-          body: data ? JSON.stringify(data) : bytes,
-        });
-        if (!response.ok) {
-          const info = await response.json().catch(() => ({}));
-          throw Object.assign(new Error(info.error || `La nube respondió ${response.status}`), { status: response.status });
-        }
-        if (binary) return { bytes: await response.arrayBuffer(), status: response.status, range: response.headers.get('content-range') };
-        return await response.json();
-      } catch (error) {
-        if (signal?.aborted) throw stopError();
-        if (attempt === 2 || (error.status && error.status < 500 && error.status !== 429)) throw error;
-        await pause((attempt + 1) * 1000);
-      } finally { clearTimeout(timeout); signal?.removeEventListener('abort', abort); }
-    }
+    const transferring = Boolean(signal && this.active?.controller.signal === signal);
+    return cloudRequest(this.api + path, {
+      method, data, bytes, headers: { Authorization: `Bearer ${this.key}`, ...headers }, signal, binary,
+      maxAttempts: transferring ? TRANSFER_ATTEMPTS : 3,
+      onRetry: transferring ? retry => { this.retry = retry; this.emit(); } : undefined,
+    });
   }
   async refresh() {
     if (!this.connected) return;
@@ -120,9 +102,13 @@ class Cloud {
       return await operation();
     } finally { this.reserved = false; }
   }
-  notify(job, label) {
+  completedBytes(job) {
     const done = job.kind === 'upload' ? job.files.reduce((sum, file) => sum + (file.done ? file.size : Math.min(file.size, file.parts.length * CHUNK)), 0)
       : job.manifest.files.reduce((sum, file) => sum + Math.min(file.size, (job.counts[file.id] || 0) * CHUNK), 0);
+    return done;
+  }
+  notify(job, label) {
+    const done = this.completedBytes(job);
     this.progress = { id: job.id, kind: job.kind, title: job.title, total: job.total, done, label };
     this.emit();
   }
@@ -132,15 +118,23 @@ class Cloud {
     const controller = new AbortController(); this.active = { id: job.id, controller };
     let wake;
     try {
+      delete job.lastError;
+      await store.put('cloudTransfers', job);
       wake = await navigator.wakeLock?.request('screen').catch(() => null);
       await operation(controller.signal);
     } catch (error) {
-      if (error.name === 'AbortError') app.toast('Transferencia pausada. Puedes reanudarla desde Nube.');
-      else if (error.name === 'QuotaExceededError') throw new Error('No hay espacio suficiente. Libera espacio y reanuda la descarga.');
-      else throw error;
+      if (controller.signal.aborted) app.toast('Transferencia pausada. Puedes reanudarla desde Nube.');
+      else {
+        if (error.name === 'QuotaExceededError') error = new Error('No hay espacio suficiente en este dispositivo. Libera espacio y reanuda la transferencia.');
+        const detail = { message: error.message || 'No se pudo completar la transferencia.', status: error.status || null, code: error.code || null, attempts: error.attempts || 1, label: this.progress?.label || '', at: Date.now() };
+        // No recrear una transferencia ya completada si falla la actualización del catálogo.
+        const saved = await store.get('cloudTransfers', job.id).catch(() => null);
+        if (saved) { saved.lastError = detail; await store.put('cloudTransfers', saved).catch(() => {}); }
+        throw error;
+      }
     } finally {
       await wake?.release().catch(() => {});
-      this.active = null; this.progress = null; this.emit();
+      this.active = null; this.progress = null; this.retry = null; this.emit();
     }
   }
   upload(song, options = {}) { return this.exclusive(() => this.performUpload(song, options)); }
