@@ -65,9 +65,19 @@ function currentBindings() {
   return app.settings.bindings || DEFAULT_BINDINGS;
 }
 
+function sectionActions() {
+  if (!app.current || !app.player) return [];
+  return app.player.sections().map((section) => ({
+    id: `section:${app.current.song.id}:${section.id}`,
+    name: `${section.name} · compás ${section.bar}`,
+  }));
+}
+
 function rebuild() {
   lookup = new Map();
+  const allowed = new Set([...ACTIONS, ...sectionActions()].map((action) => action.id));
   for (const [action, triggers] of Object.entries(currentBindings())) {
+    if (!allowed.has(action)) continue;
     for (const trigger of triggers) if (!lookup.has(trigger)) lookup.set(trigger, action);
   }
 }
@@ -157,6 +167,7 @@ export const controls = {
     app.on('settings', (key) => {
       if (key === 'bindings') rebuild();
     });
+    for (const event of ['song:loaded', 'song:unloaded', 'song:refresh', 'song:updated']) app.on(event, rebuild);
     if (app.settings.midiEnabled) this.enableMidi();
   },
   async enableMidi() {
@@ -189,6 +200,7 @@ export const controls = {
   bindings() {
     return currentBindings();
   },
+  sectionActions,
   triggersFor(action) {
     return currentBindings()[action] || [];
   },
@@ -208,7 +220,13 @@ export const controls = {
   },
   assign(action, trigger) {
     const next = {};
-    for (const [id, triggers] of Object.entries(currentBindings())) next[id] = triggers.filter((item) => item !== trigger);
+    const activeSections = new Set(sectionActions().map((item) => item.id));
+    for (const [id, triggers] of Object.entries(currentBindings())) {
+      // The same hardware button may address different sections in other songs.
+      // Global transport controls remain exclusive across all songs.
+      const conflict = !action.startsWith('section:') || !id.startsWith('section:') || activeSections.has(id);
+      next[id] = conflict ? triggers.filter((item) => item !== trigger) : [...triggers];
+    }
     next[action] = [...(next[action] || []), trigger];
     app.setSetting('bindings', next);
   },
@@ -237,7 +255,7 @@ export const controls = {
         const note = Number(value);
         return `MIDI nota ${NOTE_NAMES[note % 12]}${Math.floor(note / 12) - 1}`;
       }
-      return `MIDI pedal CC ${value}`;
+      return `MIDI CC ${value}`;
     }
     return trigger;
   },

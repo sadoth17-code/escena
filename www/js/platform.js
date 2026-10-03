@@ -1,5 +1,6 @@
 import { app } from './app.js';
 import { isIOS, isNative, isStandalone, createEmitter } from './util.js';
+import { configureAudioSession } from './audio-session.js';
 
 const bus = createEmitter();
 
@@ -8,7 +9,7 @@ const state = {
   wake: null,
   audio: null,
   registration: null,
-  unlocked: false,
+  audioStarting: false,
   reloadOnChange: false,
   barsHidden: false,
 };
@@ -55,43 +56,35 @@ function silentWavUrl() {
   return URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
 }
 
-function setAudioSession() {
-  try {
-    if (navigator.audioSession) navigator.audioSession.type = 'playback';
-  } catch (error) {
-    void error;
-  }
-}
-
 function startSilentAudio() {
-  if (state.audio) return;
-  const audio = document.createElement('audio');
-  audio.src = silentWavUrl();
-  audio.loop = true;
-  audio.setAttribute('playsinline', '');
-  audio.setAttribute('aria-hidden', 'true');
-  audio.volume = 1;
-  audio.style.display = 'none';
-  document.body.append(audio);
-  state.audio = audio;
-  audio.play().catch(() => {
-    state.audio = null;
-    audio.remove();
-  });
+  if (state.audioStarting || (state.audio && !state.audio.paused)) return;
+  let audio = state.audio;
+  if (!audio) {
+    audio = document.createElement('audio');
+    audio.src = silentWavUrl();
+    audio.loop = true;
+    audio.setAttribute('playsinline', '');
+    audio.setAttribute('aria-hidden', 'true');
+    audio.volume = 1;
+    audio.style.display = 'none';
+    document.body.append(audio);
+    state.audio = audio;
+  }
+  state.audioStarting = true;
+  // A denied first touch or an interruption must not disable future attempts.
+  Promise.resolve(audio.play()).catch(() => {}).finally(() => { state.audioStarting = false; });
 }
 
 function ensureRunning() {
   const engine = app.engine;
   if (!engine || engine.offline) return;
-  if (engine.ctx.state !== 'running') engine.ctx.resume().catch(() => {});
+  if (engine.ctx.state !== 'running') engine.resume().catch(() => {});
 }
 
 function unlock() {
+  const sessionConfigured = configureAudioSession();
+  if (!sessionConfigured && (isIOS() || /Android/i.test(navigator.userAgent))) startSilentAudio();
   ensureRunning();
-  if (state.unlocked) return;
-  state.unlocked = true;
-  setAudioSession();
-  if (isIOS() || /Android/i.test(navigator.userAgent)) startSilentAudio();
 }
 
 async function syncWake() {

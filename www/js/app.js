@@ -10,6 +10,7 @@ const MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || isIOS();
 export const DEFAULT_SETTINGS = {
   output: { ...DEFAULT_OUTPUT },
   jumpMode: 'bar',
+  liveControlsVersion: 1,
   afterSong: 'stop',
   gapSeconds: 0,
   preloadNext: !MOBILE,
@@ -24,6 +25,10 @@ export const DEFAULT_SETTINGS = {
 
 function mergeSettings(saved) {
   const merged = { ...DEFAULT_SETTINGS, ...saved };
+  // This live-performance update starts every device in bar mode once.
+  // Later, deliberate changes in Ajustes are retained.
+  if (!saved || saved.liveControlsVersion !== 1 || !['bar', 'beat', 'now'].includes(merged.jumpMode)) merged.jumpMode = 'bar';
+  merged.liveControlsVersion = 1;
   const savedOutput = saved && saved.output ? saved.output : {};
   merged.output = { ...DEFAULT_OUTPUT, ...savedOutput, routes: normalizeRoutes(savedOutput.routes) };
   return merged;
@@ -66,6 +71,7 @@ class App {
 
   async init() {
     this.settings = mergeSettings(await store.getMeta('settings', {}));
+    await store.setMeta('settings', this.settings);
     for (const raw of await store.all('songs')) this.songs.set(raw.id, normalizeSong(raw));
     this.setlists = (await store.all('setlists')).sort((a, b) => a.createdAt - b.createdAt);
     if (!this.setlists.length) {
@@ -639,7 +645,11 @@ class App {
   async play() {
     const player = this.player;
     if (!player) return;
-    await player.play({ countIn: this.settings.autoCountIn && player.state === 'stopped' });
+    try {
+      await player.play({ countIn: this.settings.autoCountIn && player.state === 'stopped' });
+    } catch (error) {
+      this.toast(error.message || 'No se pudo activar el audio. Toca Reproducir de nuevo.', 'error');
+    }
   }
 
   pause() {
@@ -780,6 +790,13 @@ class App {
   }
 
   runAction(id) {
+    const sectionPrefix = this.current && `section:${this.current.song.id}:`;
+    if (sectionPrefix && id.startsWith(sectionPrefix)) {
+      const markerId = id.slice(sectionPrefix.length);
+      const index = this.player.sections().findIndex((section) => section.id === markerId);
+      if (index >= 0) return this.jumpToSection(index);
+      return;
+    }
     switch (id) {
       case 'playPause':
         return this.togglePlay();

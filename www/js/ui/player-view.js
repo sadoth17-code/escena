@@ -294,7 +294,13 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
     setText(durationValue, ` / ${fmtTime(snap.duration)}`);
     setText(bpmValue, String(Number(snap.bpm.toFixed(2))));
     setText(sigValue, snap.signature);
-    if (snap.next) {
+    const queued = snap.jump === null ? null : player.sections()[snap.jump];
+    if (queued) {
+      setText(nextName, queued.name);
+      setText(nextWhen, app.settings.jumpMode === 'bar' ? 'al terminar este compás' : app.settings.jumpMode === 'beat' ? 'en el siguiente tiempo' : 'ahora');
+      nextBanner.style.setProperty('--c', queued.color);
+      setClass(nextBanner, 'none', false);
+    } else if (snap.next) {
       setText(nextName, snap.next.name);
       setText(nextWhen, barsText(snap.barsToNext));
       nextBanner.style.setProperty('--c', snap.next.color);

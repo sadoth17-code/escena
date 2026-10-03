@@ -112,7 +112,8 @@ export function createMixer({ onEdit }) {
     h('button', { type: 'button', class: 'btn small', 'aria-label': 'Editar pistas', onClick: () => onEdit('tracks') }, icon('edit', 16), h('span', { class: 'btn-text', text: 'Pistas' }))
   );
   const empty = h('div', { class: 'mixer-empty', text: 'La mezcla aparece al cargar una canción' });
-  const el = h('div', { class: 'mixer-wrap' }, mini, scroller, empty);
+  const touchHint = h('p', { class: 'mixer-touch-hint', text: 'Desliza de lado para ver canales. Arrastra la perilla hacia arriba o abajo para cambiar el volumen.' });
+  const el = h('div', { class: 'mixer-wrap' }, mini, touchHint, scroller, empty);
   let items = [];
   let outputs = [];
   let entry = null;
@@ -124,6 +125,7 @@ export function createMixer({ onEdit }) {
     items = [];
     outputs = [];
     empty.hidden = Boolean(next);
+    touchHint.hidden = !next;
     scroller.hidden = !next;
     if (!next) return;
     const player = next.player;

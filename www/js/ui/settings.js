@@ -187,7 +187,7 @@ export function openSettings() {
   const toneBox = h('div', { class: 'tone-row' });
   const toneHint = h('span', { class: 'field-hint' });
   const toneField = h('div', { class: 'field' }, toneLabel, toneBox, toneHint);
-  const play = (fn) => app.engine.resume().then(fn);
+  const play = (fn) => app.engine.resume().then(fn).catch((error) => app.toast(error.message, 'error'));
   const renderTones = () => {
     if (app.engine.multiActive && current().mode === 'multi') {
       toneLabel.textContent = 'Prueba de salidas';
@@ -269,10 +269,23 @@ export function openSettings() {
   );
   loadDevices();
 
+  const audioStatus = h('span', { class: 'field-hint', role: 'status' });
+  const renderAudioStatus = () => {
+    audioStatus.textContent = {
+      running: 'Audio activo. Usa «Ambos» para comprobar que se escucha.',
+      suspended: 'Audio en espera. Toca Reactivar audio o Reproducir.',
+      interrupted: 'Audio interrumpido por el dispositivo. Vuelve a Escena y toca Reactivar audio.',
+      closed: 'Audio cerrado. Recarga Escena para continuar.',
+    }[app.engine.ctx.state] || 'Comprueba el audio con la prueba de canales.';
+  };
+  app.engine.ctx.addEventListener('statechange', renderAudioStatus);
+  unsubscribe.push(() => app.engine.ctx.removeEventListener('statechange', renderAudioStatus));
+  renderAudioStatus();
   const outputSection = section(
     'Salida de audio',
     'Elige tu dispositivo de audio y cómo se reparte el sonido entre sus salidas.',
     field('Dispositivo de salida', deviceBox),
+    field('Estado de audio', h('div', { class: 'row-actions' }, audioStatus, h('button', { type: 'button', class: 'btn small', onClick: () => play(renderAudioStatus) }, 'Reactivar audio'))),
     modeGrid,
     routeField,
     swapRow,
@@ -326,7 +339,7 @@ export function openSettings() {
   const playbackSection = section(
     'Reproducción',
     null,
-    field('Saltos entre secciones', jump.el, 'Cuándo se ejecuta el salto al tocar una sección o usar el pedal.'),
+    field('Saltos entre secciones', jump.el, 'Compás: sigue tocando y cambia al terminar el compás actual. Se aplica a pantalla, teclado y MIDI; se guarda en este dispositivo.'),
     field('Al terminar la canción', after.el),
     gap,
     settingRow('Pre-conteo automático', 'Cuenta antes de empezar desde el inicio', autoCount.el),
@@ -338,7 +351,12 @@ export function openSettings() {
   const midiBox = h('div', { class: 'midi-box' });
   const renderControls = () => {
     const list = h('div', { class: 'bind-list' });
-    for (const action of ACTIONS) {
+    const sections = controls.sectionActions();
+    for (const action of [...ACTIONS, ...sections]) {
+      if (action === sections[0]) list.append(
+        h('h4', { class: 'sub', text: `Secciones de «${app.current.song.title}»` }),
+        h('p', { class: 'field-hint', text: 'Pulsa Asignar y luego un botón del controlador. Cada asignación sigue a esta sección aunque cambies su nombre u orden. Se guarda para esta canción en este dispositivo.' })
+      );
       const triggers = controls.triggersFor(action.id);
       const chips = triggers.map((trigger) =>
         h('span', { class: 'bind-chip' }, controls.label(trigger), h('button', { type: 'button', class: 'bind-x', 'aria-label': 'Quitar', onClick: () => { controls.unassign(action.id, trigger); renderControls(); } }, icon('close', 12)))
@@ -351,8 +369,9 @@ export function openSettings() {
         renderControls();
       } }, icon('plus', 14), 'Asignar');
       const learnBtn = learn;
-      list.append(h('div', { class: 'bind-row' }, h('span', { class: 'bind-name', text: action.name }), h('div', { class: 'bind-chips' }, chips, learn)));
+      list.append(h('div', { class: 'bind-row', 'data-action': action.id }, h('span', { class: 'bind-name', text: action.name }), h('div', { class: 'bind-chips' }, chips, learn)));
     }
+    if (!sections.length) list.append(h('p', { class: 'field-hint', text: 'Carga una canción para asignar MIDI a sus secciones.' }));
     controlsBox.replaceChildren(
       list,
       h('div', { class: 'row-actions' }, h('button', { type: 'button', class: 'btn small', onClick: () => { controls.reset(); renderControls(); } }, 'Restablecer atajos'), controls.learning ? h('button', { type: 'button', class: 'btn small', onClick: () => { controls.cancelLearn(); renderControls(); } }, 'Cancelar') : null)
@@ -381,7 +400,7 @@ export function openSettings() {
       settingRow('Cambio de programa MIDI', 'El programa 1 carga la primera canción del setlist, el 2 la segunda…', program.el)
     );
   };
-  unsubscribe.push(controls.on('midi', renderMidi), controls.on('learn', () => {}));
+  unsubscribe.push(controls.on('midi', renderMidi), app.on('song:loaded', renderControls), app.on('song:unloaded', renderControls));
   renderControls();
   renderMidi();
   const controlsSection = section(
@@ -422,7 +441,7 @@ export function openSettings() {
   };
   unsubscribe.push(platform.on('install', renderInstall));
   renderInstall();
-  const appSection = section('Aplicación', null, installBox, usageText, persistButton, h('p', { class: 'field-hint', text: 'Escena · Edición Nube v5 · ingvelarde.com' }));
+  const appSection = section('Aplicación', null, installBox, usageText, persistButton, h('p', { class: 'field-hint', text: 'Escena · Nube v5 · Directo MIDI · ingvelarde.com' }));
 
   const wipe = h('button', {
     type: 'button',

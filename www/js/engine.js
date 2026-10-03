@@ -1,6 +1,7 @@
 import { faderToGain, FADER_DEFAULT } from './util.js';
 import { loadVoiceBank } from './voices.js';
 import { SongPlayer } from './player.js';
+import { configureAudioSession, resumeAudioContext } from './audio-session.js';
 
 export const MAX_OUTPUTS = 32;
 
@@ -119,6 +120,7 @@ function playEnvelope(ctx, frequency, seconds, attach) {
 
 export class Engine {
   constructor({ ctx } = {}) {
+    if (!ctx) configureAudioSession();
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     this.ctx = ctx || new AudioContextClass({ latencyHint: 'playback' });
     this.offline = typeof OfflineAudioContext !== 'undefined' && this.ctx instanceof OfflineAudioContext;
@@ -366,13 +368,7 @@ export class Engine {
 
   async resume() {
     if (this.offline) return;
-    if (this.ctx.state !== 'running') {
-      try {
-        await this.ctx.resume();
-      } catch (error) {
-        console.error(error);
-      }
-    }
+    await resumeAudioContext(this.ctx);
   }
 
   async setSinkId(id) {

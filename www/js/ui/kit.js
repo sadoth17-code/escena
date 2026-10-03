@@ -235,10 +235,11 @@ export function showToast({ message, kind = 'info', action, duration }) {
 
 const FADER_TICKS = [6, 0, -6, -12, -24, -48].map((db) => gainToFader(Math.pow(10, db / 20)));
 
-function attachDoubleTap(el, onDouble) {
+function attachDoubleTap(el, onDouble, accepts = () => true) {
   let last = null;
   let start = null;
   el.addEventListener('pointerdown', (event) => {
+    if (!accepts(event)) { start = null; last = null; return; }
     start = { x: event.clientX, y: event.clientY, time: performance.now() };
   });
   el.addEventListener('pointerup', (event) => {
@@ -255,10 +256,11 @@ function attachDoubleTap(el, onDouble) {
     }
     start = null;
   });
+  el.addEventListener('pointercancel', () => { start = null; last = null; });
 }
 
 export function createFader({ value = FADER_DEFAULT, onInput, label = '' } = {}) {
-  const thumb = h('div', { class: 'fader-thumb' });
+  const thumb = h('div', { class: 'fader-thumb', title: 'Arrastra esta perilla para ajustar el volumen' });
   const ticks = h(
     'div',
     { class: 'fader-ticks' },
@@ -282,6 +284,7 @@ export function createFader({ value = FADER_DEFAULT, onInput, label = '' } = {})
   let current = value;
   let dragging = false;
   let grab = 0;
+  let pointer = null;
   const thumbHeight = () => thumb.offsetHeight || 28;
   const render = () => {
     el.style.setProperty('--v', String(current));
@@ -301,30 +304,52 @@ export function createFader({ value = FADER_DEFAULT, onInput, label = '' } = {})
     return (rect.bottom - size / 2 - clientY) / usable;
   };
   el.addEventListener('pointerdown', (event) => {
-    if (event.button !== undefined && event.button > 0) return;
-    el.setPointerCapture(event.pointerId);
+    if (pointer || (event.button !== undefined && event.button > 0)) return;
+    const touch = event.pointerType === 'touch' || event.pointerType === 'pen';
+    // The rail is a scrolling surface on touchscreens, never a jump-to-volume.
+    if (touch && !thumb.contains(event.target)) return;
+    pointer = { id: event.pointerId, x: event.clientX, y: event.clientY, touch };
     const rect = el.getBoundingClientRect();
     const size = thumbHeight();
     const center = rect.bottom - size / 2 - (rect.height - size) * current;
     const onThumb = Math.abs(event.clientY - center) <= size * 0.8;
     grab = onThumb ? event.clientY - center : 0;
-    dragging = true;
-    el.classList.add('active');
+    dragging = !touch;
+    if (!touch) {
+      el.setPointerCapture(event.pointerId);
+      el.classList.add('active');
+    }
     if (!onThumb) apply(fromPointer(event.clientY));
-    event.preventDefault();
+    if (!touch) event.preventDefault();
   });
   el.addEventListener('pointermove', (event) => {
+    if (!pointer || event.pointerId !== pointer.id) return;
+    if (!dragging) {
+      const dx = Math.abs(event.clientX - pointer.x);
+      const dy = Math.abs(event.clientY - pointer.y);
+      if (dx > 6 && dx >= dy) { pointer = null; return; }
+      if (dy < 6 || dy <= dx * 1.2) return;
+      dragging = true;
+      el.setPointerCapture(event.pointerId);
+      el.classList.add('active');
+    }
     if (dragging) apply(fromPointer(event.clientY - grab));
   });
-  const end = () => {
-    if (!dragging) return;
+  const end = (event) => {
+    if (!pointer || event.pointerId !== pointer.id) return;
+    pointer = null;
     dragging = false;
+    if (el.hasPointerCapture(event.pointerId)) el.releasePointerCapture(event.pointerId);
     el.classList.remove('active');
     el.blur();
   };
   el.addEventListener('pointerup', end);
   el.addEventListener('pointercancel', end);
-  attachDoubleTap(el, () => apply(FADER_DEFAULT));
+  el.addEventListener('lostpointercapture', (event) => {
+    // Touch initially captures the thumb. Ignore its bubbled capture transfer.
+    if (event.target === el) end(event);
+  });
+  attachDoubleTap(el, () => apply(FADER_DEFAULT), (event) => event.pointerType === 'mouse');
   el.addEventListener('keydown', (event) => {
     const step = event.shiftKey ? 0.05 : 0.01;
     let next = null;

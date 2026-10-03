@@ -132,6 +132,7 @@ export class SongPlayer {
     this.sectionCache = null;
     this.peakCache = null;
     this.disposed = false;
+    this.playRequest = 0;
     this.refreshAll();
     this.refreshSolo();
   }
@@ -336,7 +337,9 @@ export class SongPlayer {
     if (!run) return;
     for (const source of run.sources) {
       const gain = source.fade.gain;
-      gain.cancelScheduledValues(when);
+      // Replace an earlier queued jump without leaving its old fade behind.
+      gain.cancelScheduledValues(this.ctx.currentTime);
+      gain.setValueAtTime(1, this.ctx.currentTime);
       gain.setValueAtTime(1, when);
       gain.linearRampToValueAtTime(0, when + fade);
       try {
@@ -364,8 +367,9 @@ export class SongPlayer {
   }
 
   async play({ countIn = false } = {}) {
+    const request = ++this.playRequest;
     await this.engine.resume();
-    if (this.state === 'playing' || this.disposed) return;
+    if (request !== this.playRequest || this.state === 'playing' || this.disposed) return;
     const ctx = this.ctx;
     const now = ctx.currentTime;
     let position = this.pausedAt;
@@ -434,6 +438,7 @@ export class SongPlayer {
   }
 
   pause() {
+    this.playRequest++;
     if (this.state !== 'playing') return;
     this.halt(null);
     this.state = 'paused';
@@ -441,6 +446,7 @@ export class SongPlayer {
   }
 
   stop() {
+    this.playRequest++;
     if (this.state === 'stopped' && this.pausedAt === 0) return;
     if (this.state === 'playing') this.halt(0);
     else this.pausedAt = 0;
@@ -463,8 +469,11 @@ export class SongPlayer {
     }
     const counting = now < this.run.ctxStart;
     let when;
-    if (counting || mode === 'now') {
+    if (mode === 'now') {
       when = now + 0.03;
+    } else if (counting) {
+      // Preserve the count-in; the selected section enters on its downbeat.
+      when = this.run.ctxStart;
     } else {
       const lookahead = now + 0.04;
       const here = this.position(lookahead);
@@ -472,11 +481,12 @@ export class SongPlayer {
       if (this.run.loop && boundary > this.run.loop.b) boundary = this.run.loop.b;
       when = lookahead + Math.max(0, boundary - here);
     }
-    if (counting) {
+    const immediate = counting && mode === 'now';
+    if (immediate) {
       this.stopCountIn();
       this.releaseRun(this.run, now);
     }
-    this.switchRun(when, time, counting);
+    this.switchRun(when, time, immediate);
   }
 
   switchRun(when, target, immediateStop = false) {
