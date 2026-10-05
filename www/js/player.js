@@ -271,13 +271,24 @@ export class SongPlayer {
     return this.pausedAt;
   }
 
+  // Instante del reloj del audio en que termina lo que se oye antes del primer compás de la
+  // reproducción: el final del pre-conteo o, si no lo hay, el arranque de la música. Con el pre-conteo
+  // la música puede haber entrado ya (arrancar antes del compás 1 deja un silencio de entrada que
+  // suena mientras caen los últimos tiempos del conteo), así que no es lo mismo que `ctxStart`.
+  readyTime(run) {
+    return Math.max(run.ctxStart, run.countEnd || 0);
+  }
+
   isCountingIn(now = this.ctx.currentTime) {
-    return this.state === 'playing' && this.run !== null && now < this.run.ctxStart;
+    return this.state === 'playing' && this.run !== null && now < this.readyTime(this.run);
   }
 
   countIn(now = this.ctx.currentTime) {
     const run = this.run;
-    if (this.state !== 'playing' || !run || !run.countStart || now >= run.ctxStart) return null;
+    if (this.state !== 'playing' || !run || !run.countStart || now >= run.countEnd) return null;
+    // Si el silencio de entrada es más largo que el conteo, la música arranca primero y el conteo
+    // empieza justo antes del compás 1: hasta entonces no hay nada que contar.
+    if (now < run.countStart && run.countStart > run.ctxStart) return null;
     const segment = this.tempo.segmentAtTime(Math.max(0, run.songStart - this.offset));
     const index = Math.floor(Math.max(0, now - run.countStart) / segment.beatDur);
     return {
@@ -452,11 +463,19 @@ export class SongPlayer {
     const entries = this.prepareSources(position, loop, { fadeIn });
     const countNodes = intro ? this.prepareCountIn(intro) : [];
     const when = ctx.currentTime + this.startLead();
-    const songStart = when + (intro ? intro.duration : 0);
-    for (const node of countNodes) node.start(when);
+    // El pre-conteo tiene que acabar justo un tiempo antes del primer tiempo fuerte de la cuadrícula.
+    // Si se arranca dentro del silencio de entrada (antes del compás 1, que empieza en `offset`), ese
+    // primer tiempo fuerte llega `lead` segundos después de que la música empiece, y el conteo debe
+    // acabar ahí y no en el arranque de la música: así el compás 1 cae justo en el tiempo siguiente
+    // al último del conteo. Arrancando desde el compás 1 en adelante `lead` es 0 y todo queda igual.
+    const lead = Math.max(0, this.offset - position);
+    const countEnd = intro ? when + Math.max(intro.duration, lead) : 0;
+    const countStart = intro ? countEnd - intro.duration : 0;
+    const songStart = intro ? countEnd - lead : when;
+    for (const node of countNodes) node.start(countStart);
     this.countInSources.push(...countNodes);
     const sources = this.commitSources(entries, songStart, position, { fadeIn });
-    this.run = { ctxStart: songStart, songStart: position, loop, sources, countStart: intro ? when : 0 };
+    this.run = { ctxStart: songStart, songStart: position, loop, sources, countStart, countEnd };
     this.pending = null;
     this.state = 'playing';
     this.emit('state');
@@ -532,13 +551,17 @@ export class SongPlayer {
       this.pending = null;
     }
     const lead = this.startLead();
-    const counting = now < this.run.ctxStart;
+    const old = this.run;
+    // `waiting`: la música aún no ha entrado. `counting`: todavía suena el pre-conteo, y la música
+    // puede haber entrado ya si se arrancó antes del compás 1 (ver play()).
+    const waiting = now < old.ctxStart;
+    const counting = now < this.readyTime(old);
     let when;
     if (mode === 'now') {
       when = now + lead;
     } else if (counting) {
       // Preserve the count-in; the selected section enters on its downbeat.
-      when = Math.max(this.run.ctxStart, now + lead);
+      when = Math.max(this.readyTime(old), now + lead);
     } else {
       const lookahead = now + lead;
       const here = this.position(lookahead);
@@ -547,12 +570,20 @@ export class SongPlayer {
       when = lookahead + Math.max(0, boundary - here);
     }
     if (follow) time = clamp(this.position(when), 0, Math.max(0, this.duration - 0.01));
-    const immediate = counting && mode === 'now';
+    const immediate = waiting && mode === 'now';
     if (immediate) {
       this.stopCountIn();
       this.releaseRun(this.run, now);
+    } else if (counting && mode === 'now' && !follow) {
+      // Salto inmediato con la música ya sonando mientras caían los últimos tiempos del conteo.
+      this.stopCountIn();
     }
     this.switchRun(when, time, immediate, entries);
+    // Un reajuste sin salto no interrumpe el pre-conteo: la pista nueva sigue sabiendo que aún suena.
+    if (follow && counting && this.pending && old.countEnd) {
+      this.pending.countStart = old.countStart;
+      this.pending.countEnd = old.countEnd;
+    }
   }
 
   switchRun(when, target, immediateStop = false, entries = null) {

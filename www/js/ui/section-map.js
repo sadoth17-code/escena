@@ -1,17 +1,24 @@
 import { h, clamp } from '../util.js';
 import { app } from '../app.js';
+import { snapToHit } from '../align.js';
 import { icon, iconButton, createSectionPicker } from './kit.js';
 
 const DIM = '#4a5a6a';
 const LIT = '#35c9ff';
+const MARK = '#ff3fb4';
+const MARK_INK = '#1c0614';
+const TEMPO_MARK = '#5eead4';
+const LANE = 26;
 const FLAG = 20;
 const RULER = 22;
 const GRIP = 30;
 const MIN_SPAN = 0.25;
 const SLOP = 5;
+const FLAG_SLOP = 2;
 const DIRECT = 512;
 const ZOOM = 2;
 const ZEBRA_MIN = 10;
+const TIME_STEPS = [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
 
 export function waveColumns(wave, t0, span, columns) {
   const out = new Float32Array(columns);
@@ -70,6 +77,23 @@ function barStep(pixelsPerBar) {
   return 512;
 }
 
+function timeStep(pixelsPerSecond) {
+  for (const step of TIME_STEPS) if (step * pixelsPerSecond >= 74) return step;
+  return 1200;
+}
+
+// Marca de tiempo de la regla inferior: 1:05, 1:05.5, 1:05.52…, según lo cerca que esté la vista.
+function rulerTime(seconds, step) {
+  const digits = step >= 1 ? 0 : step >= 0.1 ? 1 : step >= 0.01 ? 2 : 3;
+  const unit = 10 ** digits;
+  const ticks = Math.round(Math.max(0, seconds) * unit);
+  const minutes = Math.floor(ticks / (60 * unit));
+  const rest = (ticks - minutes * 60 * unit) / unit;
+  return `${minutes}:${rest.toFixed(digits).padStart(digits ? digits + 3 : 2, '0')}`;
+}
+
+const mod = (value, size) => ((value % size) + size) % size;
+
 function layerContext(layer, width, height) {
   if (layer.width !== width) layer.width = width;
   if (layer.height !== height) layer.height = height;
@@ -78,14 +102,31 @@ function layerContext(layer, width, height) {
   return context;
 }
 
-export function createSectionMap({ song, entry, quick, addMarker, moveMarker, removeMarker, selectMarker }) {
+function roundedRect(context, x, y, width, height, radius) {
+  const r = Math.min(radius, width / 2, height / 2);
+  context.beginPath();
+  context.moveTo(x + r, y);
+  context.arcTo(x + width, y, x + width, y + height, r);
+  context.arcTo(x + width, y + height, x, y + height, r);
+  context.arcTo(x, y + height, x, y, r);
+  context.arcTo(x, y, x + width, y, r);
+  context.closePath();
+}
+
+// mode 'sections': mapa para colocar secciones. mode 'align': mapa para colocar el compás 1 sobre la onda.
+// `align` (opcional) conecta la bandera «Compás 1»: { setOffset(ms), nudge(ms), magnet(), mark(time) }.
+export function createSectionMap({ song, entry, quick = [], addMarker, moveMarker, removeMarker, selectMarker, mode = 'sections', align = null }) {
   const player = entry.player;
   const duration = player.duration;
+  const alignMode = mode === 'align';
 
   const playIcon = h('span', { class: 'smap-play-icon' }, icon('play', 24));
   const playButton = h('button', { type: 'button', class: 'smap-play', 'aria-label': 'Reproducir', title: 'Reproducir o pausar', onClick: () => toggle() }, playIcon);
   const startButton = iconButton({ name: 'skipPrev', label: 'Ir al inicio', onClick: () => toStart() });
-  const clock = h('span', { class: 'smap-clock' });
+  // Reloj de dos líneas: arriba el tiempo, abajo el compás (o «Antes del compás 1»). Así su ancho casi no cambia.
+  const clockTime = h('b', { class: 'smap-clock-time' });
+  const clockBar = h('span', { class: 'smap-clock-bar' });
+  const clock = h('span', { class: 'smap-clock', role: 'timer', 'aria-live': 'off' }, clockTime, clockBar);
   const zoomOutButton = iconButton({ name: 'minus', label: 'Alejar', onClick: () => zoomButton(1 / ZOOM) });
   const zoomInButton = iconButton({ name: 'plus', label: 'Acercar', onClick: () => zoomButton(ZOOM) });
   const zoomLabel = h('span', { class: 'smap-zoom' });
@@ -96,6 +137,8 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     icon('target', 16),
     h('span', { class: 'smap-follow-text', text: 'Seguir' })
   );
+  const goBarOne = h('button', { type: 'button', class: 'btn small smap-go', title: 'Llevar la vista a la bandera del compás 1', onClick: () => focusOn(gridOffset()) }, icon('flag', 16), 'Compás 1');
+  const goEnd = h('button', { type: 'button', class: 'btn small smap-go', title: 'Llevar la vista al final de la canción', onClick: () => focusEnd() }, icon('sectionNext', 16), 'Final');
   const bar = h(
     'div',
     { class: 'smap-bar' },
@@ -106,7 +149,20 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
   const canvas = h('canvas', { class: 'smap-canvas' });
   const tip = h('div', { class: 'smap-tip', hidden: true });
   const waiting = h('div', { class: 'smap-wait', text: 'Calculando la forma de onda…' });
-  const stage = h('div', { class: 'smap-stage', tabindex: '0', role: 'application', 'aria-label': 'Onda de la canción con sus secciones. Rueda del mouse para acercar, flechas para moverte, espacio para reproducir' }, canvas, tip, waiting);
+  const stage = h(
+    'div',
+    {
+      class: 'smap-stage',
+      tabindex: '0',
+      role: 'application',
+      'aria-label': alignMode
+        ? 'Onda de la canción con su cuadrícula de compases. Toca un golpe para poner ahí el compás 1. Rueda del mouse para acercar, flechas para moverte, Shift y flechas para mover el compás 1 un milisegundo, espacio para reproducir'
+        : 'Onda de la canción con sus secciones. Rueda del mouse para acercar, flechas para moverte, espacio para reproducir',
+    },
+    canvas,
+    tip,
+    waiting
+  );
   const ovCanvas = h('canvas', { class: 'smap-ov-canvas' });
   const overview = h('div', { class: 'smap-overview', 'aria-hidden': 'true' }, ovCanvas);
 
@@ -124,10 +180,20 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     h('div', { class: 'smap-sel-actions' }, nudgeBack, nudgeForward, listenButton, removeButton)
   );
 
-  const help = h('p', { class: 'field-hint smap-help', text: 'Rueda del mouse o pellizco: acercar. Arrastra la onda: moverte. Toca un compás para ir a su inicio y elegirlo. Toca el nombre de una sección para saltar a ella. Arrastra el puntito de una sección (⋮⋮): moverla de compás.' });
+  const help = alignMode
+    ? h(
+        'details',
+        { class: 'smap-tips' },
+        h('summary', { text: 'Gestos y atajos' }),
+        h('p', { class: 'field-hint', text: 'Rueda del mouse o pellizco: acercar. Arrastra la onda: moverte. Toca un golpe de la onda o arrastra la bandera «Compás 1» para colocar el primer tiempo; con Alt pulsado no se pega al golpe. Toca la regla de arriba o la de abajo para llevar el cursor a ese instante exacto. Con el teclado, Mayús + flechas mueven el compás 1 un milisegundo (con Alt, diez; con Ctrl, una décima).' })
+      )
+    : h('p', {
+        class: 'field-hint smap-help',
+        text: 'Rueda del mouse o pellizco: acercar. Arrastra la onda: moverte. Toca un compás para ir a su inicio y elegirlo. Toca el nombre de una sección para saltar a ella. Arrastra el puntito de una sección (⋮⋮): moverla de compás. La bandera rosa «Compás 1» se arrastra para alinear la cuadrícula con la música.',
+      });
   const statusText = h('span', { class: 'smap-status-text' });
   const clearButton = h('button', { type: 'button', class: 'btn small', hidden: true, onClick: () => clearPick() }, 'Quitar elección');
-  const status = h('div', { class: 'smap-status idle', role: 'status' }, statusText, clearButton);
+  const status = h('div', { class: 'smap-status idle', role: 'status' }, statusText, clearButton, ...(alignMode ? [goBarOne, goEnd] : []));
   const addLabel = h('span', { class: 'smap-add-label' });
   const addRow = h(
     'div',
@@ -135,7 +201,10 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     addLabel,
     h('div', { class: 'quick-add' }, quick.map((label) => h('button', { type: 'button', class: 'chip small', onClick: () => add(label) }, label)), createSectionPicker({ onPick: (label) => add(label) }))
   );
-  const el = h('div', { class: 'smap' }, bar, stage, overview, status, selBar, addRow, help);
+  // En la pestaña Alinear la onda (transporte y escenario) queda fija arriba mientras se baja a los controles:
+  // `el` es esa parte fija e `info` lo demás (franja resumen, estado y ayuda).
+  const info = alignMode ? h('div', { class: 'smap-info' }, overview, status, help) : null;
+  const el = alignMode ? h('div', { class: 'smap smap-align' }, bar, stage) : h('div', { class: 'smap' }, bar, stage, overview, status, selBar, addRow, help);
 
   const under = document.createElement('canvas');
   const litLayer = document.createElement('canvas');
@@ -164,21 +233,45 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
   let lastZoom = '';
   let lastStatus = '';
   let lastTone = '';
+  let lastClear = '';
   let pickedBar = null;
   let armedBar = null;
   let hoverY = null;
   let hoverFlag = false;
+  let offsetOverride = null;
+  let tapAction = 'bar1';
+  let hoverSnap = null;
+  let hoverKey = '';
+  let markGeom = null;
+  let scrubAt = 0;
   const pointers = new Map();
 
-  const maxBar = () => Math.max(1, player.tempo.barCount(Math.max(0, duration - player.offset)));
+  const lanes = () => {
+    const compact = size.h > 0 && size.h < 150;
+    return { top: compact ? 20 : LANE, flag: compact ? 16 : FLAG, bottom: compact ? 16 : RULER };
+  };
+  // Inicio del compás 1 que se dibuja: el que se está arrastrando o, si no, el guardado.
+  const gridOffset = () => (offsetOverride !== null ? offsetOverride : player.offset);
+  const maxBar = () => Math.max(1, player.tempo.barCount(Math.max(0, duration - gridOffset())));
   const xCss = (time) => ((time - view.t0) / view.span) * size.w;
   const tOf = (x) => view.t0 + (x / Math.max(1, size.w)) * view.span;
-  const barAtTime = (time) => clamp(Math.round(player.tempo.barFloat(Math.max(0, time - player.offset))), 1, maxBar());
-  const blockAt = (time) => clamp(Math.floor(player.tempo.barFloat(Math.max(0, time - player.offset)) + 1e-6), 1, maxBar());
-  const barTime = (bar) => player.tempo.barStart(bar) + player.offset;
+  const barAtTime = (time) => clamp(Math.round(player.tempo.barFloat(Math.max(0, time - gridOffset()))), 1, maxBar());
+  const blockAt = (time) => clamp(Math.floor(player.tempo.barFloat(Math.max(0, time - gridOffset())) + 1e-6), 1, maxBar());
+  const barTime = (bar) => player.tempo.barStart(bar) + gridOffset();
   const cursorBar = () => blockAt(player.position());
   const markerOf = (id) => song.markers.find((item) => item.id === id) || null;
   const sectionOf = (id) => player.sections().find((item) => item.id === id) || null;
+  const magnetOn = () => Boolean(align && align.magnet && align.magnet());
+  const barDuration = () => player.tempo.segmentAtBar(1).barDur;
+
+  // Las secciones siguen al compás 1 mientras se arrastra su bandera, antes de guardar.
+  const sectionList = () => {
+    const list = player.sections();
+    if (offsetOverride === null) return list;
+    const delta = offsetOverride - player.offset;
+    const starts = list.map((section) => (section.implicit ? 0 : clamp(section.start + delta, 0, duration)));
+    return list.map((section, index) => ({ ...section, start: starts[index], end: index + 1 < list.length ? starts[index + 1] : duration }));
+  };
 
   const toggle = () => {
     if (player.state === 'playing') app.pause();
@@ -208,7 +301,7 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
 
   const updateZoomLabel = () => {
     const center = view.t0 + view.span / 2;
-    const segment = player.tempo.segmentAtTime(Math.max(0, center - player.offset));
+    const segment = player.tempo.segmentAtTime(Math.max(0, center - gridOffset()));
     const [main, sub] = spanText(view.span, duration, segment.barDur);
     const key = `${main}|${sub}`;
     if (key === lastZoom) return;
@@ -260,6 +353,22 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     if (x < 0 || x > size.w) setFollow(false);
   };
 
+  // Lleva la vista a un instante (a un cuarto del borde izquierdo). Sin `wanted`, conserva el acercamiento;
+  // si se ve toda la canción, acerca a unos dos compases.
+  const focusOn = (time, wanted = null) => {
+    const whole = view.span >= duration - 0.05;
+    const span = wanted || (whole ? Math.max(2.2 * barDuration(), 2.5) : view.span);
+    setView(time - clamp(span, Math.min(MIN_SPAN, duration), duration) * 0.25, span);
+    releaseFollow();
+  };
+
+  const focusEnd = () => {
+    const whole = view.span >= duration - 0.05;
+    const span = clamp(whole ? Math.max(2.2 * barDuration(), 2.5) : view.span, Math.min(MIN_SPAN, duration), duration);
+    setView(duration - span, span);
+    releaseFollow();
+  };
+
   const renderSelection = () => {
     const marker = selectedId ? markerOf(selectedId) : null;
     if (!marker) {
@@ -283,7 +392,17 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     selectMarker(id ? markerOf(id) : null);
   };
 
+  const setTapAction = (kind) => {
+    tapAction = kind;
+    stage.classList.toggle('armed-mark', kind === 'mark');
+    staticDirty = true;
+  };
+
   const clearPick = () => {
+    if (tapAction === 'mark') {
+      setTapAction('bar1');
+      return;
+    }
     pickedBar = null;
   };
 
@@ -339,6 +458,46 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     }
   };
 
+  // Golpe más cercano a un instante, buscado en el audio de las pistas de la mezcla. El radio crece con la
+  // distancia entre píxeles: acercando, el imán es fino; alejado, atrapa el golpe más claro de la zona.
+  const snapNear = (time) => {
+    if (!wave || !wave.channels || !wave.channels.length || !magnetOn()) return null;
+    const radius = clamp((view.span / Math.max(1, size.w)) * 14, 0.012, 0.12);
+    return snapToHit(wave.channels, wave.rate, time, { radius });
+  };
+
+  const tenths = (seconds) => Math.round(clamp(seconds, 0, Math.max(0, duration - 0.05)) * 10000) / 10;
+
+  // Bandera «Compás 1»: ¿qué parte de ella hay bajo el puntero?
+  const markHandleAt = (x, y, reach = 7) => {
+    if (!align || !markGeom) return null;
+    const lane = lanes();
+    if (markGeom.edge) return y <= lane.top && x >= markGeom.left - 4 && x <= markGeom.left + markGeom.width + 4 ? 'edge' : null;
+    if (y <= lane.top && x >= markGeom.left - 6 && x <= markGeom.left + markGeom.width + 6) return 'tag';
+    const poleX = xCss(gridOffset());
+    if (y > lane.top + lane.flag + 2 && y < size.h - lane.bottom && Math.abs(x - poleX) <= reach) return 'pole';
+    return null;
+  };
+
+  const placeAt = (time, altKey = false) => {
+    if (!align) return;
+    const hit = altKey ? null : snapNear(time);
+    const when = hit ? hit.time : time;
+    if (tapAction === 'mark') {
+      setTapAction('bar1');
+      if (align.mark) align.mark(when, Boolean(hit));
+      return;
+    }
+    align.setOffset(tenths(when), Boolean(hit));
+  };
+
+  const scrubTo = (time, force = false) => {
+    const now = performance.now();
+    if (!force && now - scrubAt < 90) return;
+    scrubAt = now;
+    app.seekExact(clamp(time, 0, duration));
+  };
+
   const renderStatic = () => {
     const W = canvas.width;
     const H = canvas.height;
@@ -348,22 +507,34 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     const o = layerContext(over, W, H);
     if (!W || !H) return;
     const px = (value) => Math.round(value * dpr);
-    const flagH = px(FLAG);
-    const rulerH = px(RULER);
+    const lane = lanes();
+    const laneH = px(lane.top);
+    const flagTop = laneH;
+    const flagLaneH = px(lane.flag);
+    const flagH = laneH + flagLaneH;
+    const rulerH = px(lane.bottom);
     const top = flagH + px(3);
     const bottom = H - rulerH;
     const mid = (top + bottom) / 2;
     const half = Math.max(2, (bottom - top) / 2 - px(2));
     const toX = (time) => ((time - view.t0) / view.span) * W;
-    const list = player.sections();
+    const list = sectionList();
     const tempo = player.tempo;
-    const offset = player.offset;
-    const firstBar = Math.max(1, Math.floor(tempo.barFloat(Math.max(0, view.t0 - offset))));
-    const lastBar = Math.ceil(tempo.barFloat(Math.max(0, view.t0 + view.span - offset))) + 1;
-    const first = tempo.segmentAtBar(firstBar);
+    const off = gridOffset();
+    const firstBar = Math.floor(tempo.barFloat(view.t0 - off) + 1e-9);
+    const lastBar = Math.ceil(tempo.barFloat(view.t0 + view.span - off)) + 1;
+    const first = tempo.segmentAtBar(Math.max(1, firstBar));
     const pxPerBar = (size.w * first.barDur) / view.span;
     const step = barStep(pxPerBar);
     const hair = Math.max(1, px(1));
+    const barW = Math.max(2, Math.round(1.5 * dpr));
+    const xOff = toX(off);
+
+    // Antes del compás 1 no hay compases: se oscurece para distinguirlo.
+    if (off > 0 && xOff > 0) {
+      u.fillStyle = 'rgba(0, 0, 0, 0.34)';
+      u.fillRect(0, flagH, Math.min(W, xOff), H - flagH);
+    }
 
     for (const section of list) {
       if (section.implicit) continue;
@@ -378,11 +549,11 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
 
     if (pxPerBar >= ZEBRA_MIN) {
       u.fillStyle = 'rgba(255, 255, 255, 0.07)';
-      for (let number = firstBar + (firstBar % 2); number <= lastBar; number += 2) {
-        const start = tempo.barStart(number) + offset;
+      for (let number = Math.max(2, firstBar + (firstBar % 2)); number <= lastBar; number += 2) {
+        const start = tempo.barStart(number) + off;
         if (start >= duration) break;
         const x0 = Math.round(toX(start));
-        const x1 = Math.round(toX(Math.min(duration, tempo.barStart(number + 1) + offset)));
+        const x1 = Math.round(toX(Math.min(duration, tempo.barStart(number + 1) + off)));
         if (x1 < 0 || x0 > W) continue;
         u.fillRect(Math.max(0, x0), flagH, Math.min(W, x1) - Math.max(0, x0), H - flagH);
       }
@@ -401,52 +572,92 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
       }
     }
 
-    o.fillStyle = 'rgba(8, 11, 15, 0.9)';
+    // Reglas: arriba los compases y los tiempos (como en Ableton Live), abajo el reloj.
+    o.fillStyle = 'rgba(8, 11, 15, 0.94)';
+    o.fillRect(0, 0, W, laneH);
     o.fillRect(0, bottom, W, rulerH);
-    o.fillStyle = '#242c36';
-    o.fillRect(0, bottom, W, Math.max(1, px(1)));
+    o.fillStyle = '#2c3643';
+    o.fillRect(0, laneH - hair, W, hair);
+    o.fillRect(0, bottom, W, hair);
+    const vline = (x, width, alpha, color, y0, y1) => {
+      o.globalAlpha = alpha;
+      o.fillStyle = color;
+      o.fillRect(x - Math.floor(width / 2), y0, width, y1 - y0);
+    };
     o.textBaseline = 'alphabetic';
     for (let number = firstBar; number <= lastBar; number++) {
       const segment = tempo.segmentAtBar(number);
-      const time = tempo.barStart(number) + offset;
+      const time = tempo.barStart(number) + off;
       if (time > duration + 0.001) break;
+      const pre = number < 1;
       const x = Math.round(toX(time));
-      if (x < -px(2) || x > W + px(2)) continue;
-      const major = (number - 1) % step === 0;
-      if (major || pxPerBar >= 30) {
-        o.globalAlpha = major ? 0.4 : 0.24;
-        o.fillStyle = '#ffffff';
-        o.fillRect(x, top - px(2), hair, bottom - top + px(2));
-      }
-      o.globalAlpha = major ? 0.95 : 0.55;
-      o.fillStyle = '#7d8b99';
-      o.fillRect(x, bottom, hair, px(major ? 8 : 5));
-      if (major) {
-        o.globalAlpha = 1;
-        o.fillStyle = '#b4c0cc';
-        o.font = `700 ${px(10.5)}px system-ui, sans-serif`;
-        o.fillText(String(number), x + px(3), H - px(4));
+      const major = mod(number - 1, step) === 0;
+      if (x >= -px(2) && x <= W + px(2) && (major || pxPerBar >= 12)) {
+        vline(x, major ? barW : hair, (major ? 0.5 : 0.26) * (pre ? 0.6 : 1), '#ffffff', flagH, bottom);
+        vline(x, major ? barW : hair, pre ? 0.4 : 0.9, '#a8b6c4', laneH - px(major ? 14 : 8), laneH - hair);
+        if (major && !pre && number !== 1) {
+          o.globalAlpha = 1;
+          o.fillStyle = '#e3ebf3';
+          o.font = `700 ${px(12)}px system-ui, sans-serif`;
+          o.fillText(String(number), x + px(4), laneH - px(8));
+        }
       }
       const beatPx = (size.w * segment.beatDur) / view.span;
-      if (beatPx >= 14) {
-        for (let k = 1; k < segment.num; k++) {
-          const bx = Math.round(toX(time + k * segment.beatDur));
-          if (bx < 0 || bx > W) continue;
-          o.globalAlpha = 0.11;
-          o.fillStyle = '#ffffff';
-          o.fillRect(bx, top - px(2), hair, bottom - top + px(2));
-          o.globalAlpha = 0.5;
-          o.fillStyle = '#7d8b99';
-          o.fillRect(bx, bottom, hair, px(3));
-          if (beatPx >= 44) {
-            o.globalAlpha = 0.8;
-            o.font = `${px(9)}px system-ui, sans-serif`;
-            o.fillText(String(k + 1), bx + px(2), H - px(4));
+      if (beatPx < 9) continue;
+      for (let k = 0; k < segment.num; k++) {
+        const beatTime = time + k * segment.beatDur;
+        if (k > 0) {
+          const bx = Math.round(toX(beatTime));
+          if (bx >= 0 && bx <= W) {
+            vline(bx, hair, pre ? 0.12 : 0.2, '#ffffff', flagH, bottom);
+            vline(bx, hair, pre ? 0.35 : 0.65, '#a8b6c4', laneH - px(8), laneH - hair);
+            if (beatPx >= 46 && !pre) {
+              o.globalAlpha = 0.9;
+              o.fillStyle = '#8ea0b2';
+              o.font = `${px(10)}px system-ui, sans-serif`;
+              o.fillText(`${number}.${k + 1}`, bx + px(3), laneH - px(8));
+            }
+          }
+        }
+        if (beatPx >= 70) {
+          const parts = beatPx >= 140 ? 4 : 2;
+          for (let q = 1; q < parts; q++) {
+            const sx = Math.round(toX(beatTime + (q * segment.beatDur) / parts));
+            if (sx < 0 || sx > W) continue;
+            vline(sx, hair, pre ? 0.04 : 0.075, '#ffffff', flagH, bottom);
+            vline(sx, hair, pre ? 0.25 : 0.4, '#a8b6c4', laneH - px(4), laneH - hair);
           }
         }
       }
     }
     o.globalAlpha = 1;
+
+    // Reloj de la regla inferior.
+    const pxPerSecond = size.w / view.span;
+    const timeSpan = timeStep(pxPerSecond);
+    o.font = `${px(10)}px system-ui, sans-serif`;
+    o.fillStyle = '#8ea0b2';
+    for (let i = Math.ceil(view.t0 / timeSpan - 1e-9), count = 0; i * timeSpan <= view.t0 + view.span && count < 400; i++, count++) {
+      const at = i * timeSpan;
+      const x = Math.round(toX(at));
+      if (x < 0 || x > W) continue;
+      vline(x, hair, 0.8, '#7d8b99', bottom, bottom + px(6));
+      o.globalAlpha = 1;
+      o.fillStyle = '#8ea0b2';
+      o.fillText(rulerTime(at, timeSpan), x + px(3), H - px(4));
+    }
+    o.globalAlpha = 1;
+
+    if (off > 0 && xOff > px(120)) {
+      const labelX = Math.max(px(8), toX(0) + px(8));
+      if (Math.min(W, xOff) - labelX > px(120)) {
+        o.globalAlpha = 0.55;
+        o.fillStyle = '#ffffff';
+        o.font = `600 ${px(11)}px system-ui, sans-serif`;
+        o.fillText('Antes del compás 1', labelX, top + px(15));
+        o.globalAlpha = 1;
+      }
+    }
 
     for (const section of list) {
       if (section.implicit) continue;
@@ -458,34 +669,34 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
       const bw = Math.max(px(2), Math.min(W, x1) - bx0 - px(1));
       o.globalAlpha = 0.94;
       o.fillStyle = section.color;
-      o.fillRect(bx0, 0, bw, flagH);
+      o.fillRect(bx0, flagTop, bw, flagLaneH);
       o.globalAlpha = 1;
       const startVisible = x0 >= 0 && x0 <= W;
-      const gripVisible = startVisible && bw >= px(16);
+      const gripVisible = startVisible && bw >= px(16) && !alignMode;
       if (gripVisible) {
         o.fillStyle = 'rgba(11, 13, 16, 0.6)';
         for (const gx of [5, 9]) {
           for (const gy of [6, 10, 14]) {
             o.beginPath();
-            o.arc(x0 + px(gx), px(gy), px(1.2), 0, Math.PI * 2);
+            o.arc(x0 + px(gx), flagTop + px(gy), px(1.2), 0, Math.PI * 2);
             o.fill();
           }
         }
       }
       o.save();
       o.beginPath();
-      o.rect(bx0, 0, bw, flagH);
+      o.rect(bx0, flagTop, bw, flagLaneH);
       o.clip();
       o.fillStyle = '#0b0d10';
       o.font = `700 ${px(11)}px system-ui, sans-serif`;
       o.textBaseline = 'middle';
-      o.fillText(section.name, gripVisible ? x0 + px(15) : bx0 + px(5), flagH / 2 + px(0.5));
+      o.fillText(section.name, gripVisible ? x0 + px(15) : bx0 + px(5), flagTop + flagLaneH / 2 + px(0.5));
       o.restore();
       o.textBaseline = 'alphabetic';
       if (chosen) {
         o.strokeStyle = '#ffffff';
         o.lineWidth = px(2);
-        o.strokeRect(bx0 + px(1), px(1), Math.max(px(2), bw - px(2)), flagH - px(2));
+        o.strokeRect(bx0 + px(1), flagTop + px(1), Math.max(px(2), bw - px(2)), flagLaneH - px(2));
       }
       if (startVisible) {
         o.globalAlpha = chosen ? 1 : 0.9;
@@ -493,6 +704,53 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
         const lineW = chosen ? px(3) : px(2);
         o.fillRect(Math.round(x0) - Math.floor(lineW / 2), flagH, lineW, bottom - flagH);
         o.globalAlpha = 1;
+      }
+    }
+
+    // Bandera «Compás 1»: poste de arriba abajo y etiqueta en la regla de arriba.
+    if (align) {
+      const wide = pxPerBar >= 34;
+      const text = wide ? 'Compás 1' : '1';
+      o.font = `800 ${px(11.5)}px system-ui, sans-serif`;
+      const textW = Math.ceil(o.measureText(text).width);
+      const tagH = laneH - px(5);
+      const tagY = px(2.5);
+      const poleW = Math.max(2, Math.round(2.5 * dpr));
+      if (xOff >= -px(2) && xOff <= W + px(2)) {
+        const tagW = textW + px(16);
+        const left = xOff + tagW + px(8) <= W ? Math.round(xOff) : Math.max(0, Math.round(xOff) - tagW);
+        o.globalAlpha = 1;
+        o.fillStyle = MARK;
+        o.fillRect(Math.round(xOff) - Math.floor(poleW / 2), 0, poleW, bottom);
+        roundedRect(o, left, tagY, tagW, tagH, px(5));
+        o.fill();
+        o.fillStyle = MARK_INK;
+        o.textBaseline = 'middle';
+        o.fillText(text, left + px(8), tagY + tagH / 2 + px(0.5));
+        o.textBaseline = 'alphabetic';
+        markGeom = { left: left / dpr, width: tagW / dpr, edge: null };
+      } else {
+        const edge = xOff < 0 ? 'left' : 'right';
+        const tagW = textW + px(30);
+        const left = edge === 'left' ? px(3) : W - tagW - px(3);
+        o.globalAlpha = 0.95;
+        o.fillStyle = MARK;
+        roundedRect(o, left, tagY, tagW, tagH, px(5));
+        o.fill();
+        const arrowX = edge === 'left' ? left + px(9) : left + tagW - px(9);
+        const dir = edge === 'left' ? -1 : 1;
+        o.fillStyle = MARK_INK;
+        o.beginPath();
+        o.moveTo(arrowX + dir * px(4), tagY + tagH / 2);
+        o.lineTo(arrowX - dir * px(3), tagY + tagH / 2 - px(5));
+        o.lineTo(arrowX - dir * px(3), tagY + tagH / 2 + px(5));
+        o.closePath();
+        o.fill();
+        o.textBaseline = 'middle';
+        o.fillText(text, edge === 'left' ? left + px(18) : left + px(8), tagY + tagH / 2 + px(0.5));
+        o.textBaseline = 'alphabetic';
+        o.globalAlpha = 1;
+        markGeom = { left: left / dpr, width: tagW / dpr, edge };
       }
     }
   };
@@ -507,7 +765,7 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     const px = (value) => Math.round(value * dpr);
     const mid = H / 2;
     const half = Math.max(2, H / 2 - px(3));
-    for (const section of player.sections()) {
+    for (const section of sectionList()) {
       if (section.implicit) continue;
       const x0 = (section.start / duration) * W;
       const x1 = (section.end / duration) * W;
@@ -532,6 +790,10 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
         b.fillRect(i * colW, mid - height, colW, height * 2);
       }
     }
+    if (align) {
+      a.fillStyle = MARK;
+      a.fillRect(Math.round((gridOffset() / duration) * W) - Math.floor(px(2) / 2), 0, Math.max(2, px(2)), H);
+    }
   };
 
   const draw = (snap) => {
@@ -546,11 +808,12 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     const clipX = clamp(x, 0, W);
     if (clipX > 0) ctx.drawImage(litLayer, 0, 0, clipX, H, 0, 0, clipX, H);
     ctx.drawImage(over, 0, 0);
-    const flagH = px(FLAG);
-    const bottom = H - px(RULER);
-    const block = (bar) => {
-      const a = Math.round(toX(barTime(bar)));
-      const b = Math.round(toX(Math.min(duration, barTime(bar + 1))));
+    const lane = lanes();
+    const flagH = px(lane.top + lane.flag);
+    const bottom = H - px(lane.bottom);
+    const block = (barNumber) => {
+      const a = Math.round(toX(barTime(barNumber)));
+      const b = Math.round(toX(Math.min(duration, barTime(barNumber + 1))));
       return { a, b, w: Math.max(px(2), b - a) };
     };
     const fillBlock = (rect, color) => {
@@ -575,15 +838,8 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
       const height = px(16);
       const x0 = Math.round((left + right) / 2 - width / 2);
       const y0 = bottom - height - px(5);
-      const r = px(8);
       ctx.fillStyle = back;
-      ctx.beginPath();
-      ctx.moveTo(x0 + r, y0);
-      ctx.arcTo(x0 + width, y0, x0 + width, y0 + height, r);
-      ctx.arcTo(x0 + width, y0 + height, x0, y0 + height, r);
-      ctx.arcTo(x0, y0 + height, x0, y0, r);
-      ctx.arcTo(x0, y0, x0 + width, y0, r);
-      ctx.closePath();
+      roundedRect(ctx, x0, y0, width, height, px(8));
       ctx.fill();
       ctx.fillStyle = ink;
       ctx.textBaseline = 'middle';
@@ -599,8 +855,8 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
       ctx.fillRect(a, flagH, px(2), bottom - flagH);
       ctx.fillRect(b - px(2), flagH, px(2), bottom - flagH);
     }
-    fillBlock(block(blockAt(snap.time)), 'rgba(53, 201, 255, 0.07)');
-    if (hoverX !== null && hoverY !== null && !hoverFlag && !drag && !pinch) fillBlock(block(blockAt(tOf(hoverX))), 'rgba(255, 255, 255, 0.09)');
+    if (snap.time >= gridOffset()) fillBlock(block(blockAt(snap.time)), 'rgba(53, 201, 255, 0.07)');
+    if (!alignMode && hoverX !== null && hoverY !== null && !hoverFlag && !drag && !pinch) fillBlock(block(blockAt(tOf(hoverX))), 'rgba(255, 255, 255, 0.09)');
     if (armedBar !== null && armedBar !== pickedBar) {
       const rect = block(armedBar);
       fillBlock(rect, 'rgba(255, 176, 32, 0.1)');
@@ -634,10 +890,50 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
       ctx.setLineDash([px(5), px(4)]);
       const sx = Math.round(toX(barTime(preview.bar)));
       ctx.beginPath();
-      ctx.moveTo(sx, 0);
+      ctx.moveTo(sx, px(lane.top));
       ctx.lineTo(sx, bottom);
       ctx.stroke();
       ctx.restore();
+    }
+    // Golpe al que se pegaría la bandera (o la marca de tempo) si se tocara en este punto.
+    const dragging = drag && drag.type === 'offset' && drag.moved;
+    if (align && hoverX !== null && hoverY !== null && !drag && !pinch && !hoverFlag && hoverY > lane.top + lane.flag && hoverY < size.h - lane.bottom) {
+      const at = hoverSnap ? hoverSnap.time : tOf(hoverX);
+      const gx = Math.round(toX(at));
+      const color = tapAction === 'mark' ? TEMPO_MARK : MARK;
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.globalAlpha = hoverSnap ? 0.95 : 0.5;
+      ctx.lineWidth = Math.max(1, px(1.5));
+      ctx.setLineDash([px(4), px(4)]);
+      ctx.beginPath();
+      ctx.moveTo(gx, flagH);
+      ctx.lineTo(gx, bottom);
+      ctx.stroke();
+      ctx.restore();
+      if (hoverSnap) {
+        const cy = (flagH + bottom) / 2;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(gx, cy - px(6));
+        ctx.lineTo(gx + px(5), cy);
+        ctx.lineTo(gx, cy + px(6));
+        ctx.lineTo(gx - px(5), cy);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+    if (dragging && drag.hit) {
+      const gx = Math.round(toX(drag.hit.time));
+      const cy = (flagH + bottom) / 2;
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.moveTo(gx, cy - px(7));
+      ctx.lineTo(gx + px(6), cy);
+      ctx.lineTo(gx, cy + px(7));
+      ctx.lineTo(gx - px(6), cy);
+      ctx.closePath();
+      ctx.fill();
     }
     if (x >= -px(8) && x <= W + px(8)) {
       ctx.fillStyle = '#ffffff';
@@ -677,26 +973,42 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
   };
 
   const showTip = (x, text) => {
+    const lane = lanes();
     tip.textContent = text;
     tip.hidden = false;
     tip.style.left = `${clamp(x, 90, Math.max(90, size.w - 90))}px`;
+    tip.style.top = `${lane.top + lane.flag + 6}px`;
   };
 
   const hideTip = () => {
     tip.hidden = true;
   };
 
+  const msText = (seconds) => `${(Math.round(seconds * 10000) / 10).toFixed(1)} ms`;
+
   const hoverText = (x, y) => {
     const time = tOf(x);
+    const handle = markHandleAt(x, y);
+    if (handle === 'edge') return 'Ir a la bandera del compás 1';
+    if (handle) return `Compás 1 en ${msText(gridOffset())} · arrástrala`;
+    if (alignMode) {
+      const off = gridOffset();
+      const place = time < off ? 'antes del compás 1' : `compás ${blockAt(time)}`;
+      const where = clockText(time, 3);
+      if (tapAction === 'mark') return `${where} · toca el golpe que cae en un compás`;
+      return `${where} · ${place}${hoverSnap ? ' · golpe' : ''}`;
+    }
     const section = player.sectionAt(time);
     const name = section && !section.implicit ? section.name : '';
-    if (y <= FLAG && flagAt(x, y)) return `${name} · compás ${section.bar}`;
+    if (flagAt(x, y)) return `${name} · compás ${section.bar}`;
     return `Compás ${blockAt(time)}${name ? ` · ${name}` : ''}`;
   };
 
   const flagAt = (x, y) => {
-    if (y > FLAG) return null;
-    const list = player.sections();
+    if (alignMode) return null;
+    const lane = lanes();
+    if (y < lane.top || y > lane.top + lane.flag) return null;
+    const list = sectionList();
     for (let i = list.length - 1; i >= 0; i--) {
       const section = list[i];
       if (section.implicit) continue;
@@ -706,8 +1018,10 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
   };
 
   const gripAt = (x, y) => {
-    if (y > FLAG) return null;
-    const list = player.sections();
+    if (alignMode) return null;
+    const lane = lanes();
+    if (y < lane.top || y > lane.top + lane.flag) return null;
+    const list = sectionList();
     for (let i = list.length - 1; i >= 0; i--) {
       const section = list[i];
       if (section.implicit) continue;
@@ -727,10 +1041,12 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     hoverY = y;
     const grip = gripAt(x, y);
     const flag = grip ? null : flagAt(x, y);
-    hoverFlag = Boolean(grip || flag);
+    const handle = markHandleAt(x, y);
+    hoverFlag = Boolean(grip || flag || handle);
     showTip(x, hoverText(x, y));
     stage.classList.toggle('over-grip', Boolean(grip));
     stage.classList.toggle('over-flag', Boolean(flag));
+    stage.classList.toggle('over-mark', Boolean(handle));
   };
 
   const startPinch = () => {
@@ -740,6 +1056,7 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     pinch = { distance, span: view.span, anchor: tOf(middle) };
     drag = null;
     preview = null;
+    offsetOverride = null;
     hideTip();
   };
 
@@ -750,6 +1067,11 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     const nextSpan = clamp((pinch.span * pinch.distance) / distance, Math.min(MIN_SPAN, duration), duration);
     setView(pinch.anchor - (middle / Math.max(1, size.w)) * nextSpan, nextSpan);
     releaseFollow();
+  };
+
+  const dirtyGrid = () => {
+    staticDirty = true;
+    overviewDirty = true;
   };
 
   const onDown = (event) => {
@@ -769,13 +1091,28 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     }
     if (pointers.size > 2) return;
     hideTip();
+    const lane = lanes();
+    const handle = markHandleAt(x, y, event.pointerType === 'mouse' ? 7 : 16);
+    if (handle === 'edge') {
+      drag = { type: 'edge', startX: x, moved: false };
+      return;
+    }
+    if (handle) {
+      drag = { type: 'offset', startX: x, grab: x - xCss(gridOffset()), moved: false, hit: null };
+      return;
+    }
+    if (y < lane.top || y > size.h - lane.bottom) {
+      drag = { type: 'scrub', startX: x, moved: false };
+      scrubTo(tOf(x), true);
+      return;
+    }
     const grip = gripAt(x, y);
     if (grip) {
       drag = { type: 'marker', id: grip.id, startX: x, grab: x - xCss(grip.start), moved: false, bar: grip.bar, name: grip.name };
       if (selectedId !== grip.id) select(grip.id);
     } else {
       const flag = flagAt(x, y);
-      drag = { type: flag ? 'flag' : 'pan', id: flag ? flag.id : null, startX: x, t0: view.t0, moved: false };
+      drag = { type: flag ? 'flag' : 'pan', id: flag ? flag.id : null, startX: x, t0: view.t0, moved: false, dead: alignMode && y <= lane.top + lane.flag + 2 };
     }
   };
 
@@ -789,8 +1126,22 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     }
     if (drag) {
       const dx = x - drag.startX;
-      if (!drag.moved && Math.abs(dx) < SLOP) return;
+      if (drag.type === 'scrub') {
+        scrubTo(tOf(x));
+        return;
+      }
+      if (!drag.moved && Math.abs(dx) < (drag.type === 'offset' ? FLAG_SLOP : SLOP)) return;
       drag.moved = true;
+      if (drag.type === 'edge') return;
+      if (drag.type === 'offset') {
+        const raw = tOf(x - drag.grab);
+        const hit = event.altKey ? null : snapNear(raw);
+        drag.hit = hit;
+        offsetOverride = tenths(hit ? hit.time : raw) / 1000;
+        dirtyGrid();
+        showTip(x, `Compás 1 en ${msText(offsetOverride)}${hit ? ' · pegado al golpe' : ''}`);
+        return;
+      }
       if (drag.type === 'pan' || drag.type === 'flag') {
         drag.type = 'pan';
         setView(drag.t0 - (dx / Math.max(1, size.w)) * view.span, view.span);
@@ -817,12 +1168,31 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     drag = null;
     stage.classList.remove('grabbing');
     if (!current) return;
+    if (current.type === 'edge') {
+      if (!current.moved) focusOn(gridOffset());
+      return;
+    }
+    if (current.type === 'scrub') {
+      scrubTo(tOf(localX(event)), true);
+      return;
+    }
+    if (current.type === 'offset') {
+      hideTip();
+      const value = offsetOverride;
+      offsetOverride = null;
+      dirtyGrid();
+      if (current.moved && value !== null) align.setOffset(Math.round(value * 10000) / 10, Boolean(current.hit));
+      return;
+    }
     if (current.type === 'flag') {
       if (!current.moved) chooseSection(current.id);
       return;
     }
     if (current.type === 'pan') {
-      if (!current.moved) pickBar(blockAt(tOf(localX(event))));
+      if (!current.moved && !current.dead) {
+        if (alignMode) placeAt(tOf(localX(event)), event.altKey);
+        else pickBar(blockAt(tOf(localX(event))));
+      }
       return;
     }
     preview = null;
@@ -839,6 +1209,10 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     if (pinch && pointers.size < 2) pinch = null;
     drag = null;
     preview = null;
+    if (offsetOverride !== null) {
+      offsetOverride = null;
+      dirtyGrid();
+    }
     stage.classList.remove('grabbing');
     hideTip();
   };
@@ -847,9 +1221,12 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     hoverX = null;
     hoverY = null;
     hoverFlag = false;
+    hoverSnap = null;
+    hoverKey = '';
     if (!drag) hideTip();
     stage.classList.remove('over-grip');
     stage.classList.remove('over-flag');
+    stage.classList.remove('over-mark');
   };
 
   const onWheel = (event) => {
@@ -871,8 +1248,14 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
   };
 
   const onKey = (event) => {
-    if (event.ctrlKey || event.metaKey || event.altKey) return;
     const key = event.key;
+    if (align && event.shiftKey && (key === 'ArrowLeft' || key === 'ArrowRight')) {
+      event.preventDefault();
+      const unit = event.ctrlKey || event.metaKey ? 0.1 : event.altKey ? 10 : 1;
+      align.nudge((key === 'ArrowRight' ? 1 : -1) * unit);
+      return;
+    }
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
     if (key === ' ' || key === 'Spacebar') {
       event.preventDefault();
       toggle();
@@ -892,6 +1275,10 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     } else if (key === 'Home') {
       event.preventDefault();
       toStart();
+    } else if (key === 'Escape' && tapAction === 'mark') {
+      event.preventDefault();
+      event.stopPropagation();
+      setTapAction('bar1');
     }
   };
 
@@ -939,6 +1326,18 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
   const observer = new ResizeObserver(() => measure());
   observer.observe(stage);
 
+  const offUpdated = app.on('song:updated', (updated, kind) => {
+    if (updated !== song || (kind !== 'tempo' && kind !== 'markers')) return;
+    dirtyGrid();
+    lastLabel = '';
+    lastZoom = '';
+    updateZoomLabel();
+    if (kind === 'tempo') {
+      renderSelection();
+      if (pickedBar !== null && pickedBar > maxBar()) pickedBar = null;
+    }
+  });
+
   const followStep = (snap) => {
     if (!follow || snap.state !== 'playing' || drag || pinch || ovDrag || view.span >= duration - 0.01) return;
     const x = ((snap.time - view.t0) / view.span) * size.w;
@@ -958,12 +1357,19 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
   const syncStatus = () => {
     const jump = jumpInfo();
     let tone = 'idle';
-    let text = 'Toca un compás de la onda para elegirlo y saltar a él.';
-    if (jump) {
+    let text = alignMode ? 'Toca en la onda el golpe donde empieza el compás 1, o arrastra la bandera «Compás 1».' : 'Toca un compás de la onda para elegirlo y saltar a él.';
+    let showClear = pickedBar !== null;
+    let clearLabel = 'Quitar elección';
+    if (alignMode && tapAction === 'mark') {
+      tone = 'pick';
+      text = 'Toca el golpe que debería caer justo al inicio de un compás. Cuanto más lejos del compás 1 (hacia el final), más exacto queda el tempo.';
+      showClear = true;
+      clearLabel = 'Cancelar';
+    } else if (jump && !alignMode) {
       tone = 'armed';
       const where = jump.name ? `a «${jump.name}» (compás ${jump.bar})` : `al compás ${jump.bar}`;
       text = `Saltará ${where} ${app.settings.jumpMode === 'beat' ? 'en el siguiente tiempo' : 'al terminar este compás'}.`;
-    } else if (pickedBar !== null) {
+    } else if (pickedBar !== null && !alignMode) {
       tone = 'pick';
       text = `Compás ${pickedBar} elegido. Pulsa una sección para marcarlo ahí.`;
     }
@@ -978,18 +1384,26 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     }
     const pick = pickedBar === null ? '' : String(pickedBar);
     if (stage.dataset.pick !== pick) stage.dataset.pick = pick;
-    armedBar = jump ? jump.bar : null;
-    const armed = jump ? String(jump.bar) : '';
+    armedBar = jump && !alignMode ? jump.bar : null;
+    const armed = armedBar !== null ? String(armedBar) : '';
     if (stage.dataset.armed !== armed) stage.dataset.armed = armed;
-    const showClear = pickedBar !== null;
-    if (clearButton.hidden === showClear) clearButton.hidden = !showClear;
+    const clearKey = `${showClear}|${clearLabel}`;
+    if (clearKey !== lastClear) {
+      lastClear = clearKey;
+      clearButton.hidden = !showClear;
+      clearButton.textContent = clearLabel;
+    }
   };
 
   const syncControls = (snap) => {
-    const text = `Compás ${snap.bar} · ${clockText(snap.time)} / ${clockText(duration)}`;
+    const before = snap.time < player.offset - 0.0005;
+    const barText = before ? 'Antes del compás 1' : `Compás ${snap.bar}`;
+    const timeText = `${clockText(snap.time)} / ${clockText(duration)}`;
+    const text = `${barText}|${timeText}`;
     if (text !== lastClock) {
       lastClock = text;
-      clock.textContent = text;
+      clockTime.textContent = timeText;
+      clockBar.textContent = barText;
     }
     const playing = snap.state === 'playing';
     if (playButton.__playing !== playing) {
@@ -997,13 +1411,31 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
       playIcon.replaceChildren(icon(playing ? 'pause' : 'play', 24));
       playButton.setAttribute('aria-label', playing ? 'Pausar' : 'Reproducir');
     }
-    const target = pickedBar !== null ? pickedBar : cursorBar();
-    const label = `Marcar en el compás ${target} (${pickedBar !== null ? 'elegido' : 'cursor'})`;
-    if (label !== lastLabel) {
-      lastLabel = label;
-      addLabel.textContent = label;
+    if (!alignMode) {
+      const target = pickedBar !== null ? pickedBar : cursorBar();
+      const label = `Marcar en el compás ${target} (${pickedBar !== null ? 'elegido' : 'cursor'})`;
+      if (label !== lastLabel) {
+        lastLabel = label;
+        addLabel.textContent = label;
+      }
     }
     syncStatus();
+  };
+
+  // Golpe bajo el puntero (solo con el ratón y el imán activado), para dibujar adónde se pegaría la bandera.
+  const syncHover = () => {
+    if (!align || hoverX === null || drag || pinch) {
+      hoverSnap = null;
+      hoverKey = '';
+      return;
+    }
+    const key = `${hoverX}|${hoverY}|${view.t0}|${view.span}|${magnetOn()}|${wave ? 1 : 0}`;
+    if (key === hoverKey) return;
+    hoverKey = key;
+    const lane = lanes();
+    const inside = hoverY !== null && hoverY > lane.top + lane.flag && hoverY < size.h - lane.bottom;
+    hoverSnap = inside && !hoverFlag ? snapNear(tOf(hoverX)) : null;
+    if (inside && !hoverFlag) showTip(hoverX, hoverText(hoverX, hoverY));
   };
 
   const frame = () => {
@@ -1016,6 +1448,7 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     if (!snap) return;
     followStep(snap);
     syncControls(snap);
+    syncHover();
     if (staticDirty) {
       renderStatic();
       staticDirty = false;
@@ -1036,13 +1469,19 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     overviewDirty = true;
   });
 
-  stage.dataset.view = `0.000:${duration.toFixed(3)}`;
+  if (alignMode) {
+    // Al abrir se muestran unos dos compases alrededor de la bandera: lo bastante cerca para ver los golpes sueltos.
+    const span = clamp(Math.max(2.2 * barDuration(), 2.5), Math.min(MIN_SPAN, duration), duration);
+    view = { t0: clamp(player.offset - span * 0.25, 0, Math.max(0, duration - span)), span };
+  }
+  stage.dataset.view = `${view.t0.toFixed(3)}:${view.span.toFixed(3)}`;
   updateZoomLabel();
   renderSelection();
   raf = requestAnimationFrame(frame);
 
   return {
     el,
+    info,
     cursorBar,
     refresh() {
       staticDirty = true;
@@ -1057,11 +1496,17 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
       renderSelection();
       staticDirty = true;
     },
+    focusOn,
+    focusEnd,
+    arm(kind) {
+      setTapAction(kind === 'mark' ? 'mark' : 'bar1');
+    },
     view: () => ({ ...view }),
     destroy() {
       destroyed = true;
       cancelAnimationFrame(raf);
       observer.disconnect();
+      offUpdated();
     },
   };
 }

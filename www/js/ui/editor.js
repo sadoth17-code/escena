@@ -1,14 +1,16 @@
 import { h, fmtBytes, fmtTime, clamp, uid } from '../util.js';
 import { app } from '../app.js';
 import { normalizeTempoEntries, tempoIsShaky, tempoWarning } from '../tempo.js';
+import { bpmFromMark, findFirstHit, fitGridToAudio, snapToHit } from '../align.js';
 import { SECTION_VOICES, VOICE_GROUPS, VOICE_CATALOG, SECTION_COLORS, voiceKeyForName } from '../voices.js';
 import { CLICK_SOUNDS, CLICK_GROUPS } from '../synth.js';
 import { gatherAudio, draftTracks, isClickName, songBytes, songDuration } from '../library.js';
 import { icon, iconButton, openModal, confirmDialog, createSegmented, createSwitch, createSectionPicker, createGuideLanguageSelect, field, settingRow } from './kit.js';
-import { createSectionMap } from './section-map.js';
+import { createSectionMap, clockText } from './section-map.js';
 
 const TABS = [
   { id: 'general', label: 'General' },
+  { id: 'align', label: 'Alinear' },
   { id: 'tempo', label: 'Tempo' },
   { id: 'sections', label: 'Secciones' },
   { id: 'tracks', label: 'Pistas' },
@@ -16,6 +18,11 @@ const TABS = [
 ];
 
 const QUICK_SECTIONS = ['Intro', 'Verso', 'Pre-coro', 'Coro', 'Puente', 'Solo', 'Interludio', 'Instrumental', 'Estribillo', 'Break', 'Final', 'Tag'];
+
+// El inicio del compás 1 admite décimas de milisegundo: la detección automática lo calcula con esa precisión.
+const tenths = (value) => Math.max(0, Math.round(value * 10) / 10);
+
+const yieldNow = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 function numberInput({ value, min, max, step = 1, label, onChange, disabled = false, className = '' }) {
   const input = h('input', {
@@ -25,7 +32,7 @@ function numberInput({ value, min, max, step = 1, label, onChange, disabled = fa
     max,
     step,
     value: String(value),
-    inputmode: step < 1 ? 'decimal' : 'numeric',
+    inputmode: step === 'any' || step < 1 ? 'decimal' : 'numeric',
     'aria-label': label,
     disabled,
   });
@@ -50,17 +57,24 @@ export function openEditor(song, tab = 'general') {
   let sectionMap = null;
   let sectionTable = null;
   let selectedMarkerId = null;
+  let magnet = true;
+  const history = [];
+  // Mensajes y campos de la pestaña Alinear: solo existen mientras esa pestaña está abierta.
+  let say = () => {};
+  let syncAlignFields = () => {};
 
   const destroyMap = () => {
     if (sectionMap) sectionMap.destroy();
     sectionMap = null;
     sectionTable = null;
+    say = () => {};
+    syncAlignFields = () => {};
   };
 
   const content = h('div', { class: 'editor-content' });
   const tabBar = h('div', { class: 'tabs', role: 'tablist' });
   const reopenSections = () => {
-    if (active === 'sections') renderSections();
+    if (active === 'sections' || active === 'align') renderers[active]();
   };
   const offLoaded = app.on('song:loaded', reopenSections);
   const offUnloaded = app.on('song:unloaded', reopenSections);
@@ -91,6 +105,89 @@ export function openEditor(song, tab = 'general') {
     changed('tempo');
   };
 
+  // ---- Alinear: colocar el compás 1 y afinar el tempo mirando la onda ----------------------------------
+  const stateNow = () => ({ offsetMs: song.offsetMs, tempoMap: song.tempoMap.map((item) => ({ ...item })) });
+  const remember = (before = stateNow()) => {
+    history.push(before);
+    if (history.length > 40) history.shift();
+    syncAlignFields();
+  };
+  const refreshAfterTempo = () => {
+    if (sectionMap) sectionMap.refresh();
+    syncAlignFields();
+  };
+  const offsetLimit = () => {
+    const current = entry();
+    return current ? Math.max(0, current.player.duration * 1000 - 50) : Infinity;
+  };
+  const setOffsetMs = (ms) => {
+    const next = Math.min(offsetLimit(), tenths(ms));
+    if (next === song.offsetMs) {
+      syncAlignFields();
+      return false;
+    }
+    song.offsetMs = next;
+    changed('tempo');
+    refreshAfterTempo();
+    return true;
+  };
+  const nudgeOffset = (delta) => {
+    const before = stateNow();
+    if (setOffsetMs((Number(song.offsetMs) || 0) + delta)) remember(before);
+  };
+  const undoLast = () => {
+    const state = history.pop();
+    if (!state) return;
+    song.offsetMs = state.offsetMs;
+    song.tempoMap = state.tempoMap;
+    commitTempo();
+    refreshAfterTempo();
+    say('Se deshizo el último cambio.');
+  };
+
+  // Marca de tempo: el golpe tocado debería caer justo al inicio de un compás. Con el compás 1 fijo, eso da el BPM exacto.
+  const applyTempoMark = (time) => {
+    const current = entry();
+    if (!current) return;
+    const player = current.player;
+    const segment = player.tempo.segments[0];
+    const bar = Math.round((time - player.offset) / segment.barDur) + 1;
+    if (segment.endBar !== Infinity && bar >= segment.endBar) {
+      say('Ese punto queda después de un cambio de tempo. Ajusta el tempo de ese tramo en la pestaña Tempo.', 'warn');
+      return;
+    }
+    if (bar < 2) {
+      say('Toca más lejos del compás 1, hacia el final de la canción: así el tempo queda más exacto.', 'warn');
+      return;
+    }
+    const first = song.tempoMap[0];
+    const bpm = bpmFromMark({ offset: player.offset, markTime: time, bars: bar - 1, beatsPerBar: first.num });
+    const change = bpm ? Math.abs(bpm / first.bpm - 1) : 1;
+    if (!bpm || change > 0.05) {
+      say(`Ese golpe no cae cerca de un inicio de compás (el tempo tendría que cambiar un ${(change * 100).toFixed(1)} %). Acerca la vista y toca el golpe más cercano a una línea de compás.`, 'warn');
+      return;
+    }
+    const before = stateNow();
+    const previous = first.bpm;
+    first.bpm = Math.round(bpm * 1000) / 1000;
+    commitTempo();
+    remember(before);
+    refreshAfterTempo();
+    say(`Tempo ajustado a ${song.tempoMap[0].bpm} BPM (antes ${previous}). El compás ${bar} cae ahora en el golpe que tocaste.`, 'ok');
+  };
+
+  const alignApi = {
+    setOffset: (ms, snapped) => {
+      const before = stateNow();
+      if (!setOffsetMs(ms)) return;
+      remember(before);
+      say(`Compás 1 en ${song.offsetMs} ms${snapped ? ', pegado al golpe' : ''}.`, 'ok');
+    },
+    nudge: nudgeOffset,
+    magnet: () => magnet,
+    mark: (time) => applyTempoMark(time),
+  };
+
   const renderGeneral = () => {
     const title = h('input', { type: 'text', class: 'input', value: song.title, maxlength: '80', 'aria-label': 'Título' });
     title.addEventListener('change', () => {
@@ -108,8 +205,6 @@ export function openEditor(song, tab = 'general') {
       song.key = key.value.trim();
       changed('meta');
     });
-    // El inicio del compás 1 admite décimas de milisegundo: la detección automática lo calcula con esa precisión.
-    const tenths = (value) => Math.max(0, Math.round(value * 10) / 10);
     const offset = numberInput({
       value: song.offsetMs,
       min: 0,
@@ -177,8 +272,9 @@ export function openEditor(song, tab = 'general') {
       field('Título', title),
       h('div', { class: 'grid-2' }, field('Artista', artist), field('Tono', key)),
       h('h3', { class: 'sub', text: 'Alineación del compás 1' }),
-      h('p', { class: 'field-hint', text: 'Indica en qué milisegundo del audio empieza el primer tiempo del compás 1. Con ello el click, la guía y los saltos caen exactos sobre el audio.' }),
+      h('p', { class: 'field-hint', text: 'Indica en qué milisegundo del audio empieza el primer tiempo del compás 1. Con ello el click, la guía y los saltos caen exactos sobre el audio. Si prefieres verlo sobre la onda y colocarlo con un toque, usa la pestaña Alinear.' }),
       h('div', { class: 'offset-row' }, offset, h('span', { class: 'unit', text: 'ms' }), nudge(-10), nudge(-1), nudge(1), nudge(10)),
+      h('div', { class: 'offset-row' }, h('button', { type: 'button', class: 'btn small', onClick: () => showTab('align') }, icon('flag', 16), 'Alinear sobre la onda')),
       h('h3', { class: 'sub', text: 'Detectar tempo desde una pista de click' }),
       h('div', { class: 'detect-row' }, select, detect),
       result,
@@ -239,7 +335,7 @@ export function openEditor(song, tab = 'general') {
       h('p', { class: 'field-hint', text: 'El tempo y el compás cambian a partir del compás indicado. En compases como 6/8 o 12/8 el BPM cuenta corcheas y el click acentúa cada 3.' }),
       rows,
       h('div', { class: 'row-actions' }, add, h('div', { class: 'tap-box' }, tap, tapOut)),
-      h('p', { class: 'field-hint', text: 'Tap tempo ajusta el BPM del primer tramo: toca el botón al ritmo de la canción, al menos 3 veces.' })
+      h('p', { class: 'field-hint', text: 'Tap tempo ajusta el BPM del primer tramo: toca el botón al ritmo de la canción, al menos 3 veces. Para afinarlo viendo la onda, usa la pestaña Alinear.' })
     );
   };
 
@@ -404,6 +500,7 @@ export function openEditor(song, tab = 'general') {
         moveMarker,
         removeMarker,
         selectMarker: pickMarker,
+        align: alignApi,
       });
       if (selectedMarkerId) sectionMap.select(selectedMarkerId);
       content.replaceChildren(intro, sectionMap.el, heading, sectionTable);
@@ -421,6 +518,246 @@ export function openEditor(song, tab = 'general') {
       quick,
       h('p', { class: 'field-hint', text: 'Se añade 8 compases después de la última sección; cambia el compás en la tabla.' })
     );
+  };
+
+  const buildAlignPanel = () => {
+    const message = h('p', { class: 'field-hint detect align-message', role: 'status' });
+    say = (text, tone = '') => {
+      message.textContent = text;
+      message.classList.remove('ok', 'warn', 'bad');
+      if (tone) message.classList.add(tone);
+    };
+    // Los análisis tardan: el botón queda desactivado mientras trabaja y cualquier fallo se cuenta en pantalla.
+    const busy = (button, work) => async () => {
+      if (button.disabled) return;
+      button.disabled = true;
+      try {
+        await work();
+      } catch (error) {
+        say(error && error.message ? error.message : 'No se pudo analizar el audio', 'bad');
+      } finally {
+        button.disabled = false;
+      }
+    };
+    const offsetField = numberInput({
+      value: song.offsetMs,
+      min: 0,
+      step: 0.1,
+      label: 'Inicio del compás 1 en milisegundos',
+      onChange: (value) => {
+        const before = stateNow();
+        if (setOffsetMs(value)) {
+          remember(before);
+          say(`Compás 1 en ${song.offsetMs} ms.`, 'ok');
+        } else {
+          offsetField.value = String(song.offsetMs);
+        }
+      },
+    });
+    const nudgeButton = (delta) =>
+      h('button', {
+        type: 'button',
+        class: 'btn small',
+        text: `${delta > 0 ? '+' : '−'}${Math.abs(delta)}`,
+        title: `Mover el compás 1 ${Math.abs(delta)} ms ${delta > 0 ? 'después' : 'antes'}`,
+        onClick: () => nudgeOffset(delta),
+      });
+
+    const firstHitButton = h('button', { type: 'button', class: 'btn' }, icon('target', 18), 'Buscar el primer golpe');
+    firstHitButton.addEventListener('click', busy(firstHitButton, async () => {
+      const current = entry();
+      if (!current) return;
+      say('Buscando el primer golpe…');
+      const wave = await current.player.prepareWaveform();
+      if (!wave) return;
+      const hit = findFirstHit(wave.channels, wave.rate, { top: wave.top });
+      if (!hit) {
+        say('No encontré un golpe claro al inicio de la canción. Toca en la onda el golpe donde cae el primer tiempo del compás 1.', 'warn');
+        return;
+      }
+      const before = stateNow();
+      if (setOffsetMs(hit.time * 1000)) remember(before);
+      if (sectionMap) sectionMap.focusOn(hit.time);
+      say(`Primer golpe encontrado en ${song.offsetMs} ms: ahí queda el compás 1. Si el compás 1 de la música cae en otro golpe, arrastra la bandera hasta él.`, 'ok');
+    }));
+
+    const cursorButton = h('button', { type: 'button', class: 'btn' }, icon('flag', 18), 'Poner en el cursor');
+    cursorButton.addEventListener('click', busy(cursorButton, async () => {
+      const current = entry();
+      if (!current) return;
+      const player = current.player;
+      let time = player.position();
+      let snapped = false;
+      if (magnet) {
+        const wave = await player.prepareWaveform();
+        const hit = wave ? snapToHit(wave.channels, wave.rate, time, { radius: 0.12 }) : null;
+        if (hit) {
+          time = hit.time;
+          snapped = true;
+        }
+      }
+      const before = stateNow();
+      if (setOffsetMs(time * 1000)) remember(before);
+      if (sectionMap) sectionMap.focusOn(time);
+      say(`Compás 1 puesto en el cursor (${clockText(time, 3)})${snapped ? ', pegado al golpe más cercano' : ''}.`, 'ok');
+    }));
+
+    const listenButton = h('button', { type: 'button', class: 'btn' }, icon('play', 18), 'Escuchar desde el compás 1');
+    listenButton.addEventListener('click', async () => {
+      const current = entry();
+      if (!current) return;
+      const player = current.player;
+      const lead = Math.min(player.offset, player.tempo.segmentAtBar(1).barDur);
+      app.seekExact(player.offset - lead);
+      try {
+        await player.play({ countIn: false });
+      } catch (error) {
+        app.toast(error.message || 'No se pudo activar el audio. Toca Escuchar de nuevo.', 'error');
+      }
+    });
+
+    const magnetSwitch = createSwitch({ value: magnet, label: 'Imán al golpe', onChange: (value) => { magnet = value; } });
+    const clickSwitch = createSwitch({
+      value: !song.click.mute,
+      label: 'Oír el click de Escena',
+      onChange: (value) => {
+        song.click.mute = !value;
+        changed('click');
+      },
+    });
+
+    const bpmField = numberInput({
+      value: song.tempoMap[0].bpm,
+      min: 20,
+      max: 400,
+      step: 'any',
+      label: 'BPM del primer tramo',
+      onChange: (value) => {
+        const before = stateNow();
+        song.tempoMap[0].bpm = clamp(value, 20, 400);
+        commitTempo();
+        remember(before);
+        refreshAfterTempo();
+        say(`Tempo en ${song.tempoMap[0].bpm} BPM.`, 'ok');
+      },
+    });
+    const numField = numberInput({
+      value: song.tempoMap[0].num,
+      min: 1,
+      max: 32,
+      step: 1,
+      label: 'Tiempos por compás',
+      onChange: (value) => {
+        const before = stateNow();
+        song.tempoMap[0].num = clamp(Math.round(value), 1, 32);
+        commitTempo();
+        remember(before);
+        refreshAfterTempo();
+        say(`${song.tempoMap[0].num} tiempos por compás.`, 'ok');
+      },
+    });
+
+    const fineButton = h('button', { type: 'button', class: 'btn' }, icon('wave', 18), 'Afinar con toda la canción');
+    fineButton.addEventListener('click', busy(fineButton, async () => {
+      const current = entry();
+      if (!current) return;
+      const player = current.player;
+      const first = song.tempoMap[0];
+      say('Analizando toda la canción… puede tardar unos segundos.');
+      const wave = await player.prepareWaveform();
+      if (!wave) return;
+      const segment = player.tempo.segments[0];
+      const until = segment.endBar === Infinity ? Infinity : player.offset + (segment.endBar - segment.startBar) * segment.barDur;
+      const result = await fitGridToAudio(wave.channels, wave.rate, { bpm: first.bpm, offset: player.offset, duration: player.duration, until, pause: yieldNow });
+      if (!result) {
+        say('No encontré suficientes golpes para afinar. Usa «Ajustar con un compás lejano» o escribe el BPM.', 'warn');
+        return;
+      }
+      const share = Math.round(result.coverage * 100);
+      const far = Math.abs(result.bpm / first.bpm - 1) > 0.03;
+      if (!result.reliable || far) {
+        const spread = result.sigmaMs > 6 ? ` y se separan unos ${result.sigmaMs} ms de un pulso fijo` : '';
+        say(`No pude afinarlo con seguridad: solo ${result.used} de ${result.beats} tiempos (${share} %) caen sobre un golpe claro${spread}. Revisa que el BPM esté cerca del real, o usa «Ajustar con un compás lejano».`, 'warn');
+        return;
+      }
+      const before = stateNow();
+      const previous = first.bpm;
+      first.bpm = result.bpm;
+      song.offsetMs = Math.min(offsetLimit(), tenths(result.offsetMs));
+      commitTempo();
+      remember(before);
+      refreshAfterTempo();
+      say(`Afinado: ${song.tempoMap[0].bpm} BPM (antes ${previous}) y compás 1 en ${song.offsetMs} ms. ${result.used} de ${result.beats} tiempos (${share} %) caen sobre un golpe, con una desviación típica de ${result.sigmaMs} ms.`, 'ok');
+    }));
+
+    const markButton = h('button', { type: 'button', class: 'btn' }, icon('flag', 18), 'Ajustar con un compás lejano');
+    markButton.addEventListener('click', () => {
+      if (!sectionMap) return;
+      sectionMap.arm('mark');
+      sectionMap.focusEnd();
+      say('Estás al final de la canción. Toca el golpe que cae justo al inicio de un compás; si no lo ves, acerca o aleja con la rueda del mouse o pellizcando.');
+    });
+
+    const undoButton = h('button', { type: 'button', class: 'btn', disabled: true, onClick: () => undoLast() }, icon('swap', 18), 'Deshacer');
+
+    syncAlignFields = () => {
+      offsetField.value = String(song.offsetMs);
+      bpmField.value = String(song.tempoMap[0].bpm);
+      numField.value = String(song.tempoMap[0].num);
+      undoButton.disabled = history.length === 0;
+    };
+    syncAlignFields();
+
+    const hasOwnClick = song.tracks.some((track) => isClickName(track.name));
+    const toggle = (label, hint, control) => h('div', { class: 'align-toggle', title: hint }, h('span', { text: label }), control);
+    return h(
+      'div',
+      { class: 'align-panel' },
+      message,
+      h(
+        'div',
+        { class: 'align-group' },
+        h('div', { class: 'align-line' }, h('strong', { class: 'align-title', text: 'Compás 1' }), offsetField, h('span', { class: 'unit', text: 'ms' }), nudgeButton(-10), nudgeButton(-1), nudgeButton(-0.1), nudgeButton(0.1), nudgeButton(1), nudgeButton(10)),
+        h('div', { class: 'align-actions' }, firstHitButton, cursorButton, listenButton),
+        h(
+          'div',
+          { class: 'align-toggles' },
+          toggle('Imán al golpe', 'La bandera se pega sola al golpe más cercano. Mantén Alt al arrastrar para soltarla.', magnetSwitch.el),
+          toggle('Click de Escena', hasOwnClick ? 'Esta canción trae su propia pista de click: apágalo para no oír dos.' : 'Así oyes la cuadrícula contra la música al pulsar Escuchar.', clickSwitch.el)
+        )
+      ),
+      h(
+        'div',
+        { class: 'align-group' },
+        h('div', { class: 'align-line' }, h('strong', { class: 'align-title', text: 'Tempo' }), bpmField, h('span', { class: 'unit', text: 'BPM' }), numField, h('span', { class: 'unit', text: 'tiempos por compás' })),
+        h('div', { class: 'align-actions' }, fineButton, markButton, undoButton),
+        h('p', { class: 'field-hint', text: 'Afinar corrige pequeñas diferencias de BPM con todos los golpes de la canción. Si hacia el final la cuadrícula se separa de la música, usa «Ajustar con un compás lejano»: ve al final, toca el golpe que cae en un inicio de compás y el tempo se calcula solo. Los cambios de tempo se hacen en la pestaña Tempo.' })
+      )
+    );
+  };
+
+  const renderAlign = () => {
+    destroyMap();
+    const current = entry();
+    const intro = h('p', { class: 'field-hint sections-intro', text: 'Coloca el compás 1 justo en el golpe donde empieza la música. Así el click, la guía de voz y los saltos de sección caen sobre la canción, aunque tenga un silencio al principio.' });
+    if (!current) {
+      const load = h('button', { type: 'button', class: 'btn small', onClick: () => app.loadSong(song.id) }, icon('play', 16), 'Cargar canción');
+      const notice = h('div', { class: 'notice info smap-notice' }, icon('info', 20), h('div', {}, h('b', { text: 'Carga la canción para ver su onda' }), h('p', { text: 'Con la canción cargada verás su onda y la cuadrícula de compases, y podrás colocar el compás 1 sobre el primer golpe. Al cargarla se detiene la que esté sonando.' }), load));
+      content.replaceChildren(intro, notice);
+      return;
+    }
+    const panel = buildAlignPanel();
+    sectionMap = createSectionMap({
+      song,
+      entry: current,
+      mode: 'align',
+      align: alignApi,
+      addMarker,
+      moveMarker,
+      removeMarker,
+      selectMarker: pickMarker,
+    });
+    content.replaceChildren(sectionMap.el, sectionMap.info, panel);
   };
 
   const renderTracks = () => {
@@ -585,7 +922,7 @@ export function openEditor(song, tab = 'general') {
     );
   };
 
-  const renderers = { general: renderGeneral, tempo: renderTempo, sections: renderSections, tracks: renderTracks, cues: renderCues };
+  const renderers = { general: renderGeneral, align: renderAlign, tempo: renderTempo, sections: renderSections, tracks: renderTracks, cues: renderCues };
 
   const showTab = (id) => {
     active = id;

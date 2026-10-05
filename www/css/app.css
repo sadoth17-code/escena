@@ -2350,8 +2350,15 @@ p {
   min-width: 0;
 }
 
+/* El transporte se queda con el sobrante de la línea y el reloj se recorta con puntos suspensivos: así la altura de
+   la barra (y con ella la posición de la onda) no cambia cuando cambia el texto del reloj. */
+.smap-transport {
+  flex: 1 1 280px;
+}
+
 .smap-zoombox {
-  flex-wrap: wrap;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
 }
 
 .smap-play {
@@ -2381,14 +2388,33 @@ p {
 }
 
 .smap-clock {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 0;
+  line-height: 1.15;
+}
+
+.smap-clock-time {
   font: 700 13px var(--mono);
   color: var(--text);
   white-space: nowrap;
-  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.smap-clock-bar {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .smap-zoom {
-  min-width: 104px;
+  min-width: 152px;
   text-align: center;
   font: 600 12px var(--mono);
   color: var(--text-2);
@@ -2402,7 +2428,7 @@ p {
 
 .smap-stage {
   position: relative;
-  height: 180px;
+  height: 204px;
   border-radius: var(--radius-sm);
   background: #0a0e13;
   border: 1px solid var(--line);
@@ -2428,6 +2454,15 @@ p {
   cursor: pointer;
 }
 
+.smap-stage.over-mark {
+  cursor: ew-resize;
+}
+
+.smap-stage.armed-mark {
+  cursor: crosshair;
+  box-shadow: 0 0 0 2px #5eead4 inset;
+}
+
 .smap-stage.grabbing {
   cursor: grabbing;
 }
@@ -2441,7 +2476,8 @@ p {
 
 .smap-tip {
   position: absolute;
-  top: 26px;
+  top: 54px;
+  z-index: 2;
   transform: translateX(-50%);
   padding: 3px 9px;
   border-radius: 6px;
@@ -2572,6 +2608,149 @@ p {
 
 .smap-notice .btn {
   margin-top: 10px;
+}
+
+.smap-align .smap-stage {
+  height: 236px;
+}
+
+/* Pestaña Alinear: la onda con su cuadrícula queda fija arriba y los controles pasan por debajo al bajar. */
+.smap-align {
+  position: sticky;
+  top: 0;
+  z-index: 6;
+  gap: 8px;
+  margin: 0 -20px 6px;
+  padding: 8px 20px 10px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.smap-info {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 10px 0 14px;
+}
+
+.smap-info .smap-status {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: 6px 8px;
+  min-height: 0;
+}
+
+.smap-info .smap-status-text {
+  flex: 1 1 260px;
+}
+
+/* Con la pantalla muy baja la onda fija taparía los controles: se desplaza como el resto. */
+@media (max-height: 620px) {
+  .smap-align {
+    position: static;
+    margin-bottom: 0;
+    padding-bottom: 0;
+    border-bottom: 0;
+  }
+}
+
+.smap-go {
+  gap: 6px;
+}
+
+.smap-tips {
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+
+.smap-tips summary {
+  cursor: pointer;
+  font-weight: 700;
+  color: var(--text-2);
+  padding: 2px 0;
+}
+
+.smap-tips .field-hint {
+  margin: 6px 0 0;
+}
+
+.align-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 2px;
+}
+
+.align-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.align-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.align-title {
+  min-width: 78px;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.align-line .input {
+  width: 108px;
+}
+
+.align-line .unit {
+  margin-right: 4px;
+}
+
+.align-message {
+  margin: 0;
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+}
+
+.align-message:empty {
+  display: none;
+}
+
+.align-panel .field-hint {
+  margin: 0;
+}
+
+.align-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.align-actions .btn {
+  min-height: 42px;
+}
+
+.align-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 26px;
+}
+
+.align-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13.5px;
+  font-weight: 700;
 }
 
 .row-actions {
@@ -3572,7 +3751,23 @@ body.stage-open .toasts {
   }
 
   .smap-stage {
-    height: 160px;
+    height: 176px;
+  }
+
+  .smap-align .smap-stage {
+    height: 208px;
+  }
+
+  .align-actions .btn {
+    flex: 1 1 100%;
+  }
+
+  .align-line .input {
+    width: 92px;
+  }
+
+  .align-title {
+    min-width: 100%;
   }
 
   .smap-status {
@@ -3952,8 +4147,9 @@ body.stage-open .toasts {
     display: none;
   }
 
-  .smap-stage {
-    height: 104px;
+  .smap-stage,
+  .smap-align .smap-stage {
+    height: 128px;
   }
 
   .smap-status {

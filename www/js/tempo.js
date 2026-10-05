@@ -170,7 +170,7 @@ function accentPattern(values, upwardOnly) {
 }
 
 // Ajuste de una recta  tiempo = origen + periodo × índice  por mínimos cuadrados.
-function fitLine(points) {
+export function fitLine(points) {
   const count = points.length;
   let meanX = 0;
   let meanY = 0;
@@ -203,7 +203,7 @@ function fitLine(points) {
 // El BPM sale de una recta ajustada a cientos de golpes, así que es mucho más fino que dos decimales.
 // Si el valor cae dentro de su margen de error sobre un número «redondo» (120, 93,5, 93,37) se usa ese;
 // si no, se conservan decimales de sobra para que el click no se vaya separando de la pista en canciones largas.
-function roundBpm(value, error) {
+export function roundBpm(value, error) {
   const limit = Math.min(0.004, Math.max(0.0006, 2.5 * error));
   for (const decimals of [0, 1, 2]) {
     const scale = 10 ** decimals;

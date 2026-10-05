@@ -37,6 +37,8 @@ const PATHS = {
   mixer: [STROKE, '<path d="M6 4v16M12 4v16M18 4v16"/><circle cx="6" cy="14" r="2" fill="currentColor"/><circle cx="12" cy="8" r="2" fill="currentColor"/><circle cx="18" cy="16" r="2" fill="currentColor"/>'],
   wave: [STROKE, '<path d="M3 12h2.2l2-6 3.2 12 3-9 2 5 1.6-3H21"/>'],
   info: [STROKE, '<circle cx="12" cy="12" r="9"/><path d="M12 11v5.5M12 7.6h.01"/>'],
+  flag: [STROKE, '<path d="M6 21V4M6 5h11l-2.4 3.6L17 12H6"/>'],
+  magnet: [STROKE, '<path d="M6 3v8.5a6 6 0 0 0 12 0V3M6 7.5h4M14 7.5h4"/>'],
   target: [STROKE, '<circle cx="12" cy="12" r="3.2"/><path d="M12 3v3.5M12 17.5V21M3 12h3.5M17.5 12H21"/>'],
   speaker: [STROKE, '<path d="M4 9.5v5h3.8L13 18.5v-13L7.8 9.5z"/><path d="M16.2 9.2a4 4 0 0 1 0 5.6M18.8 6.6a7.6 7.6 0 0 1 0 10.8"/>'],
   grip: [SOLID, '<circle cx="9" cy="6" r="1.5"/><circle cx="15" cy="6" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="18" r="1.5"/><circle cx="15" cy="18" r="1.5"/>'],
