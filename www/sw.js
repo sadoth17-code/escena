@@ -1,6 +1,10 @@
-const VERSION = 'nube-v5-samples-20261005';
-const ASSETS = ["./","audio/samples/clicks.wav","audio/samples/guides-en.wav","audio/samples/guides-es.wav","audio/samples/guides-fr.wav","audio/samples/guides-pt.wav","audio/voces.wav","css/app.css","icons/apple-touch-icon.png","icons/favicon.svg","icons/icon-192.png","icons/icon-512.png","icons/maskable-512.png","index.html","js/app.js","js/audio-session.js","js/cloud-config.js","js/cloud-request.js","js/cloud.js","js/controls.js","js/demo.js","js/engine.js","js/library.js","js/main.js","js/platform.js","js/player.js","js/sample-bank.js","js/sample-index.js","js/store.js","js/synth.js","js/tempo.js","js/ui/cloud-view.js","js/ui/editor.js","js/ui/import.js","js/ui/kit.js","js/ui/library-view.js","js/ui/mixer.js","js/ui/player-view.js","js/ui/section-map.js","js/ui/settings.js","js/ui/shell.js","js/ui/stage.js","js/ui/timeline.js","js/util.js","js/voices.js","js/zip.js","manifest.webmanifest"];
+const VERSION = 'nube-v5-sonidos-20261005';
+const ASSETS = ["./","audio/clicks.json","audio/clicks.wav","audio/guias/es.json","audio/guias/es.wav","audio/voces.wav","css/app.css","icons/apple-touch-icon.png","icons/favicon.svg","icons/icon-192.png","icons/icon-512.png","icons/maskable-512.png","index.html","js/app.js","js/audio-session.js","js/cloud-config.js","js/cloud-request.js","js/cloud.js","js/controls.js","js/demo.js","js/engine.js","js/library.js","js/main.js","js/platform.js","js/player.js","js/store.js","js/synth.js","js/tempo.js","js/ui/cloud-view.js","js/ui/editor.js","js/ui/import.js","js/ui/kit.js","js/ui/library-view.js","js/ui/mixer.js","js/ui/player-view.js","js/ui/section-map.js","js/ui/settings.js","js/ui/shell.js","js/ui/stage.js","js/ui/timeline.js","js/util.js","js/voices.js","js/zip.js","manifest.webmanifest"];
 const CACHE = `escena-${VERSION}`;
+// Guías de voz en otros idiomas: no vienen precargadas. Se guardan al elegirlas por primera vez
+// y se conservan entre versiones de la app (si cambian sus audios, se sube el número).
+const GUIDES = 'guias-v1';
+const isGuide = (request) => new URL(request.url).pathname.includes('/audio/guias/');
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -16,7 +20,8 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     (async () => {
       const names = await caches.keys();
-      await Promise.all(names.filter((name) => name.startsWith('escena-') && name !== CACHE).map((name) => caches.delete(name)));
+      const stale = (name) => (name.startsWith('escena-') && name !== CACHE) || (name.startsWith('guias-') && name !== GUIDES);
+      await Promise.all(names.filter(stale).map((name) => caches.delete(name)));
       await self.clients.claim();
     })()
   );
@@ -28,11 +33,13 @@ self.addEventListener('message', (event) => {
 
 async function answer(request) {
   const cache = await caches.open(CACHE);
-  const hit = await cache.match(request, { ignoreSearch: true });
+  const guide = isGuide(request);
+  const guides = guide ? await caches.open(GUIDES) : null;
+  const hit = (await cache.match(request, { ignoreSearch: true })) || (guides ? await guides.match(request, { ignoreSearch: true }) : null);
   if (hit) return hit;
   try {
     const response = await fetch(request);
-    if (response.ok && response.type === 'basic') cache.put(request, response.clone()).catch(() => {});
+    if (response.ok && response.type === 'basic') (guides || cache).put(request, response.clone()).catch(() => {});
     return response;
   } catch (error) {
     if (request.mode === 'navigate') {

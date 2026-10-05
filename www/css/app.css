@@ -2307,6 +2307,20 @@ p {
   gap: 8px;
 }
 
+.quick-add .section-picker {
+  width: auto;
+  min-width: 170px;
+  height: 36px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.inline .select {
+  flex: 1;
+  min-width: 170px;
+  width: auto;
+}
+
 .section-table .trow.sel {
   background: rgba(53, 201, 255, 0.08);
   border-radius: 10px;

@@ -1,4 +1,5 @@
 import { h, clamp, faderToDb, gainToFader, fmtDb, fmtPan, FADER_DEFAULT } from '../util.js';
+import { VOICE_GROUPS, VOICE_CATALOG, GUIDE_LANGUAGES } from '../voices.js';
 
 const STROKE = 'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
 const SOLID = 'fill="currentColor" stroke="none"';
@@ -575,6 +576,32 @@ export function createRange({ min, max, step = 1, value, onInput, format = (v) =
       paint();
     },
   };
+}
+
+// Lista desplegable con todas las voces de sección e indicación. Al elegir una llama a onPick(nombre)
+// y vuelve al texto inicial, para poder elegir la misma otra vez.
+export function createSectionPicker({ onPick, placeholder = 'Más secciones…' }) {
+  const groups = VOICE_GROUPS.map((group) =>
+    h('optgroup', { label: group.label }, VOICE_CATALOG.filter((voice) => voice.group === group.id).map((voice) => h('option', { value: voice.label, text: voice.label })))
+  );
+  const select = h('select', { class: 'select section-picker', 'aria-label': 'Añadir otra sección o indicación' }, h('option', { value: '', text: placeholder }), groups);
+  select.addEventListener('change', () => {
+    const label = select.value;
+    select.value = '';
+    if (label) onPick(label);
+  });
+  return select;
+}
+
+// Lista de idiomas de la guía de voz. Se aplica a todas las canciones del dispositivo.
+export function createGuideLanguageSelect({ value, onChange }) {
+  const select = h(
+    'select',
+    { class: 'select', 'aria-label': 'Idioma de la guía de voz' },
+    GUIDE_LANGUAGES.map((language) => h('option', { value: language.id, text: language.name, selected: language.id === value }))
+  );
+  select.addEventListener('change', () => onChange(select.value));
+  return select;
 }
 
 export function field(label, control, hint) {

@@ -170,9 +170,16 @@ export class SongPlayer {
       duration: this.duration,
       offset: this.offset,
       sound: this.song.click.sound,
-      samples: this.engine.clickSamples,
       subdivision: this.song.click.subdivision,
+      bank: this.engine.clickBank,
     });
+  }
+
+  // Cambia la voz de la guía (otro idioma) y vuelve a dibujarla sin detener la canción.
+  setVoices(voices) {
+    this.voices = voices;
+    this.refreshGuide();
+    this.resync();
   }
 
   refreshGuide() {
@@ -390,7 +397,7 @@ export class SongPlayer {
       const intro = renderCountIn(ctx, this.tempo, grid, {
         bars,
         sound: this.song.click.sound,
-        samples: this.engine.clickSamples,
+        bank: this.engine.clickBank,
         marker: this.song.guide.mute ? null : marker,
         voices: this.voices,
         leadBars: this.song.guide.leadBars,

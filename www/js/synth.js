@@ -1,6 +1,4 @@
 import { accentLevel } from './tempo.js';
-import { SAMPLE_CLICKS } from './sample-index.js';
-import { loadSampleSprite } from './sample-bank.js';
 
 const LEVEL_GAIN = [1, 0.82, 0.64];
 const LEVEL_KIND = ['accent', 'medium', 'normal'];
@@ -91,23 +89,68 @@ const PRESETS = {
   hihat: { name: 'Hi-hat', make: hatVoice },
 };
 
-export const CLICK_SOUNDS = [
-  ...['Classic', 'Gentle', 'Woodblock', 'Cowbell', 'Blip', 'Digital', 'Saw', 'Percussive'].map(name => ({ id: `sample-${name.toLowerCase()}`, name: `${name} · sample` })),
-  ...Object.entries(PRESETS).map(([id, preset]) => ({ id, name: preset.name })),
+// Sonidos del paquete «Click and Guide Samples»: audio/clicks.wav con el índice clicks.json.
+// Cada uno trae cuatro golpes: acento, tiempo, corchea y semicorchea.
+export const SAMPLE_CLICKS = [
+  { id: 'blip', name: 'Blip' },
+  { id: 'classic', name: 'Clásico' },
+  { id: 'cowbell', name: 'Cowbell' },
+  { id: 'digital', name: 'Digital' },
+  { id: 'gentle', name: 'Suave' },
+  { id: 'percussive', name: 'Percusivo' },
+  { id: 'saw', name: 'Sierra' },
+  { id: 'woodblock', name: 'Woodblock' },
 ];
 
-export const loadClickSamples = ctx => loadSampleSprite(ctx, SAMPLE_CLICKS);
+export const CLICK_GROUPS = [
+  { id: 'synth', label: 'Sintetizados' },
+  { id: 'sample', label: 'Muestras de audio' },
+];
+
+export const CLICK_SOUNDS = [
+  ...Object.entries(PRESETS).map(([id, preset]) => ({ id, name: preset.name, group: 'synth' })),
+  ...SAMPLE_CLICKS.map((sound) => ({ ...sound, group: 'sample' })),
+];
+
+const SAMPLE_IDS = new Set(SAMPLE_CLICKS.map((sound) => sound.id));
+export const isSampleSound = (id) => SAMPLE_IDS.has(id);
+
+const CLICK_HITS = ['accent', 'beat', 'eighth', 'sixteenth'];
+// Las muestras de tiempo, corchea y semicorchea suenan igual de fuertes en el paquete; las
+// subdivisiones bajan para que el tiempo siga siendo lo que se oye primero.
+const SAMPLE_SUB_GAIN = { eighth: 0.62, sixteenth: 0.5 };
+
+// Devuelve { rate, sounds: Map(id -> { accent, beat, eighth, sixteenth }) } con cada golpe como
+// audio mono ya a la frecuencia del contexto.
+export async function loadClickBank(ctx) {
+  const [indexResponse, spriteResponse] = await Promise.all([
+    fetch(new URL('../audio/clicks.json', import.meta.url)),
+    fetch(new URL('../audio/clicks.wav', import.meta.url)),
+  ]);
+  if (!indexResponse.ok || !spriteResponse.ok) throw new Error('No se pudieron cargar los sonidos de click');
+  const index = await indexResponse.json();
+  const sprite = await ctx.decodeAudioData(await spriteResponse.arrayBuffer());
+  const channel = sprite.getChannelData(0);
+  const rate = sprite.sampleRate;
+  const sounds = new Map();
+  for (const [id, hits] of Object.entries(index.sounds || {})) {
+    const set = {};
+    for (const kind of CLICK_HITS) {
+      const slot = hits[kind];
+      if (!slot) continue;
+      const from = Math.floor(slot[0] * rate);
+      const to = Math.min(channel.length, Math.ceil((slot[0] + slot[1]) * rate));
+      if (to > from) set[kind] = channel.slice(from, to);
+    }
+    if (set.beat) sounds.set(id, set);
+  }
+  if (!sounds.size) throw new Error('El archivo de clicks no tiene sonidos');
+  return { rate, sounds };
+}
 
 const voiceCache = new Map();
 
-function getVoice(sound, kind, rate, samples, subdivision = 1) {
-  if (String(sound).startsWith('sample-')) {
-    const family = sound.slice(7);
-    const variant = kind === 'accent' ? 'accents' : kind === 'sub' ? (subdivision === 4 ? 'sixteenth' : 'eighth') : 'quarter';
-    const sample = [variant, 'quarter', 'eighth', 'sixteenth', 'accents'].map(part => samples?.get(`${family}-${part}`)).find(Boolean);
-    if (!sample) throw new Error('El sample de click todavía no está disponible. Actualiza Escena e inténtalo de nuevo.');
-    return sample;
-  }
+function getVoice(sound, kind, rate) {
   const key = `${sound}|${kind}|${rate}`;
   if (!voiceCache.has(key)) {
     const preset = PRESETS[sound] || PRESETS.madera;
@@ -130,13 +173,35 @@ function fadeTail(source, rate) {
   return out;
 }
 
+// Los golpes de un sonido de muestra, o null si ese sonido es sintético o aún no se cargó
+// (en ese caso suena Madera: el click nunca queda mudo).
+function sampleSet(bank, sound) {
+  if (!isSampleSound(sound) || !bank || !bank.sounds) return null;
+  return bank.sounds.get(sound) || null;
+}
+
+// Un tiempo con muestras: el golpe del tiempo y, encima, el acento. El primer tiempo lleva el
+// acento completo; en compases compuestos (6/8, 9/8, 12/8) el inicio de cada grupo, a la mitad.
+function addSampleBeat(data, set, level, index) {
+  addVoice(data, set.beat, index, 1);
+  if (!set.accent) return;
+  if (level === 0) addVoice(data, set.accent, index, 1);
+  else if (level === 1) addVoice(data, set.accent, index, 0.5);
+}
+
+// Subdivisión de muestra: corchea, salvo las semicorcheas de los extremos cuando se divide en cuatro.
+function addSampleSub(data, set, divisions, k, index) {
+  const kind = divisions === 4 && k % 2 === 1 ? 'sixteenth' : 'eighth';
+  addVoice(data, set[kind] || set.beat, index, SAMPLE_SUB_GAIN[kind]);
+}
+
 function placeCue(data, rate, voices, key, time, segment, counting) {
   const word = voices.get(key);
   if (!word) return;
   addVoice(data, word, Math.round(time * rate), 1);
   if (!counting || segment.beatDur < 0.3) return;
   const wordDuration = word.length / rate;
-  const firstNumber = Math.max(2, Math.ceil((wordDuration + 0.025) / segment.beatDur) + 1);
+  const firstNumber = Math.max(2, Math.ceil(wordDuration / segment.beatDur - 0.15) + 1);
   for (let beat = firstNumber; beat <= Math.min(segment.num, 12); beat++) {
     const number = voices.get(`n${beat}`);
     if (!number) continue;
@@ -146,20 +211,28 @@ function placeCue(data, rate, voices, key, time, segment, counting) {
   }
 }
 
-export function renderClickBuffer(ctx, tempo, { duration, offset, sound, subdivision, samples }) {
+export function renderClickBuffer(ctx, tempo, { duration, offset, sound, subdivision, bank }) {
   const rate = ctx.sampleRate;
   const length = Math.max(1, Math.ceil(duration * rate));
   const buffer = ctx.createBuffer(1, length, rate);
   const data = buffer.getChannelData(0);
   const divisions = Math.max(1, Math.min(4, Math.round(subdivision || 1)));
+  const samples = sampleSet(bank, sound);
   const beats = tempo.beats(Math.max(0, duration - offset + 0.5));
   for (const beat of beats) {
     const at = beat.t + offset;
     if (at >= duration) break;
-    if (at >= -0.1) addVoice(data, getVoice(sound, LEVEL_KIND[beat.level], rate, samples, divisions), Math.round(at * rate), LEVEL_GAIN[beat.level]);
+    if (at >= -0.1) {
+      const index = Math.round(at * rate);
+      if (samples) addSampleBeat(data, samples, beat.level, index);
+      else addVoice(data, getVoice(sound, LEVEL_KIND[beat.level], rate), index, LEVEL_GAIN[beat.level]);
+    }
     for (let k = 1; k < divisions; k++) {
       const sub = at + (beat.beatDur * k) / divisions;
-      if (sub >= 0 && sub < duration) addVoice(data, getVoice(sound, 'sub', rate, samples, divisions), Math.round(sub * rate), SUB_GAIN);
+      if (sub < 0 || sub >= duration) continue;
+      const index = Math.round(sub * rate);
+      if (samples) addSampleSub(data, samples, divisions, k, index);
+      else addVoice(data, getVoice(sound, 'sub', rate), index, SUB_GAIN);
     }
   }
   return buffer;
@@ -182,7 +255,7 @@ export function renderGuideBuffer(ctx, tempo, markers, voices, { duration, offse
   return buffer;
 }
 
-export function renderCountIn(ctx, tempo, gridStart, { bars, sound, marker, voices, leadBars, counting, samples }) {
+export function renderCountIn(ctx, tempo, gridStart, { bars, sound, marker, voices, leadBars, counting, bank }) {
   const rate = ctx.sampleRate;
   const segment = tempo.segmentAtTime(Math.max(0, gridStart));
   const beats = Math.max(1, Math.round(bars)) * segment.num;
@@ -190,9 +263,12 @@ export function renderCountIn(ctx, tempo, gridStart, { bars, sound, marker, voic
   const length = Math.ceil((total + 0.3) * rate);
   const clickBuffer = ctx.createBuffer(1, length, rate);
   const clickData = clickBuffer.getChannelData(0);
+  const samples = sampleSet(bank, sound);
   for (let k = 0; k < beats; k++) {
     const level = accentLevel(segment, (k % segment.num) + 1);
-    addVoice(clickData, getVoice(sound, LEVEL_KIND[level], rate, samples), Math.round(k * segment.beatDur * rate), LEVEL_GAIN[level]);
+    const index = Math.round(k * segment.beatDur * rate);
+    if (samples) addSampleBeat(clickData, samples, level, index);
+    else addVoice(clickData, getVoice(sound, LEVEL_KIND[level], rate), index, LEVEL_GAIN[level]);
   }
   let guideBuffer = null;
   if (marker && marker.voice && voices) {
@@ -204,11 +280,22 @@ export function renderCountIn(ctx, tempo, gridStart, { bars, sound, marker, voic
   return { clickBuffer, guideBuffer, duration: total };
 }
 
-export function renderPreview(ctx, sound, samples) {
+export function renderPreview(ctx, sound, bank) {
   const rate = ctx.sampleRate;
+  const samples = sampleSet(bank, sound);
+  if (samples) {
+    // Primer tiempo (con acento) y un tiempo normal a 0,3 s; el audio cabe completo, sin cortes.
+    const longest = Math.max(...Object.values(samples).map((hit) => hit.length));
+    const second = Math.round(rate * 0.3);
+    const preview = ctx.createBuffer(1, second + longest + Math.ceil(rate * 0.05), rate);
+    const out = preview.getChannelData(0);
+    addSampleBeat(out, samples, 0, 0);
+    addSampleBeat(out, samples, 2, second);
+    return preview;
+  }
   const buffer = ctx.createBuffer(1, Math.ceil(rate * 0.4), rate);
   const data = buffer.getChannelData(0);
-  addVoice(data, getVoice(sound, 'accent', rate, samples), 0, 1);
-  addVoice(data, getVoice(sound, 'normal', rate, samples), Math.round(rate * 0.2), LEVEL_GAIN[2]);
+  addVoice(data, getVoice(sound, 'accent', rate), 0, 1);
+  addVoice(data, getVoice(sound, 'normal', rate), Math.round(rate * 0.2), LEVEL_GAIN[2]);
   return buffer;
 }

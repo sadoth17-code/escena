@@ -1,6 +1,6 @@
 import { faderToGain, FADER_DEFAULT } from './util.js';
-import { loadVoiceBank } from './voices.js';
-import { loadClickSamples } from './synth.js';
+import { loadVoiceBank, DEFAULT_GUIDE_LANG } from './voices.js';
+import { loadClickBank } from './synth.js';
 import { SongPlayer } from './player.js';
 import { configureAudioSession, resumeAudioContext } from './audio-session.js';
 
@@ -126,7 +126,11 @@ export class Engine {
     this.ctx = ctx || new AudioContextClass({ latencyHint: 'playback' });
     this.offline = typeof OfflineAudioContext !== 'undefined' && this.ctx instanceof OfflineAudioContext;
     this.output = { ...DEFAULT_OUTPUT };
-    this.clickSamples = null;
+    this.voiceBank = null;
+    this.voiceBanks = new Map();
+    this.voiceLoading = new Map();
+    this.clickBank = null;
+    this.clickBankLoading = null;
     this.multi = null;
     this.multiActive = false;
     this.buildGraph();
@@ -388,13 +392,49 @@ export class Engine {
     return true;
   }
 
-  async loadVoices(bankId = 'classic') {
-    return loadVoiceBank(this.ctx, bankId);
+  // Voces de guía del idioma pedido. Cada idioma se descarga una sola vez; si no se pudo leer
+  // y se usó la voz original, no se guarda para volver a intentarlo la próxima vez.
+  async loadVoices(lang = DEFAULT_GUIDE_LANG) {
+    const cached = this.voiceBanks.get(lang);
+    if (cached) {
+      this.voiceBanks.delete(lang);
+      this.voiceBanks.set(lang, cached); // el último en usarse es el último en descartarse
+      this.voiceBank = cached;
+      return cached;
+    }
+    let loading = this.voiceLoading.get(lang);
+    if (!loading) {
+      loading = loadVoiceBank(this.ctx, lang)
+        .then((bank) => {
+          if (bank.lang === bank.requested) {
+            this.voiceBanks.set(lang, bank);
+            // Cada idioma ocupa unos 6 MB en memoria: se guardan los tres más recientes.
+            while (this.voiceBanks.size > 3) this.voiceBanks.delete(this.voiceBanks.keys().next().value);
+          }
+          return bank;
+        })
+        .finally(() => this.voiceLoading.delete(lang));
+      this.voiceLoading.set(lang, loading);
+    }
+    const bank = await loading;
+    this.voiceBank = bank;
+    return bank;
   }
 
-  async loadClicks() {
-    if (!this.clickSamples) this.clickSamples = await loadClickSamples(this.ctx);
-    return this.clickSamples;
+  // Sonidos de click de muestra (clicks.wav). Se cargan una vez y solo si alguna canción los usa.
+  async loadClickBank() {
+    if (this.clickBank) return this.clickBank;
+    if (!this.clickBankLoading) {
+      this.clickBankLoading = loadClickBank(this.ctx)
+        .then((bank) => {
+          this.clickBank = bank;
+          return bank;
+        })
+        .finally(() => {
+          this.clickBankLoading = null;
+        });
+    }
+    return this.clickBankLoading;
   }
 
   async decode(blob) {

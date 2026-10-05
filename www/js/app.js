@@ -3,7 +3,8 @@ import { store } from './store.js';
 import { Engine, DEFAULT_OUTPUT, normalizeRoutes } from './engine.js';
 import { normalizeSong, serializableSong, createSong, createTrackDef, createSetlist } from './library.js';
 import { normalizeTempoEntries, detectTempoFromBuffer } from './tempo.js';
-import { renderPreview } from './synth.js';
+import { renderPreview, isSampleSound } from './synth.js';
+import { DEFAULT_GUIDE_LANG, isGuideLanguage, guideLanguageName } from './voices.js';
 
 const MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || isIOS();
 
@@ -21,10 +22,12 @@ export const DEFAULT_SETTINGS = {
   midiProgramChange: true,
   midiEnabled: false,
   bindings: null,
+  guideLang: DEFAULT_GUIDE_LANG,
 };
 
 function mergeSettings(saved) {
   const merged = { ...DEFAULT_SETTINGS, ...saved };
+  if (!isGuideLanguage(merged.guideLang)) merged.guideLang = DEFAULT_GUIDE_LANG;
   // This live-performance update starts every device in bar mode once.
   // Later, deliberate changes in Ajustes are retained.
   if (!saved || saved.liveControlsVersion !== 1 || !['bar', 'beat', 'now'].includes(merged.jumpMode)) merged.jumpMode = 'bar';
@@ -100,7 +103,9 @@ class App {
   }
 
   resetSettings() {
+    const guideBefore = this.settings.guideLang;
     this.settings = mergeSettings({});
+    if (guideBefore !== this.settings.guideLang) this.setGuideLanguage(this.settings.guideLang).catch(() => {});
     this.engine.output = this.settings.output;
     this.engine.applyOutput(false);
     this.saveSettings();
@@ -306,20 +311,6 @@ class App {
     this.emit('song:updated', song, kind);
   }
 
-  async setGuideBank(song, bankId) {
-    const voices = await this.engine.loadVoices(bankId);
-    song.guide.voiceBank = bankId;
-    if (this.current?.song === song) this.current.player.voices = voices;
-    await this.updateSong(song, 'guide');
-    if (song.markers.some(marker => marker.voice && !voices.has(marker.voice))) this.toast('Hay indicaciones no disponibles en este idioma. Revísalas en Secciones.');
-  }
-
-  async setClickSound(song, sound) {
-    if (String(sound).startsWith('sample-')) await this.engine.loadClicks();
-    song.click.sound = sound;
-    await this.updateSong(song, 'click');
-  }
-
   async analyzeTrack(song, trackId) {
     let buffer = null;
     if (this.current && this.current.song === song) {
@@ -340,11 +331,10 @@ class App {
     return detectTempoFromBuffer(buffer);
   }
 
-  async previewVoice(key, bankId = 'classic') {
-    await this.engine.resume();
-    const voices = await this.engine.loadVoices(bankId);
+  async previewVoice(key) {
+    const voices = await this.engine.loadVoices(this.settings.guideLang);
     const data = voices.get(key);
-    if (!data) throw new Error('Esta indicación no está disponible en la voz seleccionada. Elige otra en Secciones.');
+    if (!data) return;
     const ctx = this.engine.ctx;
     const buffer = ctx.createBuffer(1, data.length, ctx.sampleRate);
     buffer.copyToChannel(data, 0);
@@ -352,9 +342,53 @@ class App {
   }
 
   async previewSound(sound) {
-    await this.engine.resume();
-    const samples = String(sound).startsWith('sample-') ? await this.engine.loadClicks() : null;
-    await this.engine.previewBuffer(renderPreview(this.engine.ctx, sound, samples), 'cue');
+    await this.ensureClickSound(sound);
+    await this.engine.previewBuffer(renderPreview(this.engine.ctx, sound, this.engine.clickBank), 'cue');
+  }
+
+  // Los sonidos de click de muestra se descargan la primera vez que se usan. Si no se pueden
+  // leer, el click suena como Madera en vez de quedar mudo.
+  async ensureClickSound(sound) {
+    if (!isSampleSound(sound)) return true;
+    try {
+      await this.engine.loadClickBank();
+      return true;
+    } catch (error) {
+      this.toast('No se pudo cargar ese sonido de click. Suena Madera mientras tanto', 'error');
+      return false;
+    }
+  }
+
+  // Banco de voces del idioma elegido, si ya se cargó (el editor lo usa para avisar qué voces faltan).
+  get guideVoices() {
+    const engine = this.engine;
+    if (!engine) return null;
+    return engine.voiceBanks.get(this.settings.guideLang) || engine.voiceBank || null;
+  }
+
+  voiceAvailable(key) {
+    const bank = this.guideVoices;
+    return !bank || bank.has(key);
+  }
+
+  // Cambia el idioma de las guías de voz. Se aplica de inmediato a la canción cargada y a la
+  // siguiente del setlist, sin detener la reproducción.
+  async setGuideLanguage(lang) {
+    if (!isGuideLanguage(lang)) return;
+    const token = (this.guideToken = (this.guideToken || 0) + 1);
+    this.setSetting('guideLang', lang);
+    let bank;
+    try {
+      bank = await this.engine.loadVoices(lang);
+    } catch (error) {
+      if (token === this.guideToken) this.toast('No se pudieron cargar las voces de guía', 'error');
+      return;
+    }
+    if (token !== this.guideToken) return;
+    if (bank.lang !== bank.requested) {
+      this.toast(`No se pudo cargar la guía en ${guideLanguageName(lang)}: suena la voz original. Conéctate a internet una vez para descargarla`, 'error');
+    }
+    for (const entry of [this.current, this.next]) if (entry) entry.player.setVoices(bank);
   }
 
   setTrackDest(node, dest) {
@@ -477,8 +511,10 @@ class App {
 
   async prepare(song, onProgress) {
     const engine = this.engine;
-    const voices = await engine.loadVoices(song.guide.voiceBank);
-    if (String(song.click.sound).startsWith('sample-')) await engine.loadClicks();
+    const [voices] = await Promise.all([
+      engine.loadVoices(this.settings.guideLang).catch(() => new Map()),
+      this.ensureClickSound(song.click.sound),
+    ]);
     const files = await store.getMany('files', song.tracks.map((track) => track.fileId));
     const buffers = new Map();
     const failed = [];

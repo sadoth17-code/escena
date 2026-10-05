@@ -1,6 +1,6 @@
 import { h, clamp } from '../util.js';
 import { app } from '../app.js';
-import { icon, iconButton } from './kit.js';
+import { icon, iconButton, createSectionPicker } from './kit.js';
 
 const DIM = '#4a5a6a';
 const LIT = '#35c9ff';
@@ -133,7 +133,7 @@ export function createSectionMap({ song, entry, quick, addMarker, moveMarker, re
     'div',
     { class: 'smap-add' },
     addLabel,
-    h('div', { class: 'quick-add' }, quick.map((label) => h('button', { type: 'button', class: 'chip small', onClick: () => add(label) }, label)))
+    h('div', { class: 'quick-add' }, quick.map((label) => h('button', { type: 'button', class: 'chip small', onClick: () => add(label) }, label)), createSectionPicker({ onPick: (label) => add(label) }))
   );
   const el = h('div', { class: 'smap' }, bar, stage, overview, status, selBar, addRow, help);
 

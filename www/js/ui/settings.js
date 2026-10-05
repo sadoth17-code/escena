@@ -4,7 +4,7 @@ import { store } from '../store.js';
 import { OUTPUT_MODES, ROUTE_KEYS, normalizeRoutes } from '../engine.js';
 import { controls, ACTIONS } from '../controls.js';
 import { platform } from '../platform.js';
-import { icon, openModal, createSegmented, createSwitch, createRange, settingRow, field, dbLabel, confirmDialog } from './kit.js';
+import { icon, openModal, createSegmented, createSwitch, createRange, createGuideLanguageSelect, settingRow, field, dbLabel, confirmDialog } from './kit.js';
 
 const DIAGRAMS = {
   split: (swap) => (swap ? ['Pistas', 'Click y guía'] : ['Click y guía', 'Pistas']),
@@ -347,6 +347,24 @@ export function openSettings() {
     settingRow('Mantener pantalla encendida', 'Evita que el dispositivo se bloquee mientras tocas', awake.el)
   );
 
+  const guideLanguage = createGuideLanguageSelect({
+    value: app.settings.guideLang,
+    onChange: async (value) => {
+      await app.setGuideLanguage(value);
+      app.previewVoice('coro');
+    },
+  });
+  const guideListen = h('button', { type: 'button', class: 'btn small', onClick: () => app.previewVoice('coro') }, icon('speaker', 16), 'Escuchar');
+  const guideSection = section(
+    'Guía de voz',
+    'En qué idioma dice la guía el nombre de cada sección. Se aplica a todas las canciones de este dispositivo y se oye al instante.',
+    field(
+      'Idioma de la guía',
+      h('div', { class: 'inline' }, guideLanguage, guideListen),
+      'Español viene incluido. Inglés, portugués y francés se descargan la primera vez que los eliges (unos 2,5 MB cada uno) y quedan guardados para usarlos sin internet. «Voz original» es la voz sintética que tenía Escena. Algunas indicaciones no existen en todos los idiomas: el editor lo avisa en la lista de voces.'
+    )
+  );
+
   const controlsBox = h('div', { class: 'controls-box' });
   const midiBox = h('div', { class: 'midi-box' });
   const renderControls = () => {
@@ -455,6 +473,6 @@ export function openSettings() {
     },
   }, 'Restablecer ajustes');
 
-  modal.body.firstChild.replaceChildren(outputSection, playbackSection, controlsSection, appSection, h('div', { class: 'danger-zone' }, wipe));
+  modal.body.firstChild.replaceChildren(outputSection, playbackSection, guideSection, controlsSection, appSection, h('div', { class: 'danger-zone' }, wipe));
   return modal;
 }

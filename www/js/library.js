@@ -27,7 +27,6 @@ export const DEFAULT_CLICK = {
 export const DEFAULT_GUIDE = {
   id: 'guide',
   name: 'Guía de voz',
-  voiceBank: 'classic',
   vol: FADER_DEFAULT,
   pan: 0,
   mute: false,
@@ -196,8 +195,6 @@ export function createSong(title, tracks) {
     offsetMs: 0,
     tempoMap: [{ bar: 1, bpm: 120, num: 4, den: 4 }],
     markers: [],
-    click: { sound: 'sample-classic' },
-    guide: { voiceBank: 'samples-es' },
     tracks,
     createdAt: now,
     updatedAt: now,
