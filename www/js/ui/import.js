@@ -3,6 +3,7 @@ import { app } from '../app.js';
 import { store } from '../store.js';
 import { gatherAudio, groupItems, draftTracks, AUDIO_PATTERN } from '../library.js';
 import { buildDemo } from '../demo.js';
+import { tempoIsShaky, tempoWarning } from '../tempo.js';
 import { icon, openModal, field } from './kit.js';
 
 const MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
@@ -17,7 +18,7 @@ export async function importDemo() {
 
 function detectLabel(state) {
   if (state.detect === 'running') return 'Detectando tempo desde la pista de click…';
-  if (state.detect === 'done') return `Tempo detectado desde «${state.detectSource}»: ${state.tempo.bpm} BPM${state.detectMeter ? `, compás de ${state.tempo.num} tiempos` : ''}`;
+  if (state.detect === 'done') return `Tempo detectado desde «${state.detectSource}»: ${state.tempo.bpm} BPM${state.detectMeter ? `, compás de ${state.tempo.num} tiempos` : ''}${state.detectResult ? tempoWarning(state.detectResult) : ''}`;
   if (state.detect === 'none') return 'No se pudo detectar el tempo automáticamente. Escríbelo a mano';
   return 'Si conoces el tempo, escríbelo. Luego podrás afinarlo en Editar → Tempo';
 }
@@ -35,6 +36,7 @@ export function openImport({ files = null, onEdit } = {}) {
     detect: 'idle',
     detectMeter: false,
     detectSource: '',
+    detectResult: null,
     busy: false,
     cancelled: false,
   };
@@ -155,6 +157,7 @@ export function openImport({ files = null, onEdit } = {}) {
         state.tempo.offsetMs = result.offsetMs;
         if (result.num) state.tempo.num = result.num;
         state.detectMeter = Boolean(result.num);
+        state.detectResult = result;
         state.detect = 'done';
         state.detectSource = clickDraft.name;
         syncTempoInputs();
@@ -174,7 +177,9 @@ export function openImport({ files = null, onEdit } = {}) {
   const refreshDetect = () => {
     if (detectEl) {
       detectEl.textContent = detectLabel(state);
-      detectEl.classList.toggle('ok', state.detect === 'done');
+      const shaky = state.detect === 'done' && Boolean(state.detectResult && tempoIsShaky(state.detectResult));
+      detectEl.classList.toggle('ok', state.detect === 'done' && !shaky);
+      detectEl.classList.toggle('warn', shaky);
     }
   };
 
@@ -222,8 +227,8 @@ export function openImport({ files = null, onEdit } = {}) {
     const offset = h('input', {
       type: 'number',
       class: 'input num',
-      step: '1',
-      inputmode: 'numeric',
+      step: '0.1',
+      inputmode: 'decimal',
       value: String(state.tempo.offsetMs),
       'aria-label': 'Inicio del compás 1 en milisegundos',
       onInput: () => {

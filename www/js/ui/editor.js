@@ -1,6 +1,6 @@
 import { h, fmtBytes, fmtTime, clamp, uid } from '../util.js';
 import { app } from '../app.js';
-import { normalizeTempoEntries } from '../tempo.js';
+import { normalizeTempoEntries, tempoIsShaky, tempoWarning } from '../tempo.js';
 import { SECTION_VOICES, VOICE_GROUPS, VOICE_CATALOG, SECTION_COLORS, voiceKeyForName } from '../voices.js';
 import { CLICK_SOUNDS, CLICK_GROUPS } from '../synth.js';
 import { gatherAudio, draftTracks, isClickName, songBytes, songDuration } from '../library.js';
@@ -108,13 +108,15 @@ export function openEditor(song, tab = 'general') {
       song.key = key.value.trim();
       changed('meta');
     });
+    // El inicio del compás 1 admite décimas de milisegundo: la detección automática lo calcula con esa precisión.
+    const tenths = (value) => Math.max(0, Math.round(value * 10) / 10);
     const offset = numberInput({
       value: song.offsetMs,
       min: 0,
-      step: 1,
+      step: 0.1,
       label: 'Inicio del compás 1 en milisegundos',
       onChange: (value) => {
-        song.offsetMs = Math.max(0, Math.round(value));
+        song.offsetMs = tenths(value);
         offset.value = String(song.offsetMs);
         changed('tempo');
       },
@@ -125,7 +127,7 @@ export function openEditor(song, tab = 'general') {
         class: 'btn small',
         text: `${delta > 0 ? '+' : '−'}${Math.abs(delta)}`,
         onClick: () => {
-          song.offsetMs = Math.max(0, Math.round((Number(song.offsetMs) || 0) + delta));
+          song.offsetMs = tenths((Number(song.offsetMs) || 0) + delta);
           offset.value = String(song.offsetMs);
           changed('tempo');
         },
@@ -138,7 +140,7 @@ export function openEditor(song, tab = 'general') {
       class: 'btn',
       onClick: async () => {
         result.textContent = 'Analizando…';
-        result.classList.remove('ok', 'bad');
+        result.classList.remove('ok', 'bad', 'warn');
         try {
           const found = await app.analyzeTrack(song, select.value);
           if (!found) {
@@ -151,8 +153,8 @@ export function openEditor(song, tab = 'general') {
           song.offsetMs = found.offsetMs;
           offset.value = String(song.offsetMs);
           commitTempo();
-          result.textContent = `Detectado: ${found.bpm} BPM${found.num ? `, compás de ${found.num} tiempos` : ''}, compás 1 en ${found.offsetMs} ms. Ya está aplicado.`;
-          result.classList.add('ok');
+          result.textContent = `Detectado: ${found.bpm} BPM${found.num ? `, compás de ${found.num} tiempos` : ''}, compás 1 en ${found.offsetMs} ms. Ya está aplicado.${tempoWarning(found)}`;
+          result.classList.add(tempoIsShaky(found) ? 'warn' : 'ok');
         } catch (error) {
           result.textContent = error.message || 'No se pudo analizar la pista';
           result.classList.add('bad');

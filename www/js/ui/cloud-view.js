@@ -131,7 +131,7 @@ export function createCloudView() {
       } else actions.append(button('Descargar', () => cloud.download(remote.id), 'primary', !!cloud.active || !cloud.connected || pendingSong));
       songs.append(h('article', { class: 'cloud-card' }, h('b', { text: remote.title }),
         remote.artist ? h('span', { class: 'field-hint', text: remote.artist }) : null,
-        h('span', { class: 'field-hint', text: `${remote.tracks} pistas · ${fmtBytes(remote.size)}${remote.bpm ? ` · ${remote.bpm} BPM` : ''}` }),
+        h('span', { class: 'field-hint', text: `${remote.tracks} pistas · ${fmtBytes(remote.size)}${remote.bpm ? ` · ${Number(Number(remote.bpm).toFixed(2))} BPM` : ''}` }),
         h('span', { class: `cloud-badge ${local ? 'downloaded' : ''}`, text: state }), actions));
     }
   };

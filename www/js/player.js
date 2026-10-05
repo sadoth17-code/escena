@@ -2,7 +2,9 @@ import { TempoMap } from './tempo.js';
 import { renderClickBuffer, renderGuideBuffer, renderCountIn } from './synth.js';
 import { faderToGain, clamp } from './util.js';
 
-const START_LEAD = 0.07;
+// Margen mínimo y máximo entre «ahora» y el instante en que arrancan todas las pistas a la vez.
+const START_LEAD_MIN = 0.07;
+const START_LEAD_MAX = 0.3;
 const SPLICE = 0.003;
 const END_EPSILON = 0.004;
 const WAVE_BLOCK = 256;
@@ -301,8 +303,21 @@ export class SongPlayer {
     return run.ctxStart + (this.duration - run.songStart);
   }
 
-  spawnSources(when, position, loop, { preroll = 0, fadeIn = 0 } = {}) {
-    const sources = [];
+  // Margen entre «ahora» y el arranque. El reloj del audio avanza a saltos del tamaño del búfer de
+  // la salida (baseLatency): si el arranque queda más cerca que ese salto, o el hilo principal tarda
+  // en programarlo, cada pista empieza en un bloque de render distinto y se desfasa unos milisegundos
+  // del click y de las demás.
+  startLead() {
+    const latency = Number(this.ctx.baseLatency);
+    const buffer = Number.isFinite(latency) && latency > 0 ? latency : 0.02;
+    return clamp(0.03 + 2 * buffer, START_LEAD_MIN, START_LEAD_MAX);
+  }
+
+  // Crea y conecta los nodos de todas las pistas, el click y la guía, sin arrancarlos. Es la parte
+  // lenta (con muchas pistas puede pasar de 50 ms en un móvil), así que se hace ANTES de leer el
+  // reloj para fijar el instante de arranque: ese tiempo ya no le resta margen al arranque.
+  prepareSources(position, loop, { fadeIn = 0 } = {}) {
+    const entries = [];
     for (const track of this.allTracks()) {
       if (!track.buffer) continue;
       if (!loop && position >= track.buffer.duration) continue;
@@ -317,12 +332,22 @@ export class SongPlayer {
       if (fadeIn > 0) fade.gain.value = 0;
       src.connect(fade);
       fade.connect(track.input);
-      let startAt = when;
-      let offset = position;
-      if (preroll > 0 && position - preroll >= 0) {
-        startAt = when - preroll;
-        offset = position - preroll;
-      }
+      entries.push({ src, fade, track });
+    }
+    return entries;
+  }
+
+  // Arranca todos los nodos preparados en el mismo instante y en el mismo punto de la canción. Solo
+  // hace llamadas ligeras: no se crea ningún nodo aquí, para que nada pueda retrasar a las últimas.
+  commitSources(entries, when, position, { preroll = 0, fadeIn = 0 } = {}) {
+    let startAt = when;
+    let offset = position;
+    if (preroll > 0 && position - preroll >= 0) {
+      startAt = when - preroll;
+      offset = position - preroll;
+    }
+    for (const entry of entries) {
+      const { src, fade } = entry;
       if (fadeIn > 0) {
         fade.gain.setValueAtTime(0, startAt);
         fade.gain.linearRampToValueAtTime(1, startAt + fadeIn);
@@ -336,9 +361,30 @@ export class SongPlayer {
           void error;
         }
       };
-      sources.push({ src, fade, track });
     }
-    return sources;
+    // Para diagnóstico y pruebas: cuánto margen quedó entre terminar de programar y el arranque.
+    this.lastStart = { when: startAt, slack: startAt - this.ctx.currentTime, tracks: entries.length };
+    return entries;
+  }
+
+  spawnSources(when, position, loop, options = {}) {
+    return this.commitSources(this.prepareSources(position, loop, options), when, position, options);
+  }
+
+  // Pre-conteo: click y guía listos pero sin arrancar.
+  prepareCountIn(intro) {
+    const nodes = [];
+    const clickSource = this.ctx.createBufferSource();
+    clickSource.buffer = intro.clickBuffer;
+    clickSource.connect(this.click.level);
+    nodes.push(clickSource);
+    if (intro.guideBuffer) {
+      const guideSource = this.ctx.createBufferSource();
+      guideSource.buffer = intro.guideBuffer;
+      guideSource.connect(this.guide.level);
+      nodes.push(guideSource);
+    }
+    return nodes;
   }
 
   releaseRun(run, when, fade = 0.01) {
@@ -379,22 +425,20 @@ export class SongPlayer {
     await this.engine.resume();
     if (request !== this.playRequest || this.state === 'playing' || this.disposed) return;
     const ctx = this.ctx;
-    const now = ctx.currentTime;
     let position = this.pausedAt;
     if (position >= this.duration - 0.02) position = this.loop ? this.loop.a : 0;
     if (this.loop && position < this.loop.a) position = this.loop.a;
     const loop = this.loop && position < this.loop.b ? this.loop : null;
-    const when = now + START_LEAD;
-    let songStart = when;
     this.stopCountIn();
     const bars = Number(this.song.click.countIn) || 0;
-    let countStart = 0;
+    // Primero todo lo lento: render del pre-conteo y nodos de todas las pistas. El reloj se lee
+    // después, y el pre-conteo, las pistas, el click y la guía arrancan juntos desde el mismo instante.
+    let intro = null;
     if (countIn && bars > 0) {
-      countStart = when;
       const grid = Math.max(0, position - this.offset);
       const barNumber = Math.round(this.tempo.barFloat(grid));
       const marker = this.startOffsetIsBarAligned(position) ? this.markerAtBar(barNumber) : null;
-      const intro = renderCountIn(ctx, this.tempo, grid, {
+      intro = renderCountIn(ctx, this.tempo, grid, {
         bars,
         sound: this.song.click.sound,
         bank: this.engine.clickBank,
@@ -403,31 +447,31 @@ export class SongPlayer {
         leadBars: this.song.guide.leadBars,
         counting: this.song.guide.counting,
       });
-      const clickSource = ctx.createBufferSource();
-      clickSource.buffer = intro.clickBuffer;
-      clickSource.connect(this.click.level);
-      clickSource.start(when);
-      this.countInSources.push(clickSource);
-      if (intro.guideBuffer) {
-        const guideSource = ctx.createBufferSource();
-        guideSource.buffer = intro.guideBuffer;
-        guideSource.connect(this.guide.level);
-        guideSource.start(when);
-        this.countInSources.push(guideSource);
-      }
-      songStart = when + intro.duration;
     }
-    const sources = this.spawnSources(songStart, position, loop, { fadeIn: position > 0.01 ? 0.004 : 0 });
-    this.run = { ctxStart: songStart, songStart: position, loop, sources, countStart };
+    const fadeIn = position > 0.01 ? 0.004 : 0;
+    const entries = this.prepareSources(position, loop, { fadeIn });
+    const countNodes = intro ? this.prepareCountIn(intro) : [];
+    const when = ctx.currentTime + this.startLead();
+    const songStart = when + (intro ? intro.duration : 0);
+    for (const node of countNodes) node.start(when);
+    this.countInSources.push(...countNodes);
+    const sources = this.commitSources(entries, songStart, position, { fadeIn });
+    this.run = { ctxStart: songStart, songStart: position, loop, sources, countStart: intro ? when : 0 };
     this.pending = null;
     this.state = 'playing';
     this.emit('state');
   }
 
+  // Arranque en un instante exacto del reloj (paso a la siguiente canción sin hueco).
   playAt(when) {
     if (this.disposed) return;
     this.stopCountIn();
-    const sources = this.spawnSources(when, 0, null, {});
+    const entries = this.prepareSources(0, null);
+    const ctx = this.ctx;
+    // Si el instante ya casi pasó (el hilo principal se atrasó), las pistas arrancan juntas un poco
+    // después en vez de repartirse entre bloques de render distintos.
+    if (!this.engine.offline && when < ctx.currentTime + 0.01) when = ctx.currentTime + this.startLead();
+    const sources = this.commitSources(entries, when, 0, {});
     this.run = { ctxStart: when, songStart: 0, loop: null, sources };
     this.pending = null;
     this.pausedAt = 0;
@@ -463,48 +507,58 @@ export class SongPlayer {
     this.emit('state');
   }
 
-  seek(target, mode = 'now') {
-    const time = clamp(target, 0, Math.max(0, this.duration - 0.01));
+  // Salta a otro punto de la canción: ya mismo ('now'), en el siguiente tiempo ('beat') o compás ('bar').
+  // Con follow = true la canción sigue sonando sin saltar: sirve para rehacer las fuentes cuando
+  // cambian el click o la guía, y el punto de destino es donde estaría la música en ese instante.
+  seek(target, mode = 'now', { follow = false } = {}) {
+    let time = clamp(target, 0, Math.max(0, this.duration - 0.01));
     if (this.state !== 'playing') {
       this.pausedAt = time;
       this.emit('state');
       return;
     }
-    const now = this.ctx.currentTime;
+    const ctx = this.ctx;
+    if (this.loop && !(time >= this.loop.a - 1e-6 && time < this.loop.b)) {
+      this.loop = null;
+      this.emit('loop');
+    }
+    // Primero lo lento (crear los nodos de todas las pistas); el reloj se lee después, así que ese
+    // tiempo no le quita margen al arranque y todas las fuentes empiezan en la misma muestra.
+    const entries = this.prepareSources(time, this.loop, { fadeIn: SPLICE * 2 });
+    const now = ctx.currentTime;
     this.settleRun(now);
     if (this.pending) {
       this.releaseRun(this.pending, now);
       this.pending = null;
     }
+    const lead = this.startLead();
     const counting = now < this.run.ctxStart;
     let when;
     if (mode === 'now') {
-      when = now + 0.03;
+      when = now + lead;
     } else if (counting) {
       // Preserve the count-in; the selected section enters on its downbeat.
-      when = this.run.ctxStart;
+      when = Math.max(this.run.ctxStart, now + lead);
     } else {
-      const lookahead = now + 0.04;
+      const lookahead = now + lead;
       const here = this.position(lookahead);
       let boundary = this.tempo.nextBoundary(here - this.offset, mode === 'beat' ? 'beat' : 'bar', 0) + this.offset;
       if (this.run.loop && boundary > this.run.loop.b) boundary = this.run.loop.b;
       when = lookahead + Math.max(0, boundary - here);
     }
+    if (follow) time = clamp(this.position(when), 0, Math.max(0, this.duration - 0.01));
     const immediate = counting && mode === 'now';
     if (immediate) {
       this.stopCountIn();
       this.releaseRun(this.run, now);
     }
-    this.switchRun(when, time, immediate);
+    this.switchRun(when, time, immediate, entries);
   }
 
-  switchRun(when, target, immediateStop = false) {
-    if (this.loop && !(target >= this.loop.a - 1e-6 && target < this.loop.b)) {
-      this.loop = null;
-      this.emit('loop');
-    }
+  switchRun(when, target, immediateStop = false, entries = null) {
     const loop = this.loop;
-    const sources = this.spawnSources(when, target, loop, { preroll: SPLICE, fadeIn: SPLICE * 2 });
+    const ready = entries || this.prepareSources(target, loop, { fadeIn: SPLICE * 2 });
+    const sources = this.commitSources(ready, when, target, { preroll: SPLICE, fadeIn: SPLICE * 2 });
     if (!immediateStop) this.releaseRun(this.run, when - SPLICE, SPLICE * 2);
     this.pending = { ctxStart: when, songStart: target, loop, sources };
     this.emit('state');
@@ -611,7 +665,7 @@ export class SongPlayer {
     if (this.state !== 'playing' || this.disposed || !this.run || this.pending) return;
     const now = this.ctx.currentTime;
     if (now < this.run.ctxStart) return;
-    this.seek(this.position(now + 0.03), 'now');
+    this.seek(this.position(now + this.startLead()), 'now', { follow: true });
   }
 
   waveSources() {
