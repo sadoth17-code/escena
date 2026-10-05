@@ -1,5 +1,6 @@
 import { faderToGain, FADER_DEFAULT } from './util.js';
 import { loadVoiceBank } from './voices.js';
+import { loadClickSamples } from './synth.js';
 import { SongPlayer } from './player.js';
 import { configureAudioSession, resumeAudioContext } from './audio-session.js';
 
@@ -125,7 +126,7 @@ export class Engine {
     this.ctx = ctx || new AudioContextClass({ latencyHint: 'playback' });
     this.offline = typeof OfflineAudioContext !== 'undefined' && this.ctx instanceof OfflineAudioContext;
     this.output = { ...DEFAULT_OUTPUT };
-    this.voiceBank = null;
+    this.clickSamples = null;
     this.multi = null;
     this.multiActive = false;
     this.buildGraph();
@@ -387,9 +388,13 @@ export class Engine {
     return true;
   }
 
-  async loadVoices() {
-    if (!this.voiceBank) this.voiceBank = await loadVoiceBank(this.ctx);
-    return this.voiceBank;
+  async loadVoices(bankId = 'classic') {
+    return loadVoiceBank(this.ctx, bankId);
+  }
+
+  async loadClicks() {
+    if (!this.clickSamples) this.clickSamples = await loadClickSamples(this.ctx);
+    return this.clickSamples;
   }
 
   async decode(blob) {

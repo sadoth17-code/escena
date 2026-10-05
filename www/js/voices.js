@@ -1,4 +1,6 @@
 import { normalizeName } from './util.js';
+import { SAMPLE_GUIDES } from './sample-index.js';
+import { loadSampleSprite } from './sample-bank.js';
 
 export const VOICE_INDEX = [
   {"key": "intro", "label": "Intro", "start": 0.0, "duration": 0.444},
@@ -50,10 +52,18 @@ const ALIASES = [
   ['repite', ['repite', 'repeat']],
 ];
 
-export function voiceKeyForName(name) {
+export function voiceKeyForName(name, bankId = 'classic') {
+  const exact = normalizeName(name).replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+  const options = sectionVoices(bankId);
+  const match = options.find(item => normalizeName(item.label).replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim() === exact);
+  if (match) return match.key;
+  const number = String(name).match(/\b(\d+)\b/)?.[1] || '';
   const text = normalizeName(name).replace(/[0-9]+/g, ' ').replace(/[^a-z\- ]/g, ' ').trim();
   for (const [key, words] of ALIASES) {
-    if (words.some((word) => text.includes(word))) return key;
+    if (words.some((word) => text.includes(word))) {
+      if (number && options.some(item => item.key === key + number)) return key + number;
+      return options.some(item => item.key === key) ? key : '';
+    }
   }
   return '';
 }
@@ -76,7 +86,7 @@ export const SECTION_COLORS = {
   repite: '#ffb020',
 };
 
-export async function loadVoiceBank(ctx) {
+async function loadClassicVoices(ctx) {
   const response = await fetch(new URL('../audio/voces.wav', import.meta.url));
   if (!response.ok) throw new Error('No se pudieron cargar las voces de guía');
   const sprite = await ctx.decodeAudioData(await response.arrayBuffer());
@@ -88,4 +98,52 @@ export async function loadVoiceBank(ctx) {
     bank.set(voice.key, channel.slice(start, end));
   }
   return bank;
+}
+
+export const GUIDE_BANKS = [
+  ...Object.entries(SAMPLE_GUIDES).map(([id, bank]) => ({ id, name: bank.label })),
+  { id: 'classic', name: 'Español · voz clásica de Escena' },
+];
+
+const COMPATIBLE_KEYS = { repite: 'tag', parada: 'break' };
+
+export function sectionVoices(bankId = 'classic') {
+  const pack = SAMPLE_GUIDES[bankId];
+  if (!pack) return SECTION_VOICES;
+  const items = pack.index.filter(item => !/^n\d+$/.test(item.key)).map(({ key, label }) => ({ key, label }));
+  for (const [key, source] of Object.entries(COMPATIBLE_KEYS)) {
+    if (items.some(item => item.key === source)) items.push({ key, label: SECTION_VOICES.find(item => item.key === key).label });
+  }
+  if (bankId === 'samples-es') {
+    for (const item of SECTION_VOICES) if (!items.some(x => x.key === item.key)) items.push({ ...item, label: item.label + ' · clásica' });
+  }
+  return items;
+}
+
+const bankCache = new WeakMap();
+export async function loadVoiceBank(ctx, bankId = 'classic') {
+  const id = SAMPLE_GUIDES[bankId] ? bankId : 'classic';
+  let cache = bankCache.get(ctx);
+  if (!cache) { cache = new Map(); bankCache.set(ctx, cache); }
+  if (!cache.has(id)) {
+    const pending = (async () => {
+      if (id === 'classic') return loadClassicVoices(ctx);
+      const samples = await loadSampleSprite(ctx, SAMPLE_GUIDES[id]);
+      // Spanish keeps legacy cues and numbers 8–12 that are absent from the ZIP.
+      const result = id === 'samples-es' ? new Map(await loadVoiceBank(ctx, 'classic')) : new Map();
+      for (const [key, data] of samples) result.set(key, data);
+      for (const [key, source] of Object.entries(COMPATIBLE_KEYS)) if (samples.has(source)) result.set(key, samples.get(source));
+      return result;
+    })();
+    cache.set(id, pending);
+    pending.catch(() => { if (cache.get(id) === pending) cache.delete(id); });
+  }
+  return cache.get(id);
+}
+
+for (const pack of Object.values(SAMPLE_GUIDES)) {
+  for (const item of pack.index) {
+    const base = item.key.replace(/\d+$/, '');
+    if (!SECTION_COLORS[item.key] && SECTION_COLORS[base]) SECTION_COLORS[item.key] = SECTION_COLORS[base];
+  }
 }

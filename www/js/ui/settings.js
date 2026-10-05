@@ -441,7 +441,7 @@ export function openSettings() {
   };
   unsubscribe.push(platform.on('install', renderInstall));
   renderInstall();
-  const appSection = section('Aplicación', null, installBox, usageText, persistButton, h('p', { class: 'field-hint', text: 'Escena · Nube v5 · Directo MIDI · ingvelarde.com' }));
+  const appSection = section('Aplicación', null, installBox, usageText, persistButton, h('p', { class: 'field-hint', text: 'Escena · Nube v5 · Click y guías · ingvelarde.com' }));
 
   const wipe = h('button', {
     type: 'button',

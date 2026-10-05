@@ -170,6 +170,7 @@ export class SongPlayer {
       duration: this.duration,
       offset: this.offset,
       sound: this.song.click.sound,
+      samples: this.engine.clickSamples,
       subdivision: this.song.click.subdivision,
     });
   }
@@ -389,6 +390,7 @@ export class SongPlayer {
       const intro = renderCountIn(ctx, this.tempo, grid, {
         bars,
         sound: this.song.click.sound,
+        samples: this.engine.clickSamples,
         marker: this.song.guide.mute ? null : marker,
         voices: this.voices,
         leadBars: this.song.guide.leadBars,

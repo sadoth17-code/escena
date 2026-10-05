@@ -306,6 +306,20 @@ class App {
     this.emit('song:updated', song, kind);
   }
 
+  async setGuideBank(song, bankId) {
+    const voices = await this.engine.loadVoices(bankId);
+    song.guide.voiceBank = bankId;
+    if (this.current?.song === song) this.current.player.voices = voices;
+    await this.updateSong(song, 'guide');
+    if (song.markers.some(marker => marker.voice && !voices.has(marker.voice))) this.toast('Hay indicaciones no disponibles en este idioma. Revísalas en Secciones.');
+  }
+
+  async setClickSound(song, sound) {
+    if (String(sound).startsWith('sample-')) await this.engine.loadClicks();
+    song.click.sound = sound;
+    await this.updateSong(song, 'click');
+  }
+
   async analyzeTrack(song, trackId) {
     let buffer = null;
     if (this.current && this.current.song === song) {
@@ -326,10 +340,11 @@ class App {
     return detectTempoFromBuffer(buffer);
   }
 
-  async previewVoice(key) {
-    const voices = await this.engine.loadVoices();
+  async previewVoice(key, bankId = 'classic') {
+    await this.engine.resume();
+    const voices = await this.engine.loadVoices(bankId);
     const data = voices.get(key);
-    if (!data) return;
+    if (!data) throw new Error('Esta indicación no está disponible en la voz seleccionada. Elige otra en Secciones.');
     const ctx = this.engine.ctx;
     const buffer = ctx.createBuffer(1, data.length, ctx.sampleRate);
     buffer.copyToChannel(data, 0);
@@ -337,7 +352,9 @@ class App {
   }
 
   async previewSound(sound) {
-    await this.engine.previewBuffer(renderPreview(this.engine.ctx, sound), 'cue');
+    await this.engine.resume();
+    const samples = String(sound).startsWith('sample-') ? await this.engine.loadClicks() : null;
+    await this.engine.previewBuffer(renderPreview(this.engine.ctx, sound, samples), 'cue');
   }
 
   setTrackDest(node, dest) {
@@ -460,7 +477,8 @@ class App {
 
   async prepare(song, onProgress) {
     const engine = this.engine;
-    const voices = await engine.loadVoices().catch(() => new Map());
+    const voices = await engine.loadVoices(song.guide.voiceBank);
+    if (String(song.click.sound).startsWith('sample-')) await engine.loadClicks();
     const files = await store.getMany('files', song.tracks.map((track) => track.fileId));
     const buffers = new Map();
     const failed = [];

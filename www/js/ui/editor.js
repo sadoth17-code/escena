@@ -1,9 +1,9 @@
 import { h, fmtBytes, fmtTime, clamp, uid } from '../util.js';
 import { app } from '../app.js';
 import { normalizeTempoEntries } from '../tempo.js';
-import { SECTION_VOICES, SECTION_COLORS, voiceKeyForName } from '../voices.js';
+import { sectionVoices, GUIDE_BANKS, SECTION_COLORS, voiceKeyForName } from '../voices.js';
 import { CLICK_SOUNDS } from '../synth.js';
-import { gatherAudio, draftTracks, isClickName, songBytes, songDuration } from '../library.js';
+import { gatherAudio, draftTracks, isClickName, isGuideName, songBytes, songDuration } from '../library.js';
 import { icon, iconButton, openModal, confirmDialog, createSegmented, createSwitch, field, settingRow } from './kit.js';
 import { createSectionMap } from './section-map.js';
 
@@ -304,7 +304,7 @@ export function openEditor(song, tab = 'general') {
       duplicateToast(wanted, other);
       return null;
     }
-    const key = voiceKeyForName(label);
+    const key = voiceKeyForName(label, song.guide.voiceBank);
     const marker = { id: uid(), name: label, bar, voice: key, color: SECTION_COLORS[key] || '#35c9ff' };
     song.markers.push(marker);
     sortMarkers();
@@ -327,11 +327,14 @@ export function openEditor(song, tab = 'general') {
     const rows = h('div', { class: 'table section-table' });
     rows.append(h('div', { class: 'trow thead' }, h('span', { text: 'Nombre' }), h('span', { text: 'Compás' }), h('span', { text: 'Voz de guía' }), h('span', { text: 'Color' }), h('span')));
     const datalistId = `sections-${uid()}`;
-    const list = h('datalist', { id: datalistId }, SECTION_VOICES.map((voice) => h('option', { value: voice.label })));
+    const list = h('datalist', { id: datalistId }, sectionVoices(song.guide.voiceBank).map((voice) => h('option', { value: voice.label })));
     for (const marker of song.markers) {
       const name = h('input', { type: 'text', class: 'input', value: marker.name, maxlength: '30', list: datalistId, 'aria-label': 'Nombre de la sección' });
-      const voice = h('select', { class: 'select', 'aria-label': 'Voz de guía' }, [h('option', { value: '', text: 'Sin voz', selected: !marker.voice }), ...SECTION_VOICES.map((item) => h('option', { value: item.key, text: item.label, selected: item.key === marker.voice }))]);
-      const preview = iconButton({ name: 'speaker', label: 'Escuchar voz', onClick: () => marker.voice && app.previewVoice(marker.voice) });
+      const voice = h('select', { class: 'select', 'aria-label': 'Voz de guía' }, [h('option', { value: '', text: 'Sin voz', selected: !marker.voice }), ...sectionVoices(song.guide.voiceBank).map((item) => h('option', { value: item.key, text: item.label, selected: item.key === marker.voice }))]);
+      if (marker.voice && !sectionVoices(song.guide.voiceBank).some(item => item.key === marker.voice)) {
+        voice.append(h('option', { value: marker.voice, selected: true, text: `${marker.voice} · no disponible en esta voz` }));
+      }
+      const preview = iconButton({ name: 'speaker', label: 'Escuchar voz', onClick: () => marker.voice && app.previewVoice(marker.voice, song.guide.voiceBank).catch(error => app.toast(error.message)) });
       const color = h('input', { type: 'color', class: 'color', value: marker.color, 'aria-label': 'Color de la sección' });
       const bar = numberInput({
         value: marker.bar,
@@ -341,10 +344,10 @@ export function openEditor(song, tab = 'general') {
         onChange: (value) => moveMarker(marker, value),
       });
       name.addEventListener('change', () => {
-        const before = voiceKeyForName(marker.name);
+        const before = voiceKeyForName(marker.name, song.guide.voiceBank);
         marker.name = name.value.trim() || 'Sección';
         name.value = marker.name;
-        const found = voiceKeyForName(marker.name);
+        const found = voiceKeyForName(marker.name, song.guide.voiceBank);
         if (!marker.voice || marker.voice === before) {
           marker.voice = found;
           if (found && SECTION_COLORS[found]) marker.color = SECTION_COLORS[found];
@@ -357,7 +360,7 @@ export function openEditor(song, tab = 'general') {
       voice.addEventListener('change', () => {
         marker.voice = voice.value;
         changed('markers');
-        if (marker.voice) app.previewVoice(marker.voice);
+        if (marker.voice) app.previewVoice(marker.voice, song.guide.voiceBank).catch(error => app.toast(error.message));
       });
       color.addEventListener('change', () => {
         marker.color = color.value;
@@ -497,17 +500,31 @@ export function openEditor(song, tab = 'general') {
   const renderCues = () => {
     const click = song.click;
     const guide = song.guide;
-    const soundSwitch = createSegmented({
-      options: CLICK_SOUNDS.map((sound) => ({ value: sound.id, label: sound.name })),
-      value: click.sound,
-      label: 'Sonido del click',
-      onChange: (value) => {
-        click.sound = value;
-        changed('click');
-        app.previewSound(value);
-      },
+    const soundSwitch = h('select', { class: 'select', 'aria-label': 'Sonido del click' }, CLICK_SOUNDS.map(sound => h('option', { value: sound.id, text: sound.name, selected: sound.id === click.sound })));
+    soundSwitch.addEventListener('change', async () => {
+      const value = soundSwitch.value;
+      soundSwitch.disabled = true;
+      try {
+        // Start audio inside the tap gesture, before downloading/decoding samples.
+        await app.engine.resume();
+        await app.setClickSound(song, value);
+        dirty = true;
+        await app.previewSound(value);
+      } catch (error) { soundSwitch.value = click.sound; app.toast(error.message); }
+      finally { soundSwitch.disabled = false; }
     });
-    const preview = h('button', { type: 'button', class: 'btn small', onClick: () => app.previewSound(click.sound) }, icon('speaker', 16), 'Escuchar');
+    const preview = h('button', { type: 'button', class: 'btn small', onClick: () => app.previewSound(click.sound).catch(error => app.toast(error.message)) }, icon('speaker', 16), 'Escuchar');
+    const bankSwitch = h('select', { class: 'select', 'aria-label': 'Voz e idioma de la guía' }, GUIDE_BANKS.map(bank => h('option', { value: bank.id, text: bank.name, selected: bank.id === guide.voiceBank })));
+    bankSwitch.addEventListener('change', async () => {
+      bankSwitch.disabled = true;
+      try {
+        await app.setGuideBank(song, bankSwitch.value); dirty = true;
+        if (active === 'sections') renderSections();
+      }
+      catch (error) { bankSwitch.value = guide.voiceBank; app.toast(error.message); }
+      finally { bankSwitch.disabled = false; }
+    });
+    const voicePreview = h('button', { type: 'button', class: 'btn small', onClick: () => app.previewVoice('coro', guide.voiceBank).catch(error => app.toast(error.message)) }, icon('speaker', 16), 'Escuchar voz');
     const subdivision = createSegmented({
       options: [
         { value: 1, label: 'Tiempos' },
@@ -543,17 +560,19 @@ export function openEditor(song, tab = 'general') {
         changed('guide');
       },
     });
-    const hasOwnClick = song.tracks.some((track) => isClickName(track.name));
-    const ownClickNotice = h('div', { class: 'notice info' }, icon('info', 20), h('div', {}, h('b', { text: 'Esta canción trae su propia pista de click' }), h('p', { text: 'El click de Escena está silenciado durante la canción para no duplicarlo; el pre-conteo sí suena.' })));
+    const hasOwnClick = song.tracks.some((track) => isClickName(track.name) || isGuideName(track.name));
+    const ownClickNotice = h('div', { class: 'notice info' }, icon('info', 20), h('div', {}, h('b', { text: 'Esta canción trae pistas de click o guía' }), h('p', { text: 'Para usar los sonidos de Escena, activa el click o la guía aquí y silencia su pista original en Mezcla. Así evitas oír ambos a la vez.' })));
     content.replaceChildren(
       ...(hasOwnClick ? [ownClickNotice] : []),
       h('h3', { class: 'sub', text: 'Click' }),
       settingRow('Click durante la canción', 'Metrónomo generado desde el mapa de tempo', clickOn.el),
-      field('Sonido', h('div', { class: 'inline' }, soundSwitch.el, preview)),
+      field('Sonido', h('div', { class: 'inline' }, soundSwitch, preview)),
       field('Subdivisión', subdivision.el),
       field('Pre-conteo al iniciar desde el principio', countIn.el),
       h('h3', { class: 'sub', text: 'Guía de voz' }),
       settingRow('Guía durante la canción', 'Dice el nombre de cada sección antes de que llegue', guideOn.el),
+      field('Voz e idioma', h('div', { class: 'inline' }, bankSwitch, voicePreview)),
+      h('p', { class: 'field-hint', text: 'En Secciones elige Coro 1, Verso 2, Entra batería, Toda la banda y otras indicaciones. Cada idioma ofrece las voces incluidas en su paquete. Español completa las voces antiguas y los números 8–12 con la voz clásica.' }),
       field('Anticipación', lead.el),
       settingRow('Contar tiempos', 'Tras el nombre, cuenta 2, 3, 4…', counting.el)
     );
@@ -571,6 +590,7 @@ export function openEditor(song, tab = 'general') {
     }
     renderers[id]();
     content.scrollTop = 0;
+    tabBar.querySelector(`[data-tab="${id}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   };
 
   for (const item of TABS) {
