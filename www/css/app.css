@@ -1435,6 +1435,7 @@ p {
 }
 
 .t-btn {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1472,6 +1473,32 @@ p {
 .t-btn.xl {
   width: clamp(54px, 9vw, 84px);
   height: clamp(54px, 9vw, 84px);
+}
+
+/* Canción siguiente: punto verde si ya está en memoria (entra al instante), ámbar si se está preparando. */
+.t-btn.ready::after,
+.t-btn.warming::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--green);
+  border: 2px solid var(--bg);
+  box-sizing: content-box;
+  pointer-events: none;
+}
+
+.t-btn.warming::after {
+  background: var(--amber);
+  animation: pulse 0.9s ease-in-out infinite;
+}
+
+.t-btn.ready.warming::after {
+  background: var(--green);
+  animation: none;
 }
 
 .t-btn.xl.play {
@@ -1925,6 +1952,29 @@ p {
 
 .song-row.loading {
   animation: pulse 0.9s ease-in-out infinite;
+}
+
+/* Punto verde: la canción ya está en memoria y entra al instante. Ámbar: se está preparando. */
+.song-row.ready .song-num::after,
+.song-row.warming .song-num::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  right: 3px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+}
+
+.song-row.warming .song-num::after {
+  background: var(--amber);
+  animation: pulse 0.9s ease-in-out infinite;
+}
+
+.song-row.ready.warming .song-num::after {
+  background: var(--green);
+  animation: none;
 }
 
 .song-num {
@@ -3202,6 +3252,24 @@ p {
   align-items: center;
   justify-content: center;
   gap: clamp(8px, 2vw, 22px);
+}
+
+.stage-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.78);
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+  pointer-events: auto;
+}
+
+.stage-loading .loading-card {
+  width: min(460px, 100%);
 }
 
 .stage-veil {

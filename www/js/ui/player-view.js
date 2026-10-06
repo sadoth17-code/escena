@@ -266,7 +266,11 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
     const mode = JUMP_MODES.find((item) => item.id === app.settings.jumpMode) || JUMP_MODES[0];
     setText(toggles.jump.querySelector('.tog-text'), mode.label);
     buttons.prevSong.disabled = !app.previousSongId();
-    buttons.nextSong.disabled = !app.nextSongId();
+    const nextId = app.nextSongId();
+    buttons.nextSong.disabled = !nextId;
+    // Punto verde: la siguiente canción ya está en memoria y entra al instante. Ámbar: se está preparando.
+    setClass(buttons.nextSong, 'ready', Boolean(nextId) && app.isReady(nextId));
+    setClass(buttons.nextSong, 'warming', Boolean(nextId) && app.isWarming(nextId));
   };
 
   const frame = (snap, now) => {

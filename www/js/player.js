@@ -161,10 +161,28 @@ export class SongPlayer {
     return [...this.fileTracks, this.click, this.guide];
   }
 
+  // Firmas de lo que se usó para dibujar cada búfer. Una canción que espera lista en memoria puede
+  // editarse mientras tanto (tempo, marcadores, click…): al ponerla en escena se comparan y solo se
+  // vuelve a dibujar lo que cambió (ver syncWithSong).
+  tempoSignature() {
+    return JSON.stringify([this.song.tempoMap, this.song.offsetMs]);
+  }
+
+  clickSignature() {
+    const click = this.song.click;
+    return JSON.stringify([this.tempoSignature(), click.sound, click.subdivision, Boolean(this.engine.clickBank)]);
+  }
+
+  guideSignature() {
+    const guide = this.song.guide;
+    return JSON.stringify([this.tempoSignature(), this.song.markers, guide.leadBars, guide.counting]);
+  }
+
   refreshTempo() {
     this.tempo = new TempoMap(this.song.tempoMap);
     this.offset = (Number(this.song.offsetMs) || 0) / 1000;
     this.sectionCache = null;
+    this.tempoKey = this.tempoSignature();
   }
 
   refreshClick() {
@@ -175,6 +193,7 @@ export class SongPlayer {
       subdivision: this.song.click.subdivision,
       bank: this.engine.clickBank,
     });
+    this.clickKey = this.clickSignature();
   }
 
   // Cambia la voz de la guía (otro idioma) y vuelve a dibujarla sin detener la canción.
@@ -192,12 +211,44 @@ export class SongPlayer {
       leadBars: this.song.guide.leadBars,
       counting: this.song.guide.counting,
     });
+    this.guideKey = this.guideSignature();
   }
 
   refreshAll() {
     this.refreshTempo();
     this.refreshClick();
     this.refreshGuide();
+  }
+
+  // Pone al día un reproductor que esperó en memoria mientras se editaba la canción: vuelve a dibujar
+  // solo lo que cambió (tempo, click, guía o la voz de la guía) y relee volumen, panorama, destino y
+  // solos de cada pista. No toca los audios decodificados, que son lo caro. Devuelve true si rehízo algo.
+  syncWithSong(voices = null) {
+    if (this.disposed) return false;
+    let changed = false;
+    const newVoices = voices && voices !== this.voices ? voices : null;
+    if (this.tempoKey !== this.tempoSignature()) {
+      if (newVoices) this.voices = newVoices;
+      this.refreshAll();
+      changed = true;
+    } else {
+      if (this.clickKey !== this.clickSignature()) {
+        this.refreshClick();
+        changed = true;
+      }
+      if (newVoices || this.guideKey !== this.guideSignature()) {
+        if (newVoices) this.voices = newVoices;
+        this.refreshGuide();
+        changed = true;
+      }
+    }
+    for (const track of this.allTracks()) {
+      track.route();
+      track.applyGain(true);
+      track.applyPan(true);
+    }
+    this.refreshSolo();
+    return changed;
   }
 
   refreshSolo() {
@@ -524,6 +575,20 @@ export class SongPlayer {
     else this.pausedAt = 0;
     this.state = 'stopped';
     this.emit('state');
+  }
+
+  // Deja el reproductor como recién creado (en el inicio, sin repetición ni pre-conteo) para guardarlo
+  // listo en memoria. A diferencia de stop(), no avisa a nadie: la canción ya no es la actual.
+  rewind() {
+    if (this.disposed) return;
+    this.playRequest++;
+    if (this.state === 'playing') this.halt(0);
+    this.stopCountIn();
+    this.run = null;
+    this.pending = null;
+    this.pausedAt = 0;
+    this.loop = null;
+    this.state = 'stopped';
   }
 
   // Salta a otro punto de la canción: ya mismo ('now'), en el siguiente tiempo ('beat') o compás ('bar').

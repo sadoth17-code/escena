@@ -191,9 +191,19 @@ export function createLibraryView({ onImport, onEdit }) {
     const playing = app.player && app.player.state === 'playing';
     for (const row of list.querySelectorAll('.song-row')) {
       const id = row.dataset.id;
+      // Punto verde: ya está en memoria y entra al instante. Ámbar: se está preparando en segundo plano.
+      const ready = id !== currentId && app.isReady(id);
+      const warming = id !== loadingId && app.isWarming(id);
       row.classList.toggle('current', id === currentId);
       row.classList.toggle('playing', id === currentId && Boolean(playing));
       row.classList.toggle('loading', id === loadingId);
+      row.classList.toggle('ready', ready);
+      row.classList.toggle('warming', warming);
+      if (row.__r !== ready) {
+        row.__r = ready;
+        if (ready) row.title = 'Lista en memoria: entra al instante';
+        else row.removeAttribute('title');
+      }
     }
   };
 
@@ -203,6 +213,7 @@ export function createLibraryView({ onImport, onEdit }) {
   app.on('song:unloaded', updateStates);
   app.on('loading', updateStates);
   app.on('transport', updateStates);
+  app.on('warm', updateStates);
   render();
 
   return { el, render };

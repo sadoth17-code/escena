@@ -261,8 +261,10 @@ class Cloud {
       await app.persistSongSoon.flushPending?.();
       await store.commitCloudSong(serializableSong(song), old?.tracks.map(track => track.fileId) || [], job.id);
       if (app.current?.song.id === song.id) app.unloadCurrent();
-      if (app.next?.song.id === song.id) app.discardNext();
+      // Lo que hubiera decodificado de la versión anterior ya no sirve.
+      app.invalidateSong(song.id);
       app.songs.set(song.id, song); app.emit('songs'); app.emit('setlists');
+      app.warmUp();
       app.toast('Canción descargada. Ya está en tu biblioteca.');
     });
   }

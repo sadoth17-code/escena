@@ -318,8 +318,6 @@ export function openSettings() {
     onChange: (value) => {
       app.setSetting('afterSong', value);
       gap.hidden = value !== 'next';
-      app.discardNext();
-      app.preloadNext();
     },
   });
   const gapRange = createRange({ min: 0, max: 15, step: 1, value: app.settings.gapSeconds, label: 'Pausa entre canciones', format: (value) => `${value} s`, onInput: (value) => app.setSetting('gapSeconds', value) });
@@ -331,8 +329,7 @@ export function openSettings() {
     label: 'Precargar la siguiente canción',
     onChange: (value) => {
       app.setSetting('preloadNext', value);
-      if (value) app.preloadNext();
-      else app.discardNext();
+      app.warmUp();
     },
   });
   const awake = createSwitch({ value: app.settings.keepAwake, label: 'Mantener pantalla encendida', onChange: (value) => app.setSetting('keepAwake', value) });
@@ -343,7 +340,7 @@ export function openSettings() {
     field('Al terminar la canción', after.el),
     gap,
     settingRow('Pre-conteo automático', 'Cuenta antes de empezar desde el inicio', autoCount.el),
-    settingRow('Precargar la siguiente canción', 'Entrada sin cortes entre canciones; usa más memoria', preload.el),
+    settingRow('Precargar la siguiente canción', 'Deja lista la siguiente (y conserva la anterior si cabe) para cambiar al instante y entrar sin cortes; usa más memoria', preload.el),
     settingRow('Mantener pantalla encendida', 'Evita que el dispositivo se bloquee mientras tocas', awake.el)
   );
 

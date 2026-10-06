@@ -108,6 +108,9 @@ async function boot() {
   app.on('toast', showToast);
   app.on('loading', (state) => {
     if (state && !shell.desktop && shell.tab === 'lib') shell.setTab('play');
+    stage.setLoading(state);
+    // Si la carga falló y no queda ninguna canción, el modo escenario no tiene nada que mostrar.
+    if (!state && !app.current && stage.open) stage.close();
   });
   app.on('song:loaded', (entry) => {
     shell.now.textContent = entry.song.title;
@@ -116,12 +119,13 @@ async function boot() {
     stage.setEntry(entry);
     if (!shell.desktop && shell.tab === 'lib') shell.setTab('play');
   });
-  app.on('song:unloaded', () => {
+  app.on('song:unloaded', (info) => {
     shell.now.textContent = '';
     playerView.setEntry(null);
     mixer.setEntry(null);
     stage.setEntry(null);
-    if (stage.open) stage.close();
+    // Al cambiar a una canción que hay que cargar, el escenario sigue abierto con el avance de la carga.
+    if (stage.open && !(info && info.loading)) stage.close();
   });
   app.on('song:refresh', (entry) => {
     playerView.refresh();

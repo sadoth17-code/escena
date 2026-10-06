@@ -66,7 +66,12 @@ export function createStage() {
     h('span', { class: 'unlock-copy' }, h('b', { text: 'Pantalla bloqueada' }), h('span', { class: 'unlock-text', text: 'Mantén pulsado para desbloquear' }))
   );
   const veil = h('div', { class: 'stage-veil', hidden: true }, unlockButton);
-  const el = h('div', { class: 'stage', hidden: true, role: 'dialog', 'aria-label': 'Modo escenario' }, top, main, sections, transport, veil);
+  // Mientras se carga una canción que no estaba lista, el escenario sigue abierto y lo dice con su avance.
+  const loadingTitle = h('b', { class: 'loading-title' });
+  const loadingText = h('span');
+  const loadingBar = h('i');
+  const loadingBox = h('div', { class: 'stage-loading', hidden: true, role: 'status' }, h('div', { class: 'loading-card' }, loadingTitle, loadingText, h('div', { class: 'progress' }, loadingBar)));
+  const el = h('div', { class: 'stage', hidden: true, role: 'dialog', 'aria-label': 'Modo escenario' }, top, main, sections, transport, veil, loadingBox);
 
   const setLocked = (value) => {
     locked = value;
@@ -147,6 +152,13 @@ export function createStage() {
         artist.textContent = entry.song.artist || ' ';
       }
     },
+    setLoading(state) {
+      loadingBox.hidden = !state;
+      if (!state) return;
+      loadingTitle.textContent = `Cargando «${state.song.title}»`;
+      loadingText.textContent = state.label ? `${state.done} de ${state.total} · ${state.label}` : 'Preparando…';
+      loadingBar.style.width = `${state.total ? (state.done / state.total) * 100 : 5}%`;
+    },
     show() {
       open = true;
       el.hidden = false;
@@ -212,7 +224,11 @@ export function createStage() {
         buttons.play.setAttribute('aria-label', playing ? 'Pausar' : 'Reproducir');
       }
       buttons.prevSong.disabled = !app.previousSongId();
-      buttons.nextSong.disabled = !app.nextSongId();
+      const nextId = app.nextSongId();
+      buttons.nextSong.disabled = !nextId;
+      // Punto verde: la siguiente canción ya está en memoria y entra al instante. Ámbar: se está preparando.
+      setClass(buttons.nextSong, 'ready', Boolean(nextId) && app.isReady(nextId));
+      setClass(buttons.nextSong, 'warming', Boolean(nextId) && app.isWarming(nextId));
     },
   };
   return api;

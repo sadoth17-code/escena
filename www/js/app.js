@@ -8,6 +8,25 @@ import { DEFAULT_GUIDE_LANG, isGuideLanguage, guideLanguageName } from './voices
 
 const MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || isIOS();
 
+const GB = 1024 ** 3;
+// Cuántos audios se decodifican a la vez. Con una canción esperando en pantalla se usan casi todos los
+// núcleos; en segundo plano (precarga mientras suena otra canción) solo dos, para no molestar al audio.
+const FOREGROUND_DECODERS = MOBILE ? 1 : clamp((Number(navigator.hardwareConcurrency) || 4) - 1, 2, 4);
+const BACKGROUND_DECODERS = MOBILE ? 1 : 2;
+// Además de la que sigue, se guarda lista en memoria como mucho una canción que se acaba de dejar,
+// por si hay que volver a ella (siempre que quepa en el presupuesto de memoria).
+const KEPT_BEHIND = 1;
+
+class Cancelled extends Error {
+  constructor() {
+    super('Carga cancelada');
+    this.cancelled = true;
+  }
+}
+
+// Lo que obliga a decodificar de nuevo: las pistas, sus archivos y si se mezclan a mono.
+const decodeSignature = (song) => song.tracks.map((track) => `${track.id}:${track.fileId}:${track.mono ? 1 : 0}`).join('|');
+
 export const DEFAULT_SETTINGS = {
   output: { ...DEFAULT_OUTPUT },
   jumpMode: 'bar',
@@ -45,11 +64,16 @@ class App {
     this.setlists = [];
     this.activeSetlistId = null;
     this.current = null;
-    this.next = null;
+    // Canciones ya decodificadas y listas para sonar al instante (la más antigua primero) y
+    // decodificaciones en curso, ambas por id de canción.
+    this.warm = new Map();
+    this.jobs = new Map();
+    // Canciones que no se pudieron leer en segundo plano (id → firma): no se reintentan en bucle.
+    this.failed = new Map();
     this.advancing = null;
-    this.preloading = null;
     this.loading = null;
     this.loadToken = 0;
+    this.wantedId = null;
     this.loopMode = false;
     this.engine = null;
     this.ready = false;
@@ -94,6 +118,21 @@ class App {
 
   get player() {
     return this.current ? this.current.player : null;
+  }
+
+  // La canción que sigue en el setlist, si ya está lista para sonar.
+  get next() {
+    const id = this.nextSongId();
+    return id ? this.warm.get(id) || null : null;
+  }
+
+  // ¿Se puede poner esta canción ya mismo? Es la actual o está decodificada en memoria.
+  isReady(id) {
+    return Boolean(this.current && this.current.song.id === id) || this.warm.has(id);
+  }
+
+  isWarming(id) {
+    return this.jobs.has(id);
   }
 
   setSetting(key, value) {
@@ -388,7 +427,7 @@ class App {
     if (bank.lang !== bank.requested) {
       this.toast(`No se pudo cargar la guía en ${guideLanguageName(lang)}: suena la voz original. Conéctate a internet una vez para descargarla`, 'error');
     }
-    for (const entry of [this.current, this.next]) if (entry) entry.player.setVoices(bank);
+    for (const entry of [this.current, ...this.warm.values()]) if (entry) entry.player.setVoices(bank);
   }
 
   setTrackDest(node, dest) {
@@ -424,7 +463,7 @@ class App {
     const song = this.songs.get(id);
     if (!song) return;
     if (this.current && this.current.song.id === id) this.unloadCurrent();
-    if (this.next && this.next.song.id === id) this.discardNext();
+    this.invalidateSong(id);
     for (const track of song.tracks) await store.remove('files', track.fileId).catch(() => {});
     await store.remove('songs', id);
     this.songs.delete(id);
@@ -436,6 +475,7 @@ class App {
     }
     this.emit('songs');
     this.emit('setlists');
+    this.warmUp();
   }
 
   async createSetlist(name) {
@@ -466,16 +506,14 @@ class App {
   async setActiveSetlist(id) {
     this.activeSetlistId = id;
     await store.setMeta('activeSetlist', id);
-    this.discardNext();
     this.emit('setlists');
-    this.preloadNext();
+    this.warmUp();
   }
 
   async saveSetlist(setlist) {
     await store.put('setlists', setlist);
     this.emit('setlists');
-    this.discardNext();
-    this.preloadNext();
+    this.warmUp();
   }
 
   async addToSetlist(songIds, setlist = this.activeSetlist()) {
@@ -509,48 +547,85 @@ class App {
     return index > 0 ? ids[index - 1] : null;
   }
 
-  async prepare(song, onProgress) {
+  // Decodifica todas las pistas de una canción y deja un reproductor listo para sonar. `job` (opcional)
+  // permite cancelar la preparación, subirle la prioridad y seguir su avance.
+  async prepare(song, job = null) {
     const engine = this.engine;
+    const signature = decodeSignature(song);
+    const stopped = () => Boolean(job && job.cancelled);
     const [voices] = await Promise.all([
       engine.loadVoices(this.settings.guideLang).catch(() => new Map()),
       this.ensureClickSound(song.click.sound),
     ]);
+    if (stopped()) throw new Cancelled();
     const files = await store.getMany('files', song.tracks.map((track) => track.fileId));
+    if (stopped()) throw new Cancelled();
     const buffers = new Map();
     const failed = [];
     const queue = song.tracks.map((track, index) => ({ track, file: files[index] }));
     const total = queue.length;
     let done = 0;
+    if (job) job.total = total;
     const worker = async () => {
-      while (queue.length) {
-        const job = queue.shift();
+      while (queue.length && !stopped()) {
+        const item = queue.shift();
         try {
-          if (!job.file) throw new Error('archivo no encontrado');
-          let buffer = await engine.decode(job.file.blob);
-          if (job.track.mono && buffer.numberOfChannels > 1) buffer = engine.monoDownmix(buffer);
-          buffers.set(job.track.id, buffer);
-          job.track.duration = buffer.duration;
+          if (!item.file) throw new Error('archivo no encontrado');
+          let buffer = await engine.decode(item.file.blob);
+          if (item.track.mono && buffer.numberOfChannels > 1) buffer = engine.monoDownmix(buffer);
+          buffers.set(item.track.id, buffer);
+          item.track.duration = buffer.duration;
         } catch (error) {
-          failed.push(job.track.name);
+          failed.push(item.track.name);
         }
         done++;
-        if (onProgress) onProgress(done, total, job.track.name);
+        if (job) {
+          job.done = done;
+          job.label = item.track.name;
+          try {
+            if (job.onProgress) job.onProgress(done, total, item.track.name);
+          } catch (error) {
+            console.error(error);
+          }
+        }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(MOBILE ? 1 : 2, total) }, worker));
+    // Los trabajadores se reparten la cola. Si alguien se queda esperando esta canción, `boost` suma más.
+    const pool = new Set();
+    const launch = () => {
+      const limit = Math.min(job ? job.decoders : BACKGROUND_DECODERS, total);
+      while (pool.size < limit && queue.length && !stopped()) {
+        const running = worker().finally(() => pool.delete(running));
+        pool.add(running);
+      }
+    };
+    if (job) job.boost = launch;
+    launch();
+    while (pool.size) await Promise.all(Array.from(pool));
+    if (job) job.boost = null;
+    if (stopped()) throw new Cancelled();
     if (!buffers.size) throw new Error('No se pudo leer ninguna pista de esta canción. Revisa el formato de los archivos');
     this.saveSong(song, true).catch(() => {});
     for (const track of song.tracks) track.solo = false;
     song.click.solo = false;
     song.guide.solo = false;
     const player = engine.createPlayer(song, buffers, voices);
-    const entry = { song, player, failed };
+    const entry = { song, player, failed, signature, bytes: player.memoryBytes() };
     player.on('state', () => this.emit('transport', entry));
     player.on('loop', () => this.emit('transport', entry));
     player.on('ended', () => this.handleEnded(entry));
+    // El dibujo de la onda queda calculado aquí, en segundo plano, y no al cambiar de canción.
+    try {
+      player.peaks();
+    } catch (error) {
+      void error;
+    }
     return entry;
   }
 
+  // Cambia de canción. Si ya está decodificada en memoria (la siguiente del setlist, o la que se acaba de dejar)
+  // el cambio es inmediato: no hay pantalla de carga, no se cierra el modo escenario y no se espera a nada.
+  // Si no, se decodifica con el avance a la vista y con todos los núcleos disponibles.
   async loadSong(id, { autoplay = false, force = false } = {}) {
     const song = this.songs.get(id);
     if (!song) return;
@@ -559,54 +634,128 @@ class App {
       return;
     }
     const token = ++this.loadToken;
-    this.advancing = null;
-    this.unloadCurrent();
-    let entry;
-    if (this.next && this.next.song.id === id) {
-      entry = this.next;
-      this.next = null;
-    } else {
-      this.loading = { song, done: 0, total: song.tracks.length, label: '' };
-      this.emit('loading', this.loading);
-      try {
-        entry = await this.prepare(song, (done, total, label) => {
-          if (token !== this.loadToken) return;
-          this.loading = { song, done, total, label };
-          this.emit('loading', this.loading);
-        });
-      } catch (error) {
-        if (token === this.loadToken) {
-          this.loading = null;
-          this.emit('loading', null);
-          this.toast(error.message, 'error');
+    this.wantedId = id;
+    try {
+      this.cancelAdvance();
+      if (force) this.invalidateSong(id);
+      // Lo que se preparaba para otra canción deja de importar: toda la máquina se dedica a esta.
+      for (const job of Array.from(this.jobs.values())) if (job.id !== id) this.cancelJob(job);
+      let entry = this.takeReady(id);
+      if (!entry) entry = await this.loadCold(song, token);
+      if (!entry) return;
+      // Un click de muestra que se eligió en el editor después de preparar la canción: se espera a que cargue.
+      if (isSampleSound(song.click.sound) && !this.engine.clickBank) {
+        await this.ensureClickSound(song.click.sound);
+        if (token !== this.loadToken) {
+          this.addWarm(entry);
+          return;
         }
-        return;
       }
-      if (token !== this.loadToken) {
-        entry.player.dispose();
-        return;
-      }
+      this.settle(entry);
+      this.becomeCurrent(entry);
+      this.endLoading();
+      if (entry.failed.length) this.toast(`No se pudieron leer: ${entry.failed.join(', ')}`, 'error');
+      this.warmUp();
+      if (autoplay) await this.play();
+    } finally {
+      if (token === this.loadToken) this.wantedId = null;
     }
-    this.loading = null;
-    this.emit('loading', null);
-    this.current = entry;
-    this.loopMode = false;
-    if (entry.failed.length) this.toast(`No se pudieron leer: ${entry.failed.join(', ')}`, 'error');
-    store.setMeta('last', { songId: id }).catch(() => {});
-    this.emit('song:loaded', entry);
-    this.preloadNext();
-    if (autoplay) await this.play();
   }
 
-  unloadCurrent() {
-    if (!this.current) return;
-    this.current.player.dispose();
+  // Camino lento: la canción no está lista en memoria. Se muestra el avance y se espera a que termine su
+  // decodificación; si ya estaba en marcha como precarga se aprovecha lo avanzado y se acelera.
+  async loadCold(song, token) {
+    const id = song.id;
+    const old = this.current;
+    // Lo que sonaba se deja guardado en memoria solo si cabe junto con la canción que se va a cargar.
+    const need = this.estimateBytes(song) || (old ? old.bytes : 0);
+    const keep = Boolean(old) && old.song.id !== id && this.settings.preloadNext && old.bytes + need <= this.warmBudget();
+    this.loading = { song, done: 0, total: song.tracks.length, label: '' };
+    this.unloadCurrent({ keep, loading: true });
+    this.makeRoom(need);
+    this.emit('loading', this.loading);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const job = this.jobs.get(id) || this.startJob(song, { foreground: true });
+      job.claimed = true;
+      job.decoders = FOREGROUND_DECODERS;
+      job.onProgress = (done, total, label) => {
+        if (token !== this.loadToken) return;
+        this.loading = { song, done, total, label };
+        this.emit('loading', this.loading);
+      };
+      if (job.done > 0) job.onProgress(job.done, job.total, job.label);
+      if (job.boost) job.boost();
+      try {
+        await job.promise;
+      } catch (error) {
+        if (token !== this.loadToken) return null;
+        // La canción cambió mientras se decodificaba: lo decodificado ya no vale, se empieza de nuevo.
+        if (error && error.cancelled) continue;
+        this.endLoading();
+        this.toast(error.message, 'error');
+        return null;
+      }
+      if (token !== this.loadToken) return null;
+      const entry = this.takeReady(id);
+      if (entry) return entry;
+    }
+    if (token === this.loadToken) {
+      this.endLoading();
+      this.toast('No se pudo preparar la canción. Inténtalo de nuevo', 'error');
+    }
+    return null;
+  }
+
+  endLoading() {
+    if (!this.loading) return;
+    this.loading = null;
+    this.emit('loading', null);
+  }
+
+  // Pasa a ser la canción actual. Lo que sonaba se guarda listo en memoria si cabe, o se libera.
+  becomeCurrent(entry) {
+    this.warm.delete(entry.song.id);
+    const old = this.current;
+    this.current = entry;
+    this.loopMode = false;
+    if (old && old !== entry) this.retire(old);
+    store.setMeta('last', { songId: entry.song.id }).catch(() => {});
+    this.emit('song:loaded', entry);
+  }
+
+  // Pone al día una canción que esperaba lista en memoria: empieza sin solos y recoge lo que se haya
+  // editado mientras tanto (tempo, marcadores, click, volúmenes, idioma de la guía).
+  settle(entry) {
+    const song = entry.song;
+    for (const track of song.tracks) track.solo = false;
+    song.click.solo = false;
+    song.guide.solo = false;
+    entry.player.syncWithSong(this.guideVoices);
+  }
+
+  // La canción que se deja: si puede hacer falta de nuevo (volver atrás) queda lista en memoria; si no, se libera.
+  retire(entry) {
+    entry.player.rewind();
+    if (this.settings.preloadNext && this.songs.get(entry.song.id) === entry.song) this.addWarm(entry);
+    else entry.player.dispose();
+  }
+
+  unloadCurrent({ keep = false, loading = false } = {}) {
+    const entry = this.current;
+    if (!entry) return;
     this.current = null;
-    this.emit('song:unloaded');
+    if (keep) this.retire(entry);
+    else entry.player.dispose();
+    this.emit('song:unloaded', { loading });
   }
 
   async reloadIfCurrent(id) {
-    if (!this.current || this.current.song.id !== id) return;
+    // Lo que hubiera decodificado de esa canción (aunque esté en espera) ya no corresponde a sus pistas.
+    this.invalidateSong(id);
+    if (!this.current || this.current.song.id !== id) {
+      this.warmUp();
+      return;
+    }
     const before = this.current.player;
     const resume = { time: before.position(), playing: before.state === 'playing' };
     await this.loadSong(id, { force: true });
@@ -616,43 +765,202 @@ class App {
     if (resume.playing) await after.play({ countIn: false });
   }
 
-  discardNext() {
-    if (this.next) {
-      this.next.player.dispose();
-      this.next = null;
-    }
-    this.preloading = null;
+  // --- Canciones listas en memoria ---------------------------------------------------------------
+  //
+  // Decodificar todas las pistas de una canción lleva segundos, y con ella en pantalla esperando eso es
+  // justo lo que no se puede permitir en vivo. Por eso la canción que sigue en el setlist se prepara en
+  // segundo plano mientras suena la actual, y la que se acaba de dejar se conserva por si hay que volver.
+  // Todo cabe en un presupuesto de memoria; la que sigue nunca se descarta.
+
+  warmBudget() {
+    const override = Number(this.settings.warmBudgetMB);
+    if (override > 0) return override * 1048576;
+    if (MOBILE) return 0;
+    return clamp((Number(navigator.deviceMemory) || 4) * 0.45, 1, 4) * GB;
   }
 
-  async preloadNext() {
-    if (!this.settings.preloadNext || !this.current) return;
-    const id = this.nextSongId();
-    if (!id || (this.next && this.next.song.id === id) || this.preloading === id) return;
-    this.discardNext();
-    this.preloading = id;
-    try {
-      const entry = await this.prepare(this.songs.get(id));
-      if (this.preloading !== id || this.nextSongId() !== id) {
-        entry.player.dispose();
-        return;
-      }
-      this.next = entry;
-    } catch (error) {
-      console.warn(error);
-    } finally {
-      if (this.preloading === id) this.preloading = null;
+  // Memoria que ocupará la canción una vez decodificada (0 si aún no se sabe cuánto duran sus pistas).
+  estimateBytes(song) {
+    const rate = this.engine.ctx.sampleRate || 48000;
+    let total = 0;
+    for (const track of song.tracks) total += (track.duration || 0) * rate * (track.mono ? 1 : 2) * 4;
+    return total;
+  }
+
+  // Las canciones que no se pueden descartar: la que sigue y la que se está cargando.
+  pinnedIds() {
+    return new Set([this.nextSongId(), this.wantedId].filter(Boolean));
+  }
+
+  // ¿Sigue valiendo lo decodificado? No si la canción se editó (pistas, archivos, mono) o se reemplazó.
+  isFresh(entry) {
+    const song = this.songs.get(entry.song.id);
+    return Boolean(song) && song === entry.song && !entry.player.disposed && decodeSignature(song) === entry.signature;
+  }
+
+  // Saca de la memoria en espera la canción pedida, si está y sigue valiendo.
+  takeReady(id) {
+    const entry = this.warm.get(id);
+    if (!entry) return null;
+    this.warm.delete(id);
+    if (!this.isFresh(entry)) {
+      entry.player.dispose();
+      this.emit('warm');
+      return null;
     }
+    this.emit('warm');
+    return entry;
+  }
+
+  addWarm(entry) {
+    const id = entry.song.id;
+    const old = this.warm.get(id);
+    if (old && old !== entry) old.player.dispose();
+    this.warm.delete(id);
+    this.warm.set(id, entry);
+    this.enforceBudget();
+    this.emit('warm');
+  }
+
+  dropWarm(id) {
+    const entry = this.warm.get(id);
+    if (!entry) return;
+    this.warm.delete(id);
+    entry.player.dispose();
+    this.emit('warm');
+  }
+
+  // Libera lo que sobre (primero lo más antiguo, sin tocar lo fijado) para que quepan `extra` bytes más.
+  makeRoom(extra = 0) {
+    const budget = this.warmBudget();
+    const pinned = this.pinnedIds();
+    let used = this.current ? this.current.bytes : 0;
+    for (const entry of this.warm.values()) used += entry.bytes;
+    for (const id of Array.from(this.warm.keys())) {
+      if (used + extra <= budget) break;
+      if (pinned.has(id)) continue;
+      used -= this.warm.get(id).bytes;
+      this.dropWarm(id);
+    }
+  }
+
+  // De lo que no está fijado se conserva a lo sumo KEPT_BEHIND canciones, y solo si caben en el presupuesto.
+  enforceBudget() {
+    if (!this.settings.preloadNext) {
+      for (const id of Array.from(this.warm.keys())) if (id !== this.wantedId) this.dropWarm(id);
+      return;
+    }
+    const pinned = this.pinnedIds();
+    const spare = Array.from(this.warm.keys()).filter((id) => !pinned.has(id));
+    while (spare.length > KEPT_BEHIND) this.dropWarm(spare.shift());
+    this.makeRoom(0);
+  }
+
+  startJob(song, { foreground = false } = {}) {
+    const id = song.id;
+    const job = {
+      id,
+      song,
+      signature: decodeSignature(song),
+      cancelled: false,
+      claimed: foreground,
+      decoders: foreground ? FOREGROUND_DECODERS : BACKGROUND_DECODERS,
+      done: 0,
+      total: song.tracks.length,
+      label: '',
+      onProgress: null,
+      boost: null,
+      promise: null,
+    };
+    this.jobs.set(id, job);
+    job.promise = this.prepare(song, job).then(
+      (entry) => {
+        if (this.jobs.get(id) === job) this.jobs.delete(id);
+        if (job.cancelled || !this.songs.has(id) || this.songs.get(id) !== song || decodeSignature(song) !== entry.signature) {
+          entry.player.dispose();
+          this.emit('warm');
+          throw new Cancelled();
+        }
+        this.failed.delete(id);
+        this.addWarm(entry);
+        return entry;
+      },
+      (error) => {
+        if (this.jobs.get(id) === job) this.jobs.delete(id);
+        if (!(error && error.cancelled) && !job.claimed) this.failed.set(id, job.signature);
+        this.emit('warm');
+        throw error;
+      }
+    );
+    // Una precarga que nadie espera no debe dejar un error sin atender si falla o se cancela.
+    job.promise.catch(() => {});
+    this.emit('warm');
+    return job;
+  }
+
+  cancelJob(job) {
+    job.cancelled = true;
+    if (this.jobs.get(job.id) === job) this.jobs.delete(job.id);
+    this.emit('warm');
+  }
+
+  // Lo decodificado de esta canción ya no vale (pistas nuevas o quitadas, archivos reemplazados, canción
+  // actualizada desde la nube): se descarta, también lo que estuviera a medias.
+  invalidateSong(id) {
+    this.failed.delete(id);
+    this.dropWarm(id);
+    const job = this.jobs.get(id);
+    if (job) this.cancelJob(job);
+  }
+
+  // Descarta todo lo que esperaba en memoria y cancela las precargas que nadie espera.
+  discardWarm() {
+    for (const job of Array.from(this.jobs.values())) if (!job.claimed) this.cancelJob(job);
+    for (const id of Array.from(this.warm.keys())) if (id !== this.wantedId) this.dropWarm(id);
+  }
+
+  // Mantiene lista la canción que sigue en el setlist para que el cambio sea inmediato.
+  warmUp() {
+    if (!this.settings.preloadNext) {
+      this.discardWarm();
+      return;
+    }
+    if (!this.current) return;
+    const id = this.nextSongId();
+    for (const job of Array.from(this.jobs.values())) if (!job.claimed && job.id !== id) this.cancelJob(job);
+    this.enforceBudget();
+    if (!id) return;
+    const song = this.songs.get(id);
+    const ready = this.warm.get(id);
+    if (ready) {
+      if (this.isFresh(ready)) return;
+      this.dropWarm(id);
+    }
+    if (this.jobs.has(id) || this.failed.get(id) === decodeSignature(song)) return;
+    this.startJob(song, { foreground: false });
+  }
+
+  // Nombres anteriores de estas dos operaciones.
+  discardNext() {
+    this.discardWarm();
+  }
+
+  preloadNext() {
+    this.warmUp();
+  }
+
+  // Anula el arranque ya programado de la canción siguiente (Pausa, Detener o cambio manual de canción
+  // en los últimos segundos de la actual).
+  cancelAdvance() {
+    const pending = this.advancing;
+    if (!pending) return;
+    this.advancing = null;
+    pending.entry.player.rewind();
   }
 
   activate(entry) {
-    const old = this.current;
-    this.current = entry;
-    this.next = null;
-    this.loopMode = false;
-    if (old && old !== entry) old.player.dispose();
-    store.setMeta('last', { songId: entry.song.id }).catch(() => {});
-    this.emit('song:loaded', entry);
-    this.preloadNext();
+    this.becomeCurrent(entry);
+    this.warmUp();
   }
 
   handleEnded(entry) {
@@ -687,12 +995,19 @@ class App {
       this.activate(target);
       return;
     }
-    if (!this.advancing && player.state === 'playing' && this.settings.afterSong === 'next' && this.next) {
-      if (player.timeToEnd(now) < 1.5 && this.next.song.id === this.nextSongId()) {
-        const when = player.endContextTime() + Math.max(0, Number(this.settings.gapSeconds) || 0);
-        this.next.player.playAt(when);
-        this.advancing = { entry: this.next, when, from: entry };
+    if (!this.advancing && player.state === 'playing' && this.settings.afterSong === 'next' && player.timeToEnd(now) < 1.5) {
+      const next = this.next;
+      if (!next) return;
+      if (!this.isFresh(next)) {
+        // Se editó mientras esperaba: ya no sirve. Al terminar esta canción se decodifica de nuevo.
+        this.dropWarm(next.song.id);
+        this.warmUp();
+        return;
       }
+      this.settle(next);
+      const when = player.endContextTime() + Math.max(0, Number(this.settings.gapSeconds) || 0);
+      next.player.playAt(when);
+      this.advancing = { entry: next, when, from: entry };
     }
   }
 
@@ -707,17 +1022,21 @@ class App {
   }
 
   pause() {
+    this.cancelAdvance();
     if (this.player) this.player.pause();
   }
 
   async togglePlay() {
     const player = this.player;
     if (!player) return;
-    if (player.state === 'playing') player.pause();
-    else await this.play();
+    if (player.state === 'playing') {
+      this.cancelAdvance();
+      player.pause();
+    } else await this.play();
   }
 
   stop() {
+    this.cancelAdvance();
     if (this.player) this.player.stop();
   }
 
