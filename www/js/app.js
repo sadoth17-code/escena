@@ -70,6 +70,8 @@ class App {
     this.jobs = new Map();
     // Canciones que no se pudieron leer en segundo plano (id → firma): no se reintentan en bucle.
     this.failed = new Map();
+    // Combinaciones «frecuencia de las pistas > frecuencia de la salida» que ya se explicaron en esta sesión.
+    this.conversionNotes = new Set();
     this.advancing = null;
     this.loading = null;
     this.loadToken = 0;
@@ -92,8 +94,8 @@ class App {
     this.bus.emit(name, ...args);
   }
 
-  toast(message, kind = 'info') {
-    this.emit('toast', { message, kind });
+  toast(message, kind = 'info', duration) {
+    this.emit('toast', { message, kind, duration });
   }
 
   async init() {
@@ -562,6 +564,8 @@ class App {
     if (stopped()) throw new Cancelled();
     const buffers = new Map();
     const failed = [];
+    // Frecuencias de las pistas que no se pudieron leer directo por no coincidir con la de la salida de audio.
+    const converted = new Map();
     const queue = song.tracks.map((track, index) => ({ track, file: files[index] }));
     const total = queue.length;
     let done = 0;
@@ -571,7 +575,9 @@ class App {
         const item = queue.shift();
         try {
           if (!item.file) throw new Error('archivo no encontrado');
-          let buffer = await engine.decode(item.file.blob);
+          const notes = {};
+          let buffer = await engine.decode(item.file.blob, { cancelled: stopped, notes });
+          if (notes.rate) converted.set(notes.rate, (converted.get(notes.rate) || 0) + 1);
           if (item.track.mono && buffer.numberOfChannels > 1) buffer = engine.monoDownmix(buffer);
           buffers.set(item.track.id, buffer);
           item.track.duration = buffer.duration;
@@ -610,7 +616,9 @@ class App {
     song.click.solo = false;
     song.guide.solo = false;
     const player = engine.createPlayer(song, buffers, voices);
-    const entry = { song, player, failed, signature, bytes: player.memoryBytes() };
+    // De la más frecuente a la menos: { from: [[Hz, pistas], …], to: Hz de la salida } o null si todo se leyó directo.
+    const resampled = converted.size ? { from: Array.from(converted).sort((a, b) => b[1] - a[1]), to: engine.ctx.sampleRate } : null;
+    const entry = { song, player, failed, signature, bytes: player.memoryBytes(), resampled };
     player.on('state', () => this.emit('transport', entry));
     player.on('loop', () => this.emit('transport', entry));
     player.on('ended', () => this.handleEnded(entry));
@@ -641,6 +649,7 @@ class App {
       // Lo que se preparaba para otra canción deja de importar: toda la máquina se dedica a esta.
       for (const job of Array.from(this.jobs.values())) if (job.id !== id) this.cancelJob(job);
       let entry = this.takeReady(id);
+      const waited = !entry;
       if (!entry) entry = await this.loadCold(song, token);
       if (!entry) return;
       // Un click de muestra que se eligió en el editor después de preparar la canción: se espera a que cargue.
@@ -655,6 +664,7 @@ class App {
       this.becomeCurrent(entry);
       this.endLoading();
       if (entry.failed.length) this.toast(`No se pudieron leer: ${entry.failed.join(', ')}`, 'error');
+      if (waited) this.explainConversion(entry);
       this.warmUp();
       if (autoplay) await this.play();
     } finally {
@@ -704,6 +714,23 @@ class App {
       this.toast('No se pudo preparar la canción. Inténtalo de nuevo', 'error');
     }
     return null;
+  }
+
+  // Un WAV a la misma frecuencia que la salida de audio se lee directo (ver wav.js); a otra frecuencia lo remuestrea
+  // decodeAudioData, que tarda más y además convierte el audio. Cuando alguien tuvo que esperar por eso se explica,
+  // una sola vez por combinación de frecuencias y sesión. En el móvil no se avisa: allí la salida no se puede cambiar.
+  explainConversion(entry) {
+    const info = entry.resampled;
+    if (!info || MOBILE) return;
+    const [rate] = info.from[0];
+    const key = `${rate}>${info.to}`;
+    if (this.conversionNotes.has(key)) return;
+    this.conversionNotes.add(key);
+    this.toast(
+      `Las pistas de «${entry.song.title}» están a ${rate} Hz y la salida de audio de este equipo trabaja a ${info.to} Hz, así que se convierten al cargar y tarda más. Con la salida del equipo en ${rate} Hz (y abriendo Escena de nuevo) se leen directo.`,
+      'info',
+      14000
+    );
   }
 
   endLoading() {

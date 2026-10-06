@@ -3,6 +3,7 @@ import { loadVoiceBank, DEFAULT_GUIDE_LANG } from './voices.js';
 import { loadClickBank } from './synth.js';
 import { SongPlayer } from './player.js';
 import { configureAudioSession, resumeAudioContext } from './audio-session.js';
+import { decodeWav } from './wav.js';
 
 export const MAX_OUTPUTS = 32;
 
@@ -437,7 +438,16 @@ export class Engine {
     return this.clickBankLoading;
   }
 
-  async decode(blob) {
+  // Los WAV sin comprimir se leen directamente (ver wav.js): carga más rápido que decodeAudioData y no deja varias
+  // copias de la pista en memoria mientras tanto. Cualquier otro formato, otra frecuencia o cualquier problema con
+  // la lectura directa sigue por el camino de siempre.
+  async decode(blob, { cancelled = null, notes = null } = {}) {
+    try {
+      const direct = await decodeWav(blob, this.ctx, { cancelled, notes });
+      if (direct) return direct;
+    } catch (error) {
+      if (error && error.name === 'WavAborted') throw error;
+    }
     const data = await blob.arrayBuffer();
     return this.ctx.decodeAudioData(data);
   }

@@ -1,6 +1,7 @@
-const { app, BrowserWindow, Menu, powerSaveBlocker, protocol, session, shell } = require('electron');
+const { app, BrowserWindow, Menu, net, powerSaveBlocker, protocol, session, shell } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
+const { PREFIX: CLOUD_PREFIX, createNubeProxy } = require('./nube-proxy');
 
 const ROOT = path.join(__dirname, '..', 'www');
 const ORIGIN = 'app://escena';
@@ -33,8 +34,16 @@ app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
 let mainWindow = null;
 let blockerId = null;
 
+// Las solicitudes a la nube de Escena salen por aquí y no desde la página: así la clave de acceso
+// funciona sin depender de que el Worker tenga «app://escena» en ALLOWED_ORIGINS (ver nube-proxy.js).
+const nubeProxy = createNubeProxy({
+  fetch: (url, init) => net.fetch(url, init),
+  fallbackFetch: (url, init) => fetch(url, init),
+});
+
 async function serve(request) {
   const url = new URL(request.url);
+  if (url.pathname.startsWith(CLOUD_PREFIX)) return nubeProxy(request);
   let name = decodeURIComponent(url.pathname);
   if (name.endsWith('/')) name += 'index.html';
   const file = path.normalize(path.join(ROOT, name));
