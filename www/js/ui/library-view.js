@@ -3,6 +3,7 @@ import { app } from '../app.js';
 import { songDuration, songBytes } from '../library.js';
 import { icon, iconButton, createSegmented, confirmDialog, promptDialog } from './kit.js';
 import { createCloudView } from './cloud-view.js';
+import { createCover } from './cover.js';
 
 function songMeta(song) {
   const first = song.tempoMap[0];
@@ -105,7 +106,7 @@ export function createLibraryView({ onImport, onEdit }) {
       fn();
     };
     const lead = h('span', { class: 'song-num' }, inSetlist ? String(index + 1).padStart(2, '0') : icon('music', 16), h('i', { class: 'eq' }, h('s'), h('s'), h('s')));
-    const main = h('div', { class: 'song-main' }, h('b', { class: 'song-title', text: song.title }), h('span', { class: 'song-meta', text: songMeta(song) }));
+    const main = h('div', { class: 'song-main' }, h('b', { class: 'song-title', text: song.title }), h('span', { class: 'song-meta', text: songMeta(song) }), h('span', { class: 'song-ready-label' }));
     const actions = h('div', { class: 'song-actions' });
     if (mode === 'setlist' && ordering) {
       const ids = app.activeSetlist().songIds;
@@ -128,7 +129,7 @@ export function createLibraryView({ onImport, onEdit }) {
     } else {
       actions.append(iconButton({ name: 'edit', label: 'Editar canción', onClick: stop(() => onEdit(song)) }));
     }
-    row.append(lead, main, actions);
+    row.append(lead, createCover(song), main, actions);
     if (current) row.classList.add('current');
     return row;
   };
@@ -199,6 +200,9 @@ export function createLibraryView({ onImport, onEdit }) {
       row.classList.toggle('loading', id === loadingId);
       row.classList.toggle('ready', ready);
       row.classList.toggle('warming', warming);
+      const label = row.querySelector('.song-ready-label');
+      const status = id === loadingId ? 'Preparando audio…' : id === currentId ? 'En reproductor' : ready ? 'Lista para sonar' : warming ? 'Preparando en segundo plano…' : 'Descargada en este dispositivo';
+      if (label.textContent !== status) label.textContent = status;
       if (row.__r !== ready) {
         row.__r = ready;
         if (ready) row.title = 'Lista en memoria: entra al instante';

@@ -7,6 +7,7 @@ import { CLICK_SOUNDS, CLICK_GROUPS } from '../synth.js';
 import { gatherAudio, draftTracks, isClickName, songBytes, songDuration } from '../library.js';
 import { icon, iconButton, openModal, confirmDialog, createSegmented, createSwitch, createSectionPicker, createGuideLanguageSelect, field, settingRow } from './kit.js';
 import { createSectionMap, clockText } from './section-map.js';
+import { createCoverPicker } from './cover.js';
 
 const TABS = [
   { id: 'general', label: 'General' },
@@ -270,6 +271,11 @@ export function openEditor(song, tab = 'general') {
     const duration = songDuration(song);
     content.replaceChildren(
       field('Título', title),
+      createCoverPicker({ value: song.cover, onChange: async value => {
+        song.cover = value;
+        changed('meta');
+        await app.saveSong(song);
+      } }),
       h('div', { class: 'grid-2' }, field('Artista', artist), field('Tono', key)),
       h('h3', { class: 'sub', text: 'Alineación del compás 1' }),
       h('p', { class: 'field-hint', text: 'Indica en qué milisegundo del audio empieza el primer tiempo del compás 1. Con ello el click, la guía y los saltos caen exactos sobre el audio. Si prefieres verlo sobre la onda y colocarlo con un toque, usa la pestaña Alinear.' }),

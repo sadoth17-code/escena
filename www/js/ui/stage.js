@@ -4,6 +4,8 @@ import { app } from '../app.js';
 import { platform } from '../platform.js';
 import { icon, setText, setClass } from './kit.js';
 import { barsText } from './player-view.js';
+import { songPitchText } from '../pitch-utils.js';
+import { createPadControl } from './pad-control.js';
 
 const HOLD_MS = 800;
 
@@ -23,7 +25,7 @@ export function createStage() {
   const artist = h('p', { class: 'stage-artist' });
   const lockButton = h('button', { type: 'button', class: 'stage-btn', 'aria-label': 'Bloquear pantalla', title: 'Bloquear pantalla' }, icon('lock', 26));
   const exitButton = h('button', { type: 'button', class: 'stage-btn', 'aria-label': 'Salir del modo escenario', title: 'Salir', onClick: () => api.close() }, icon('close', 26));
-  const top = h('div', { class: 'stage-top' }, h('div', { class: 'stage-song' }, position, title, artist), h('div', { class: 'stage-top-actions' }, lockButton, exitButton));
+  const top = h('div', { class: 'stage-top' }, h('div', { class: 'stage-song' }, position, title, artist), h('div', { class: 'stage-top-actions' }, createPadControl({ compact: true }), lockButton, exitButton));
 
   const sectionLabel = h('span', { class: 'stage-label' });
   const sectionName = h('b', { class: 'stage-section' });
@@ -138,7 +140,7 @@ export function createStage() {
       chipKey = '';
       if (next) {
         title.textContent = next.song.title;
-        artist.textContent = next.song.artist || ' ';
+        artist.textContent = [next.song.artist, songPitchText(next.song)].filter(Boolean).join(' · ') || ' ';
         const ids = app.activeSetlist().songIds.filter((id) => app.songs.has(id));
         const index = ids.indexOf(next.song.id);
         position.textContent = index >= 0 ? `${index + 1} / ${ids.length}` : '';
@@ -149,7 +151,7 @@ export function createStage() {
       chipKey = '';
       if (entry) {
         title.textContent = entry.song.title;
-        artist.textContent = entry.song.artist || ' ';
+        artist.textContent = [entry.song.artist, songPitchText(entry.song)].filter(Boolean).join(' · ') || ' ';
       }
     },
     setLoading(state) {
@@ -224,6 +226,7 @@ export function createStage() {
         buttons.play.setAttribute('aria-label', playing ? 'Pausar' : 'Reproducir');
       }
       buttons.prevSong.disabled = !app.previousSongId();
+      buttons.play.disabled = Boolean(player.pitchBusy);
       const nextId = app.nextSongId();
       buttons.nextSong.disabled = !nextId;
       // Punto verde: la siguiente canción ya está en memoria y entra al instante. Ámbar: se está preparando.

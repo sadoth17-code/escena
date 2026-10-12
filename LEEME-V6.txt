@@ -1,0 +1,100 @@
+ESCENA · ACTUALIZACIÓN V6
+Tonalidad, cambio de canción, portadas y pad
+12 de octubre de 2026
+
+BASE DE ESTA ENTREGA
+Esta actualización usa tu último paquete:
+Escena-archivos-para-GitHub-v5-Nube-Exe-Clave-y-Cambio-Instantaneo.zip.
+Incluye el proyecto completo, no solo un parche. El sitio publicado y los
+programas instalados todavía no cambian hasta que publiques o reconstruyas.
+
+1. SUBIR O BAJAR TONALIDAD
+Abre una canción y pausa la reproducción. En el panel Tonalidad, usa − o +
+y pulsa Aplicar. El rango es de −12 a +12 semitonos. Espera a que termine
+la preparación antes de reproducir. Original recupera el audio original.
+
+En Pistas que cambian de tono puedes elegir qué pistas musicales procesar.
+El click y la guía generados por Escena no cambian. Las pistas importadas
+con nombres de click, guía, batería o percusión, o destinadas a Cue, quedan
+excluidas inicialmente; revisa la selección si tus archivos usan otros nombres.
+
+El procesamiento mantiene el número de muestras y el tempo. Cada cambio
+parte del original, por lo que no acumula degradación de cambios anteriores.
+Puedes cancelarlo sin perder el tono aplicado previamente. El ajuste se guarda
+por canción. Al abrirla de nuevo se procesa con ese tono durante la preparación.
+Los archivos originales guardados no se sobrescriben ni se exportan transpuestos.
+
+Para mostrar el nombre del tono resultante, escribe la tonalidad original en
+Editar canción → General, por ejemplo C, D, F#, Bb, Am o Do menor.
+Cambiar el tono no requiere conocer ese nombre; el pad automático sí lo necesita.
+Cambios grandes pueden alterar el timbre: escucha tus pistas en el equipo de uso.
+
+2. POR QUÉ UNA CANCIÓN DESCARGADA TODAVÍA PUEDE DEMORAR
+Descargada significa que sus archivos ya están guardados en el dispositivo.
+Lista para sonar significa que sus pistas ya están decodificadas en memoria
+y, cuando corresponde, transpuestas. Esa segunda preparación tarda aunque
+no haya que volver a descargarlas.
+
+La siguiente canción del setlist se prepara en segundo plano. La anterior
+se conserva si cabe en el presupuesto de memoria. La lista y el reproductor
+muestran si está descargada, preparándose o lista para sonar.
+
+En tu instalación actual pulsa Preparar siguiente, o activa Ajustes →
+Precarga inteligente. Se respeta la preferencia anterior del dispositivo;
+las instalaciones nuevas la traen activada.
+
+El cambio a una canción lista reutiliza su audio en memoria. Una canción que
+no cabe, que no estaba prevista, que fue editada o que se abre por primera vez
+puede necesitar preparación. No se cargan todas las canciones a la vez.
+En móviles el presupuesto es más conservador. Aplicar tonalidad conserva
+también los originales en RAM y puede reducir lo que cabe en la precarga.
+
+3. PORTADA DE LA CANCIÓN
+Al importar una canción, elige su portada; también puedes añadirla, cambiarla
+o quitarla en Editar canción → General. En importaciones de varias canciones,
+asigna la portada de cada una desde su editor después de importarlas.
+
+Admite JPG, PNG y WebP de hasta 12 MB. Recorta al centro y guarda un JPEG
+cuadrado de 480 × 480. Aparece en el setlist, la biblioteca y el reproductor.
+Se guarda sin conexión y viaja con los metadatos cuando subes o actualizas
+la canción en la nube. Las canciones que ya estaban subidas deben actualizarse
+para incluir una portada recién añadida. No cambia la configuración del Worker.
+
+4. PAD DE ACOMPAÑAMIENTO
+En el reproductor, usa Iniciar pad. Puedes elegir la nota, el volumen y el
+timbre Suave o Cálido. Seguir tonalidad usa la tonalidad original indicada
+en la canción más los semitonos aplicados. Si no hay una tonalidad reconocible,
+indícala en el editor o desactiva el seguimiento y elige la nota manualmente.
+
+El pad combina fundamental, quinta y octava, sin tercera mayor o menor.
+Entra y sale gradualmente y hace transiciones suaves al cambiar la nota.
+Se genera dentro de la app, sin descargar muestras. Usa la salida de pistas/Sala.
+Continúa entre canciones y tiene su propio botón Detener pad, también en
+modo escenario. Detener la canción no detiene el pad. No se inicia solo.
+
+5. CÓMO ACTUALIZAR TU REPOSITORIO
+1) Conserva una copia del proyecto anterior y de tus canciones importantes.
+2) Descomprime este ZIP. Dentro están www, electron, scripts, cloud, tests,
+   android-res y los archivos de configuración. Se mantiene .github/workflows.
+3) Sustituye los archivos del repositorio con los de este paquete, conservando
+   la misma estructura. www debe seguir siendo una carpeta en la raíz.
+   Incluye los nuevos módulos de www/js y www/js/vendor; no basta con index.html.
+4) Al publicar los cambios en main o master, el flujo existente de GitHub
+   prepara el modo sin internet y genera la web y los instaladores.
+   Esto requiere que tu configuración habitual de GitHub Actions siga habilitada.
+5) Cierra y vuelve a abrir la web cuando termine la publicación. Si aparece
+   un aviso de actualización, aplícalo. No borres los datos del navegador:
+   ahí están las canciones guardadas localmente.
+6) Para Windows, Mac o Android, instala la nueva compilación generada.
+   Actualizar GitHub Pages por sí solo no actualiza un EXE o APK instalado.
+
+No se publicó ni se conectó ninguna cuenta desde esta entrega. No se cambiaron
+la clave, el Worker, el bucket ni el procedimiento de firma de los instaladores.
+El archivo entregado contiene código fuente, no un EXE/APK/DMG ya compilado.
+
+COMPROBACIÓN ANTES DE USARLO EN VIVO
+Prueba dos canciones de tu setlist en el dispositivo de uso. Espera a Lista
+para sonar y cambia entre ellas. Con la reproducción pausada, aplica −2 y +2,
+reproduce y vuelve a Original. Comprueba la salida del pad y su botón de parada,
+y vuelve a abrir una canción para confirmar que conserva tono y portada.
+Consulta VERIFICACION-V6.txt para conocer las pruebas realizadas y sus límites.

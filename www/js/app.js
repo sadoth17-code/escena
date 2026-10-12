@@ -5,6 +5,8 @@ import { normalizeSong, serializableSong, createSong, createTrackDef, createSetl
 import { normalizeTempoEntries, detectTempoFromBuffer } from './tempo.js';
 import { renderPreview, isSampleSound } from './synth.js';
 import { DEFAULT_GUIDE_LANG, isGuideLanguage, guideLanguageName } from './voices.js';
+import { normalizePitch, pitchLabel, keyPitchClass } from './pitch-utils.js';
+import { AmbientPad } from './pad.js';
 
 const MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || isIOS();
 
@@ -33,7 +35,7 @@ export const DEFAULT_SETTINGS = {
   liveControlsVersion: 1,
   afterSong: 'stop',
   gapSeconds: 0,
-  preloadNext: !MOBILE,
+  preloadNext: true,
   autoCountIn: true,
   keepAwake: true,
   sinkId: '',
@@ -42,10 +44,16 @@ export const DEFAULT_SETTINGS = {
   midiEnabled: false,
   bindings: null,
   guideLang: DEFAULT_GUIDE_LANG,
+  pad: { volume: 0.35, note: 0, followSong: true, style: 'soft' },
 };
 
 function mergeSettings(saved) {
   const merged = { ...DEFAULT_SETTINGS, ...saved };
+  merged.pad = { ...DEFAULT_SETTINGS.pad, ...(saved?.pad || {}) };
+  merged.pad.volume = clamp(Number(merged.pad.volume) || 0, 0, 1);
+  merged.pad.note = ((Math.round(Number(merged.pad.note) || 0) % 12) + 12) % 12;
+  merged.pad.followSong = Boolean(merged.pad.followSong);
+  merged.pad.style = merged.pad.style === 'warm' ? 'warm' : 'soft';
   if (!isGuideLanguage(merged.guideLang)) merged.guideLang = DEFAULT_GUIDE_LANG;
   // This live-performance update starts every device in bar mode once.
   // Later, deliberate changes in Ajustes are retained.
@@ -70,8 +78,6 @@ class App {
     this.jobs = new Map();
     // Canciones que no se pudieron leer en segundo plano (id → firma): no se reintentan en bucle.
     this.failed = new Map();
-    // Combinaciones «frecuencia de las pistas > frecuencia de la salida» que ya se explicaron en esta sesión.
-    this.conversionNotes = new Set();
     this.advancing = null;
     this.loading = null;
     this.loadToken = 0;
@@ -94,8 +100,8 @@ class App {
     this.bus.emit(name, ...args);
   }
 
-  toast(message, kind = 'info', duration) {
-    this.emit('toast', { message, kind, duration });
+  toast(message, kind = 'info') {
+    this.emit('toast', { message, kind });
   }
 
   async init() {
@@ -113,6 +119,8 @@ class App {
     this.engine = new Engine();
     this.engine.output = this.settings.output;
     this.engine.applyOutput(true);
+    this.pad = new AmbientPad(this.engine, () => this.emit('pad'));
+    this.setPad(this.settings.pad, false);
     this.startTicker();
     this.ready = true;
     this.emit('ready');
@@ -143,9 +151,54 @@ class App {
     this.emit('settings', key);
   }
 
+  setPad(patch, persist = true) {
+    const next = { ...this.settings.pad, ...patch };
+    next.volume = clamp(Number(next.volume) || 0, 0, 1);
+    next.note = ((Math.round(Number(next.note) || 0) % 12) + 12) % 12;
+    next.style = next.style === 'warm' ? 'warm' : 'soft';
+    next.followSong = Boolean(next.followSong);
+    this.settings.pad = next;
+    if (this.pad) {
+      this.pad.setVolume(next.volume);
+      this.pad.setStyle(next.style);
+      if (!next.followSong) this.pad.setNote(next.note);
+      else this.syncPadSong();
+    }
+    if (persist) this.saveSettings();
+    this.emit('pad');
+  }
+
+  syncPadSong() {
+    if (!this.pad || !this.settings.pad.followSong) return;
+    const song = this.current?.song;
+    const note = keyPitchClass(song?.key);
+    if (note === null) { if (this.pad.active) this.pad.stop(); return; }
+    this.pad.setNote((note + normalizePitch(song.pitchSemitones) + 12) % 12);
+  }
+
+  async togglePad() {
+    if (!this.pad) return;
+    if (this.pad.active) { this.pad.stop(); return; }
+    if (this.padStarting) return;
+    if (this.settings.pad.followSong && keyPitchClass(this.current?.song.key) === null) {
+      this.toast('Indica el tono en Editar canción o desactiva «Seguir la tonalidad» para elegir una nota');
+      return;
+    }
+    this.padStarting = true;
+    try {
+      await this.engine.resume();
+      if (this.settings.pad.followSong && keyPitchClass(this.current?.song.key) === null) throw new Error('Indica la tonalidad de la canción antes de iniciar el pad');
+      this.syncPadSong();
+      this.pad.start();
+    } catch (error) { this.toast(error.message || 'No se pudo activar el pad', 'error'); }
+    finally { this.padStarting = false; }
+  }
+
   resetSettings() {
     const guideBefore = this.settings.guideLang;
     this.settings = mergeSettings({});
+    this.pad?.stop();
+    this.setPad(this.settings.pad, false);
     if (guideBefore !== this.settings.guideLang) this.setGuideLanguage(this.settings.guideLang).catch(() => {});
     this.engine.output = this.settings.output;
     this.engine.applyOutput(false);
@@ -299,6 +352,8 @@ class App {
       throw new Error(error && error.name === 'QuotaExceededError' ? 'No hay espacio suficiente en el dispositivo' : error.message || 'No se pudo guardar');
     }
     const song = createSong(title, defs);
+    if (extra.cover) song.cover = extra.cover;
+    if (extra.key) song.key = String(extra.key);
     if (chosen.some((draft) => draft.click)) song.click.mute = true;
     if (chosen.some((draft) => draft.guide)) song.guide.mute = true;
     if (extra.tempo) {
@@ -350,6 +405,7 @@ class App {
     }
     this.persistSongSoon(song);
     this.emit('song:updated', song, kind);
+    if (entry) this.syncPadSong();
   }
 
   async analyzeTrack(song, trackId) {
@@ -564,8 +620,6 @@ class App {
     if (stopped()) throw new Cancelled();
     const buffers = new Map();
     const failed = [];
-    // Frecuencias de las pistas que no se pudieron leer directo por no coincidir con la de la salida de audio.
-    const converted = new Map();
     const queue = song.tracks.map((track, index) => ({ track, file: files[index] }));
     const total = queue.length;
     let done = 0;
@@ -575,9 +629,7 @@ class App {
         const item = queue.shift();
         try {
           if (!item.file) throw new Error('archivo no encontrado');
-          const notes = {};
-          let buffer = await engine.decode(item.file.blob, { cancelled: stopped, notes });
-          if (notes.rate) converted.set(notes.rate, (converted.get(notes.rate) || 0) + 1);
+          let buffer = await engine.decode(item.file.blob);
           if (item.track.mono && buffer.numberOfChannels > 1) buffer = engine.monoDownmix(buffer);
           buffers.set(item.track.id, buffer);
           item.track.duration = buffer.duration;
@@ -616,9 +668,22 @@ class App {
     song.click.solo = false;
     song.guide.solo = false;
     const player = engine.createPlayer(song, buffers, voices);
-    // De la más frecuente a la menos: { from: [[Hz, pistas], …], to: Hz de la salida } o null si todo se leyó directo.
-    const resampled = converted.size ? { from: Array.from(converted).sort((a, b) => b[1] - a[1]), to: engine.ctx.sampleRate } : null;
-    const entry = { song, player, failed, signature, bytes: player.memoryBytes(), resampled };
+    try {
+      if (normalizePitch(song.pitchSemitones)) {
+        await player.setPitch(song.pitchSemitones, {
+          signal: job?.pitchAbort?.signal,
+          onProgress: state => {
+            if (job?.onProgress) job.onProgress(state.done, state.total, `Tonalidad · ${state.label}`);
+          },
+        });
+      }
+      if (stopped()) throw new Cancelled();
+    } catch (error) {
+      player.dispose();
+      if (stopped() || error.name === 'AbortError') throw new Cancelled();
+      throw error;
+    }
+    const entry = { song, player, failed, signature, bytes: player.memoryBytes() };
     player.on('state', () => this.emit('transport', entry));
     player.on('loop', () => this.emit('transport', entry));
     player.on('ended', () => this.handleEnded(entry));
@@ -649,7 +714,6 @@ class App {
       // Lo que se preparaba para otra canción deja de importar: toda la máquina se dedica a esta.
       for (const job of Array.from(this.jobs.values())) if (job.id !== id) this.cancelJob(job);
       let entry = this.takeReady(id);
-      const waited = !entry;
       if (!entry) entry = await this.loadCold(song, token);
       if (!entry) return;
       // Un click de muestra que se eligió en el editor después de preparar la canción: se espera a que cargue.
@@ -664,7 +728,6 @@ class App {
       this.becomeCurrent(entry);
       this.endLoading();
       if (entry.failed.length) this.toast(`No se pudieron leer: ${entry.failed.join(', ')}`, 'error');
-      if (waited) this.explainConversion(entry);
       this.warmUp();
       if (autoplay) await this.play();
     } finally {
@@ -716,23 +779,6 @@ class App {
     return null;
   }
 
-  // Un WAV a la misma frecuencia que la salida de audio se lee directo (ver wav.js); a otra frecuencia lo remuestrea
-  // decodeAudioData, que tarda más y además convierte el audio. Cuando alguien tuvo que esperar por eso se explica,
-  // una sola vez por combinación de frecuencias y sesión. En el móvil no se avisa: allí la salida no se puede cambiar.
-  explainConversion(entry) {
-    const info = entry.resampled;
-    if (!info || MOBILE) return;
-    const [rate] = info.from[0];
-    const key = `${rate}>${info.to}`;
-    if (this.conversionNotes.has(key)) return;
-    this.conversionNotes.add(key);
-    this.toast(
-      `Las pistas de «${entry.song.title}» están a ${rate} Hz y la salida de audio de este equipo trabaja a ${info.to} Hz, así que se convierten al cargar y tarda más. Con la salida del equipo en ${rate} Hz (y abriendo Escena de nuevo) se leen directo.`,
-      'info',
-      14000
-    );
-  }
-
   endLoading() {
     if (!this.loading) return;
     this.loading = null;
@@ -744,6 +790,7 @@ class App {
     this.warm.delete(entry.song.id);
     const old = this.current;
     this.current = entry;
+    this.syncPadSong();
     this.loopMode = false;
     if (old && old !== entry) this.retire(old);
     store.setMeta('last', { songId: entry.song.id }).catch(() => {});
@@ -802,16 +849,19 @@ class App {
   warmBudget() {
     const override = Number(this.settings.warmBudgetMB);
     if (override > 0) return override * 1048576;
-    if (MOBILE) return 0;
+    if (MOBILE) return clamp((Number(navigator.deviceMemory) || 4) * 0.12, 0.25, 0.75) * GB;
     return clamp((Number(navigator.deviceMemory) || 4) * 0.45, 1, 4) * GB;
   }
 
   // Memoria que ocupará la canción una vez decodificada (0 si aún no se sabe cuánto duran sus pistas).
   estimateBytes(song) {
     const rate = this.engine.ctx.sampleRate || 48000;
-    let total = 0;
-    for (const track of song.tracks) total += (track.duration || 0) * rate * (track.mono ? 1 : 2) * 4;
-    return total;
+    const duration = Math.max(0, ...song.tracks.map(track => track.duration || 0));
+    // createPlayer pads each stem to the longest one. Include generated click/guide too.
+    let total = duration * rate * 8;
+    for (const track of song.tracks) total += duration * rate * (track.mono ? 1 : 2) * 4;
+    if (!duration) total = Math.max(32 * 1048576, song.tracks.reduce((sum, track) => sum + (track.bytes || 0) * 12, 0));
+    return total * (normalizePitch(song.pitchSemitones) ? 2 : 1);
   }
 
   // Las canciones que no se pueden descartar: la que sigue y la que se está cargando.
@@ -890,6 +940,7 @@ class App {
       song,
       signature: decodeSignature(song),
       cancelled: false,
+      pitchAbort: new AbortController(),
       claimed: foreground,
       decoders: foreground ? FOREGROUND_DECODERS : BACKGROUND_DECODERS,
       done: 0,
@@ -927,6 +978,7 @@ class App {
 
   cancelJob(job) {
     job.cancelled = true;
+    job.pitchAbort.abort();
     if (this.jobs.get(job.id) === job) this.jobs.delete(job.id);
     this.emit('warm');
   }
@@ -952,19 +1004,37 @@ class App {
       this.discardWarm();
       return;
     }
-    if (!this.current) return;
-    const id = this.nextSongId();
-    for (const job of Array.from(this.jobs.values())) if (!job.claimed && job.id !== id) this.cancelJob(job);
+    if (!this.current || this.loading || this.player.pitchBusy) return;
+    const candidates = [this.nextSongId()].filter(Boolean);
+    for (const job of Array.from(this.jobs.values())) if (!job.claimed && !candidates.includes(job.id)) this.cancelJob(job);
     this.enforceBudget();
-    if (!id) return;
-    const song = this.songs.get(id);
-    const ready = this.warm.get(id);
-    if (ready) {
-      if (this.isFresh(ready)) return;
-      this.dropWarm(id);
+    // One background song at a time, including on mobile, to protect the live audio.
+    if (Array.from(this.jobs.values()).some(job => !job.cancelled)) return;
+    for (const id of candidates) {
+      const song = this.songs.get(id);
+      const ready = this.warm.get(id);
+      if (ready) {
+        if (this.isFresh(ready)) continue;
+        this.dropWarm(id);
+      }
+      if (this.failed.get(id) === decodeSignature(song)) continue;
+      const need = this.estimateBytes(song);
+      if (id === candidates[0]) this.makeRoom(need);
+      let used = this.current.bytes;
+      for (const entry of this.warm.values()) used += entry.bytes;
+      if (used + need > this.warmBudget()) continue;
+      const job = this.startJob(song, { foreground: false });
+      job.promise.then(() => this.warmUp(), () => this.warmUp());
+      return;
     }
-    if (this.jobs.has(id) || this.failed.get(id) === decodeSignature(song)) return;
-    this.startJob(song, { foreground: false });
+  }
+
+  prepareNextSong() {
+    if (!this.nextSongId()) { this.toast('Añade una canción después de la actual en el setlist'); return; }
+    this.setSetting('preloadNext', true);
+    this.warmUp();
+    if (!this.isReady(this.nextSongId()) && !this.isWarming(this.nextSongId())) this.toast('La siguiente canción supera el margen de memoria disponible; se preparará al abrirla.');
+    this.emit('warm');
   }
 
   // Nombres anteriores de estas dos operaciones.
@@ -1045,6 +1115,34 @@ class App {
       await player.play({ countIn: this.settings.autoCountIn && player.state === 'stopped' });
     } catch (error) {
       this.toast(error.message || 'No se pudo activar el audio. Toca Reproducir de nuevo.', 'error');
+    }
+  }
+
+  async setPitch(value, enabled = {}) {
+    const entry = this.current;
+    if (!entry || entry.player.pitchBusy) return false;
+    if (entry.player.state === 'playing') {
+      this.toast('Pausa la canción antes de cambiar la tonalidad');
+      return false;
+    }
+    this.cancelAdvance();
+    this.discardWarm();
+    try {
+      await entry.player.setPitch(value, { enabled, onProgress: state => this.emit('pitch:progress', { ...state, entry }) });
+      entry.bytes = entry.player.memoryBytes();
+      this.syncPadSong();
+      await this.saveSong(entry.song, true).catch(() => this.toast('El tono se aplicó, pero no se pudo guardar el ajuste', 'error'));
+      if (this.current === entry) {
+        this.emit('song:refresh', entry);
+        this.toast(normalizePitch(value) ? `Tonalidad aplicada: ${pitchLabel(value)}` : 'Tonalidad original restaurada');
+      }
+      return true;
+    } catch (error) {
+      if (error.name !== 'AbortError') this.toast(error.message || 'No se pudo cambiar la tonalidad', 'error');
+      return false;
+    } finally {
+      if (this.current === entry) this.emit('pitch:progress', { entry, done: 0, total: 0 });
+      this.warmUp();
     }
   }
 

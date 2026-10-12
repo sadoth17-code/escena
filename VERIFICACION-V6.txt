@@ -1,0 +1,50 @@
+ESCENA V6 · VERIFICACIÓN DEL 12 DE OCTUBRE DE 2026
+
+Pruebas automatizadas realizadas sobre el proyecto:
+
+A. 11 pruebas de tonalidad con el módulo WASM real de Signalsmith Stretch.
+   Frecuencia de un seno de 440 Hz a −12, −5, −2, +2, +7 y +12 semitonos
+   (error inferior a 5 cents), duración exacta, originales intactos, bypass
+   exacto a cero, coherencia estéreo, transitorios y audio de 44,1 kHz/corto.
+   Comando: node --test tests/tonalidad.test.mjs
+
+B. 16 comprobaciones de integración con DOM emulado, IndexedDB emulado,
+   motor PCM de Web Audio y Workers Node que ejecutan el mismo DSP.
+   Comprueban precarga, cambio y retorno sin repetir decodificación, selección
+   de pistas, click/guía intactos, velocidad 1, bloqueo durante reproducción,
+   posición y bucle conservados, cancelación, errores, recarga con el tono
+   guardado, recuperación exacta del original, pad y liberación de sus voces,
+   metadatos, presupuesto de memoria, activación en instalaciones anteriores,
+   recorte de imagen a JPEG 480px y ensamblaje de reproductor/setlist/escenario.
+
+   Dependencias de pruebas, separadas de la aplicación:
+   npm install --prefix .test-runtime jsdom@26 web-audio-engine@0.13.4 fake-indexeddb@6 @napi-rs/canvas
+   Linux/macOS:
+   ESCENA_TEST_MODULES="$PWD/.test-runtime/node_modules" node tests/actualizacion-v6.test.mjs
+   Windows PowerShell:
+   $env:ESCENA_TEST_MODULES = "$PWD/.test-runtime/node_modules"
+   node tests/actualizacion-v6.test.mjs
+
+C. 41 pruebas existentes de sesión de audio, alineación, nube, solicitudes y
+   puente Electron completadas. La prueba de nube también verifica que portada
+   y semitonos sobreviven al intercambio de metadatos; usa un servicio simulado.
+   Comando:
+   node --test tests/audio-session.test.mjs tests/align.test.mjs tests/cloud.test.mjs tests/cloud-request.test.mjs tests/nube-proxy.test.mjs
+
+Se comprobó la sintaxis JavaScript y el inventario del Service Worker, incluida
+la distribución local del módulo WASM y su licencia MIT. El paquete no necesita
+descargar una librería de transposición de un CDN en tiempo de ejecución.
+
+LÍMITES
+No se consiguió ejecutar un navegador gráfico en este entorno. Las pruebas
+DOM no validan el aspecto visual ni la compatibilidad real del navegador.
+Los casos Playwright de tests/cambio-cancion.test.cjs se ajustaron a la nueva
+política de precarga, pero no se ejecutaron en esta revisión.
+No se probaron dispositivos físicos, reproducción escuchada, salida de una
+interfaz de audio, Electron empaquetado, Android, iOS ni conexión a la nube
+de producción. No se generaron instaladores ni se desplegó la web.
+La duración/frecuencia de señales sintéticas no mide la calidad subjetiva de
+una mezcla musical completa. Verifica tus multitracks en el equipo de uso.
+
+VERIFICACION.txt y las secciones históricas del README corresponden a v5;
+sus resultados anteriores no deben leerse como pruebas nuevas de v6.

@@ -326,7 +326,7 @@ export function openSettings() {
   const autoCount = createSwitch({ value: app.settings.autoCountIn, label: 'Pre-conteo automático', onChange: (value) => app.setSetting('autoCountIn', value) });
   const preload = createSwitch({
     value: app.settings.preloadNext,
-    label: 'Precargar la siguiente canción',
+    label: 'Precarga inteligente',
     onChange: (value) => {
       app.setSetting('preloadNext', value);
       app.warmUp();
@@ -340,7 +340,7 @@ export function openSettings() {
     field('Al terminar la canción', after.el),
     gap,
     settingRow('Pre-conteo automático', 'Cuenta antes de empezar desde el inicio', autoCount.el),
-    settingRow('Precargar la siguiente canción', 'Deja lista la siguiente (y conserva la anterior si cabe) para cambiar al instante y entrar sin cortes; usa más memoria', preload.el),
+    settingRow('Precarga inteligente', 'Prepara la siguiente y conserva la anterior cuando caben en memoria, también en móviles. Descargada significa guardada; Lista significa preparada para sonar.', preload.el),
     settingRow('Mantener pantalla encendida', 'Evita que el dispositivo se bloquee mientras tocas', awake.el)
   );
 

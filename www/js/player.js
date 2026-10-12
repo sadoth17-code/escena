@@ -1,6 +1,8 @@
 import { TempoMap } from './tempo.js';
 import { renderClickBuffer, renderGuideBuffer, renderCountIn } from './synth.js';
 import { faderToGain, clamp } from './util.js';
+import { normalizePitch, defaultPitchEnabled } from './pitch-utils.js';
+import { renderPitchBuffer } from './pitch-render.js';
 
 // Margen mínimo y máximo entre «ahora» y el instante en que arrancan todas las pistas a la vez.
 const START_LEAD_MIN = 0.07;
@@ -28,6 +30,7 @@ export class TrackNode {
     this.def = def;
     this.kind = kind;
     this.buffer = buffer;
+    this.originalBuffer = kind === 'file' ? buffer : null;
     this.silenced = false;
     this.input = this.ctx.createGain();
     this.level = this.ctx.createGain();
@@ -109,6 +112,7 @@ export class TrackNode {
       void error;
     }
     this.buffer = null;
+    this.originalBuffer = null;
   }
 }
 
@@ -135,6 +139,9 @@ export class SongPlayer {
     this.peakCache = null;
     this.disposed = false;
     this.playRequest = 0;
+    this.pitchSemitones = 0;
+    this.pitchBusy = false;
+    this.pitchController = null;
     this.refreshAll();
     this.refreshSolo();
   }
@@ -159,6 +166,63 @@ export class SongPlayer {
 
   allTracks() {
     return [...this.fileTracks, this.click, this.guide];
+  }
+
+  cancelPitch() {
+    this.pitchController?.abort();
+  }
+
+  async setPitch(value, { enabled = {}, signal, onProgress = () => {} } = {}) {
+    if (this.disposed) throw new DOMException('Canción descargada', 'AbortError');
+    if (this.state === 'playing') throw new Error('Pausa la canción antes de cambiar la tonalidad');
+    if (this.pitchBusy) throw new Error('Espera a que termine el cambio de tonalidad');
+    const semitones = normalizePitch(value);
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    const check = () => {
+      if (controller.signal.aborted || this.disposed) throw new DOMException('Cambio de tonalidad cancelado', 'AbortError');
+    };
+    this.pitchController = controller;
+    this.pitchBusy = true;
+    this.playRequest++; // Invalidate a pending engine.resume() before rendering.
+    signal?.addEventListener('abort', cancel, { once: true });
+    if (signal?.aborted) cancel();
+    this.emit('pitch');
+    try {
+      check();
+      const rendered = [];
+      for (let index = 0; index < this.fileTracks.length; index++) {
+        const track = this.fileTracks[index];
+        const previous = track.def.pitchEnabled ?? defaultPitchEnabled(track.def);
+        const include = typeof enabled[track.def.id] === 'boolean' ? enabled[track.def.id] : previous;
+        let buffer = track.originalBuffer;
+        const report = fraction => onProgress({ done: index + fraction, total: this.fileTracks.length, label: track.def.name });
+        report(0);
+        if (semitones && include) {
+          if (semitones === this.pitchSemitones && previous) buffer = track.buffer;
+          else buffer = await renderPitchBuffer(this.ctx, track.originalBuffer, semitones, { signal: controller.signal, onProgress: report });
+        }
+        check();
+        rendered.push({ track, buffer, include });
+        report(1);
+      }
+      check();
+      // Commit together: cancellation/errors must never leave tracks in different keys.
+      for (const { track, buffer, include } of rendered) {
+        track.buffer = buffer;
+        track.def.pitchEnabled = include;
+      }
+      this.pitchSemitones = semitones;
+      this.song.pitchSemitones = semitones;
+      this.peakCache = null;
+      this.wavePromise = null;
+      this.waveKey = '';
+    } finally {
+      signal?.removeEventListener('abort', cancel);
+      this.pitchController = null;
+      this.pitchBusy = false;
+      this.emit('pitch');
+    }
   }
 
   // Firmas de lo que se usó para dibujar cada búfer. Una canción que espera lista en memoria puede
@@ -483,9 +547,10 @@ export class SongPlayer {
   }
 
   async play({ countIn = false } = {}) {
+    if (this.pitchBusy) throw new Error('Espera a que termine el cambio de tonalidad');
     const request = ++this.playRequest;
     await this.engine.resume();
-    if (request !== this.playRequest || this.state === 'playing' || this.disposed) return;
+    if (request !== this.playRequest || this.state === 'playing' || this.disposed || this.pitchBusy) return;
     const ctx = this.ctx;
     let position = this.pausedAt;
     if (position >= this.duration - 0.02) position = this.loop ? this.loop.a : 0;
@@ -534,7 +599,7 @@ export class SongPlayer {
 
   // Arranque en un instante exacto del reloj (paso a la siguiente canción sin hueco).
   playAt(when) {
-    if (this.disposed) return;
+    if (this.disposed || this.pitchBusy) return;
     this.stopCountIn();
     const entries = this.prepareSources(0, null);
     const ctx = this.ctx;
@@ -580,6 +645,7 @@ export class SongPlayer {
   // Deja el reproductor como recién creado (en el inicio, sin repetición ni pre-conteo) para guardarlo
   // listo en memoria. A diferencia de stop(), no avisa a nadie: la canción ya no es la actual.
   rewind() {
+    this.cancelPitch();
     if (this.disposed) return;
     this.playRequest++;
     if (this.state === 'playing') this.halt(0);
@@ -819,12 +885,14 @@ export class SongPlayer {
     let total = 0;
     for (const track of this.allTracks()) {
       if (track.buffer) total += track.buffer.length * track.buffer.numberOfChannels * 4;
+      if (track.originalBuffer && track.originalBuffer !== track.buffer) total += track.originalBuffer.length * track.originalBuffer.numberOfChannels * 4;
     }
     return total;
   }
 
   dispose() {
     if (this.disposed) return;
+    this.cancelPitch();
     this.disposed = true;
     for (const run of [this.run, this.pending]) {
       if (!run) continue;

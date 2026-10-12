@@ -1,6 +1,8 @@
 import { uid, naturalCompare, normalizeName, PALETTE, FADER_DEFAULT } from './util.js';
 import { listZip, extractEntry } from './zip.js';
 import { normalizeTempoEntries } from './tempo.js';
+import { normalizePitch, defaultPitchEnabled } from './pitch-utils.js';
+import { normalizeCover } from './cover.js';
 
 export const AUDIO_PATTERN = /\.(wav|wave|mp3|m4a|aac|flac|ogg|oga|opus|aif|aiff|caf)$/i;
 const CLICK_PATTERN = /(^|[^a-z])(click|clic|metronomo|metro)([^a-z]|$)/;
@@ -223,6 +225,8 @@ export function normalizeSong(raw) {
   song.title = String(song.title || 'Sin título');
   song.artist = String(song.artist || '');
   song.key = String(song.key || '');
+  song.pitchSemitones = normalizePitch(song.pitchSemitones);
+  song.cover = normalizeCover(song.cover);
   song.offsetMs = Number(song.offsetMs) || 0;
   song.tempoMap = normalizeTempoEntries(song.tempoMap);
   song.markers = (song.markers || [])
@@ -245,6 +249,7 @@ export function normalizeSong(raw) {
     mute: Boolean(track.mute),
     solo: false,
     mono: Boolean(track.mono),
+    pitchEnabled: typeof track.pitchEnabled === 'boolean' ? track.pitchEnabled : defaultPitchEnabled(track),
     bytes: Number(track.bytes) || 0,
     duration: Number(track.duration) || 0,
   }));

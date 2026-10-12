@@ -1,0 +1,5 @@
+Upstream: https://github.com/Signalsmith-Audio/signalsmith-stretch
+Source: https://raw.githubusercontent.com/Signalsmith-Audio/signalsmith-stretch/main/web/release/SignalsmithStretch.mjs
+Retrieved: 2026-10-12 (UTC)
+Upstream SHA-256: 97530b11d5bc01015af4cde40d6aa55ff10c40aa1294ca4c8c5762027d517a46
+Adaptation: keep the complete generated WASM factory preceding function registerWorkletProcessor; export it as default for offline Web Worker use. No DSP or WASM bytecode changes. See LICENSE.txt.

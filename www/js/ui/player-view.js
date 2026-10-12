@@ -3,6 +3,10 @@ import { accentLevel } from '../tempo.js';
 import { app } from '../app.js';
 import { icon, iconButton, setText, setClass } from './kit.js';
 import { createTimeline } from './timeline.js';
+import { createPitchControl } from './pitch-control.js';
+import { songPitchText } from '../pitch-utils.js';
+import { createCover, updateCover } from './cover.js';
+import { createPadControl } from './pad-control.js';
 
 const JUMP_MODES = [
   { id: 'bar', label: 'Salto en compás' },
@@ -49,7 +53,9 @@ function hbar() {
 
 export function createPlayerView({ onEdit, onImport, onDemo }) {
   const timeline = createTimeline();
+  const pitch = createPitchControl();
   const title = h('h2', { class: 'pv-title' });
+  const cover = createCover(null, 'cover-player');
   const subtitle = h('p', { class: 'pv-sub' });
   const bpmValue = h('b');
   const sigValue = h('b');
@@ -64,7 +70,7 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
   const head = h(
     'div',
     { class: 'pv-head' },
-    h('div', { class: 'pv-titles' }, title, subtitle),
+    h('div', { class: 'pv-titles with-cover' }, cover, h('div', { class: 'pv-title-copy' }, title, subtitle)),
     pills,
     h('div', { class: 'pv-head-actions' }, iconButton({ name: 'edit', label: 'Editar canción', onClick: () => onEdit('general') }))
   );
@@ -129,6 +135,9 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
     } }, icon('target', 18), h('span', { class: 'tog-text' })),
   };
   const toggleBar = h('div', { class: 'toggles' }, Object.values(toggles));
+  const preloadText = h('span');
+  const preloadButton = h('button', { type: 'button', class: 'btn small', onClick: () => app.prepareNextSong() }, 'Preparar siguiente');
+  const preloadStatus = h('div', { class: 'preload-status' }, preloadText, preloadButton);
 
   const loadingText = h('span');
   const loadingBar = h('i');
@@ -142,8 +151,8 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
   const emptyActions = h('div', { class: 'empty-actions' }, importButton, demoButton);
   const empty = h('div', { class: 'pv-empty' }, h('div', { class: 'empty-art' }, icon('wave', 44)), emptyTitle, emptyText, emptyActions);
 
-  const live = h('div', { class: 'pv-live' }, head, readout, timeline.el, chips, noSections, transport, toggleBar, meters);
-  const el = h('div', { class: 'pv' }, live, empty, loading);
+  const live = h('div', { class: 'pv-live' }, head, pitch.el, readout, timeline.el, chips, noSections, transport, toggleBar, preloadStatus, meters);
+  const el = h('div', { class: 'pv' }, live, empty, createPadControl(), loading);
 
   let entry = null;
   let ledKey = '';
@@ -218,10 +227,12 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
     ledKey = '';
     chipKey = '';
     timeline.setEntry(next);
+    pitch.setEntry(next);
     if (next) {
       const song = next.song;
+      updateCover(cover, song);
       title.textContent = song.title;
-      subtitle.textContent = [song.artist, song.key ? `Tono ${song.key}` : ''].filter(Boolean).join(' · ') || ' ';
+      subtitle.textContent = [song.artist, songPitchText(song)].filter(Boolean).join(' · ') || ' ';
       memValue.textContent = fmtBytes(next.player.memoryBytes());
       timeline.measure();
     }
@@ -232,13 +243,16 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
   const refresh = () => {
     if (!entry) return;
     title.textContent = entry.song.title;
-    subtitle.textContent = [entry.song.artist, entry.song.key ? `Tono ${entry.song.key}` : ''].filter(Boolean).join(' · ') || ' ';
+    updateCover(cover, entry.song);
+    subtitle.textContent = [entry.song.artist, songPitchText(entry.song)].filter(Boolean).join(' · ') || ' ';
+    pitch.setEntry(entry);
     memValue.textContent = fmtBytes(entry.player.memoryBytes());
     chipKey = '';
     timeline.invalidate();
   };
 
   const syncStatic = (snap) => {
+    pitch.frame();
     const player = entry.player;
     const output = app.settings.output;
     const labels = outputLabels({ ...output, mode: app.engine.effectiveMode });
@@ -267,6 +281,14 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
     setText(toggles.jump.querySelector('.tog-text'), mode.label);
     buttons.prevSong.disabled = !app.previousSongId();
     const nextId = app.nextSongId();
+    preloadStatus.hidden = !nextId;
+    const nextSong = nextId && app.songs.get(nextId);
+    const ready = nextId && app.isReady(nextId);
+    const warming = nextId && app.isWarming(nextId);
+    setText(preloadText, nextSong ? `${nextSong.title} · ${ready ? 'Lista para sonar' : warming ? 'Preparando audio…' : 'Descargada · pendiente de preparar'}` : '');
+    preloadButton.hidden = Boolean(ready || warming);
+    preloadButton.disabled = Boolean(player.pitchBusy);
+    buttons.play.disabled = Boolean(player.pitchBusy);
     buttons.nextSong.disabled = !nextId;
     // Punto verde: la siguiente canción ya está en memoria y entra al instante. Ámbar: se está preparando.
     setClass(buttons.nextSong, 'ready', Boolean(nextId) && app.isReady(nextId));

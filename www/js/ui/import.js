@@ -5,6 +5,7 @@ import { gatherAudio, groupItems, draftTracks, AUDIO_PATTERN } from '../library.
 import { buildDemo } from '../demo.js';
 import { tempoIsShaky, tempoWarning } from '../tempo.js';
 import { icon, openModal, field } from './kit.js';
+import { createCoverPicker } from './cover.js';
 
 const MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
@@ -30,6 +31,9 @@ export function openImport({ files = null, onEdit } = {}) {
     skipped: [],
     groups: [],
     title: '',
+    cover: '',
+    coverBusy: false,
+    key: '',
     drafts: [],
     tempo: { bpm: 120, num: 4, den: 4, offsetMs: 0 },
     tempoTouched: false,
@@ -265,6 +269,8 @@ export function openImport({ files = null, onEdit } = {}) {
     }
     setBody(
       field('Título de la canción', title),
+      createCoverPicker({ value: state.cover, onChange: value => { state.cover = value; }, onBusy: value => { state.coverBusy = value; } }),
+      field('Tonalidad original', h('input', { type: 'text', class: 'input', value: state.key, maxlength: 12, placeholder: 'Ej. C, Am, Re menor', 'aria-label': 'Tonalidad original', onInput: event => { state.key = event.target.value; } })),
       h('div', { class: 'tempo-grid' }, field('BPM', bpm), field('Compás', h('div', { class: 'sig' }, num, h('span', { text: '/' }), den)), field('Inicio del compás 1 (ms)', offset)),
       detectEl,
       h('h3', { class: 'sub', text: 'Pistas' }),
@@ -301,7 +307,8 @@ export function openImport({ files = null, onEdit } = {}) {
   };
 
   const runImport = async () => {
-    const groups = state.stage === 'single' ? [{ title: state.title, drafts: state.drafts, tempo: state.tempo, keep: true }] : state.groups.filter((group) => group.keep).map((group) => ({ title: group.title, drafts: draftTracks(group.items), tempo: null, keep: true }));
+    if (state.coverBusy) { app.toast('Espera a que termine de prepararse la portada'); return; }
+    const groups = state.stage === 'single' ? [{ title: state.title, drafts: state.drafts, tempo: state.tempo, cover: state.cover, key: state.key, keep: true }] : state.groups.filter((group) => group.keep).map((group) => ({ title: group.title, drafts: draftTracks(group.items), tempo: null, keep: true }));
     const chosen = groups.filter((group) => group.drafts.some((draft) => draft.keep));
     if (!chosen.length) {
       app.toast('Elige al menos una pista', 'error');
@@ -326,7 +333,7 @@ export function openImport({ files = null, onEdit } = {}) {
           group.title,
           group.drafts,
           (done, total, name) => setProgress(done, total, `${prefix}${name}`),
-          { tempo }
+          { tempo, cover: group.cover, key: group.key }
         );
         songs.push(song);
       }

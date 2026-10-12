@@ -84,8 +84,19 @@ export const store = {
     return readRequest(name, (s) => s.get(key));
   },
   async getMany(name, keys) {
-    const rows = await Promise.all(keys.map((key) => this.get(name, key)));
-    return rows;
+    if (!keys.length) return [];
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(name, 'readonly');
+      const source = tx.objectStore(name);
+      const rows = new Array(keys.length);
+      keys.forEach((key, index) => {
+        const request = source.get(key);
+        request.onsuccess = () => { rows[index] = request.result; };
+      });
+      tx.oncomplete = () => resolve(rows);
+      tx.onerror = tx.onabort = () => reject(tx.error || new Error('No se pudieron leer las pistas locales'));
+    });
   },
   put(name, value) {
     return writeRequest(name, (s) => s.put(value));
