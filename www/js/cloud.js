@@ -19,6 +19,17 @@ function normalizeUrl(value) {
   if (url.pathname !== '/') throw new Error('La dirección debe terminar en el dominio, sin rutas');
   return url.origin;
 }
+// Comprueba, parte por parte, que un archivo local es idéntico al publicado.
+// Se detiene en la primera diferencia, así una pista modificada se descarta pronto.
+async function sameAudio(blob, published, signal) {
+  if (!blob || !published || published.size !== blob.size || !Array.isArray(published.hashes) || published.hashes.length !== Math.ceil(blob.size / CHUNK)) return false;
+  for (let part = 0; part < published.hashes.length; part++) {
+    if (signal?.aborted) throw stopError();
+    const bytes = await blob.slice(part * CHUNK, Math.min(blob.size, (part + 1) * CHUNK)).arrayBuffer();
+    if (await hash(bytes) !== published.hashes[part]) return false;
+  }
+  return true;
+}
 function validateDownload(m) {
   const id = /^[a-zA-Z0-9_-]{8,80}$/;
   if (m?.schema !== 1 || m.chunkSize !== CHUNK || !id.test(m.id) || !id.test(m.revision) || !Array.isArray(m.files) || !m.files.length || m.files.length > 128 || !Array.isArray(m.song?.tracks) || m.song.tracks.length !== m.files.length) throw new Error('La canción en la nube tiene un formato no compatible');
@@ -104,6 +115,7 @@ class Cloud {
     return this.onlineAccess || ((navigator.onLine === false || this.offline || verifying) && this.offlineLeaseActive);
   }
   get canPublish() { return this.canAccess && this.onlineAccess && this.role === 'master' && this.permissions.publish; }
+  get canDelete() { return this.canPublish && this.identity?.role === 'owner'; }
   get canManageUsers() { return this.canAccess && this.onlineAccess && this.identity?.role === 'owner' && this.permissions.manageUsers; }
   applyAccess(profile, verified = false) {
     this.accessProfile = profile;
@@ -380,8 +392,11 @@ class Cloud {
       }
       if (!job.files.length || job.files.length > 128) throw new Error('La canción debe tener de 1 a 128 pistas');
       if (linked) {
-        const remote = await this.request(`/v1/songs/${job.songId}`);
+        const remote = await this.request(`/v1/songs/${job.songId}`).catch(error => {
+          throw error.status === 404 ? new Error('Esta canción ya no está en la nube. Súbela como nueva canción.') : error;
+        });
         if (remote.revision !== job.expectedRevision) throw new Error('La nube tiene otra versión. Actualiza tu copia o usa «Subir como nueva».');
+        job.base = await this.reuseBase(remote);
       }
       await store.put('cloudTransfers', job);
     }
@@ -396,6 +411,16 @@ class Cloud {
         if (file.done) continue;
         const local = await store.get('files', file.localFileId);
         if (!local?.blob || local.blob.size !== file.size) throw new Error('Cambió el archivo local. Descarta la subida pendiente y vuelve a subir la canción.');
+        // Si la pista es idéntica a la que ya está publicada, no se vuelve a subir.
+        const base = job.base?.files?.[file.id];
+        if (base && !file.compared && !file.uploadId && !file.parts.length) {
+          this.notify(job, `Comprobando ${file.name}…`);
+          if (await sameAudio(local.blob, base, signal)) {
+            file.done = true; file.hashes = base.hashes.slice(); file.reuse = base.revision;
+            await store.put('cloudTransfers', job); continue;
+          }
+          file.compared = true; await store.put('cloudTransfers', job);
+        }
         const data = { songId: job.songId, revision: job.revision, trackId: file.id, size: file.size };
         if (!file.uploadId) {
           const start = await this.request('/v1/uploads/start', { method: 'POST', data, signal });
@@ -414,15 +439,74 @@ class Cloud {
         await this.request('/v1/uploads/complete', { method: 'POST', data: { ...data, uploadId: file.uploadId, parts: file.parts }, signal });
         file.done = true; await store.put('cloudTransfers', job);
       }
-      const manifest = { schema: 1, chunkSize: CHUNK, id: job.songId, revision: job.revision, song: job.song, files: job.files.map(({ id, name, type, size, hashes }) => ({ id, name, type, size, hashes })) };
+      const manifest = { schema: 1, chunkSize: CHUNK, id: job.songId, revision: job.revision, song: job.song, files: job.files.map(({ id, name, type, size, hashes, reuse }) => ({ id, name, type, size, hashes, ...(reuse ? { revision: reuse } : {}) })) };
       this.notify(job, 'Publicando canción…');
       await this.request(`/v1/songs/${job.songId}/publish`, { method: 'POST', data: { manifest, expectedRevision: job.expectedRevision }, signal });
       const current = app.songs.get(job.localId);
       if (current) { current.cloud = { endpoint: this.api, id: job.songId, revision: job.revision, syncedHash: savedHash }; await app.saveSong(current); }
       await store.remove('cloudTransfers', job.id);
-      app.toast('Canción guardada en tu nube');
+      const reused = job.files.filter(file => file.reuse).length;
+      app.toast(reused ? `Cambios publicados. ${reused === 1 ? 'Una pista sin cambios no se volvió' : `${reused} pistas sin cambios no se volvieron`} a subir.` : 'Canción guardada en tu nube');
       await this.refresh();
     });
+  }
+  // Elimina una canción de la nube, con todo su audio. Solo el propietario.
+  deleteSong(remote) { return this.exclusive(() => this.performDelete(remote)); }
+  async performDelete(remote) {
+    await this.init();
+    if (!this.connected) throw new Error('Conecta tu nube antes de eliminar canciones');
+    this.requireMaster();
+    if (this.identity?.role !== 'owner') throw new Error('Solo el propietario puede eliminar canciones de la nube.');
+    if (navigator.onLine === false) throw new Error('Sin internet. Conéctate para eliminar canciones de la nube.');
+    const pending = await this.pending();
+    if (pending.some(job => (job.kind === 'upload' ? job.songId : job.manifest?.id) === remote.id)) throw new Error('Esta canción tiene una transferencia pendiente. Termínala o descártala antes de eliminarla.');
+    try {
+      await this.request(`/v1/songs/${encodeURIComponent(remote.id)}/delete`, { method: 'POST', data: { revision: remote.revision } });
+    } catch (error) {
+      // Un Worker anterior no conoce esta ruta: se explica qué hacer en vez de mostrar un error técnico.
+      if (error.status === 404 && /Ruta no encontrada/i.test(error.message || '')) throw new Error('Tu nube todavía no admite eliminar canciones. Publica primero el Worker nuevo (server/worker.mjs) y vuelve a intentarlo.');
+      // Si ya la eliminaron desde otro equipo, la lista se pone al día para que la tarjeta desaparezca.
+      if (error.status === 404) await this.refresh().catch(() => {});
+      throw error;
+    }
+    // La lista deja de mostrarla ya, aunque falle la consulta siguiente.
+    this.catalog = this.catalog.filter(song => song.id !== remote.id);
+    await store.setMeta(`cloudCatalog:${this.api}`, this.catalog).catch(() => {});
+    // Las copias de este equipo dejan de apuntar a una canción que ya no existe.
+    for (const song of app.songList()) {
+      if (song.cloud?.endpoint === this.api && song.cloud.id === remote.id) { delete song.cloud; await app.saveSong(song); }
+    }
+    this.emit();
+    app.toast(`«${remote.title}» se eliminó de la nube. Los equipos que ya la descargaron conservan su copia.`);
+    await this.refresh().catch(() => {});
+  }
+  // Pistas de la versión publicada cuyo audio puede reutilizarse al publicar.
+  // Solo si el Worker lo anuncia; con un Worker anterior se sube todo, como antes.
+  async reuseBase(remote) {
+    try {
+      const ping = await this.request('/v1/ping', { maxAttempts: 1 });
+      if (ping?.features?.reuseAudio !== true) return null;
+      validateDownload(remote);
+      const files = {};
+      for (const file of remote.files) files[file.id] = { size: file.size, hashes: file.hashes, revision: /^[a-zA-Z0-9_-]{8,80}$/.test(file.revision || '') ? file.revision : remote.revision };
+      return { revision: remote.revision, files };
+    } catch { return null; }
+  }
+  // Una actualización suele cambiar solo portada, secciones o ajustes. Las pistas
+  // de esta copia cuyo audio coincide con el publicado se conservan en vez de bajarse otra vez.
+  async reuseLocalAudio(job, signal) {
+    const tracks = new Map((app.songs.get(job.localId)?.tracks || []).map(track => [track.id, track.fileId]));
+    for (const file of job.manifest.files) {
+      if (signal.aborted) throw stopError();
+      const fileId = tracks.get(file.id);
+      if (!fileId || job.completed[file.id] || (job.counts[file.id] || 0) > 0) continue;
+      const saved = await store.get('files', fileId);
+      if (saved?.blob?.size !== file.size) continue;
+      this.notify(job, `Comprobando ${file.name}…`);
+      if (!await sameAudio(saved.blob, file, signal)) continue;
+      job.completed[file.id] = fileId; job.counts[file.id] = file.hashes.length;
+      await store.put('cloudTransfers', job);
+    }
   }
   download(id, resumeJob = null) { return this.exclusive(() => this.performDownload(id, resumeJob)); }
   async performDownload(id, resumeJob = null) {
@@ -446,6 +530,7 @@ class Cloud {
     if (app.current?.song.id === job.localId && app.player?.state === 'playing') throw new Error('Detén la canción antes de actualizarla');
     return this.run(job, async signal => {
       const manifest = job.manifest;
+      await this.reuseLocalAudio(job, signal);
       const left = manifest.files.reduce((sum, file) => sum + Math.max(0, file.size - (job.counts[file.id] || 0) * CHUNK), 0);
       const largest = Math.max(...manifest.files.filter(file => !job.completed[file.id]).map(file => file.size), 0);
       const usage = await store.usage();
@@ -495,7 +580,9 @@ class Cloud {
       if (savedOld && job.localStartHash && await cloudSongHash(savedOld) !== job.localStartHash) throw new Error('La copia local cambió durante la descarga. Se conservaron tus cambios. Descarta esta descarga y pulsa «Actualizar» de nuevo cuando hayas guardado lo que necesites.');
       const song = normalizeSong({ ...manifest.song, id: job.localId, tracks: manifest.song.tracks.map(track => ({ ...track, fileId: job.completed[track.id] })), cloud: { endpoint: this.api, id: manifest.id, revision: manifest.revision } });
       song.cloud.syncedHash = await cloudSongHash(song);
-      await store.commitCloudSong(serializableSong(song), old?.tracks.map(track => track.fileId) || [], job.id);
+      // Los archivos que se conservaron forman parte de la copia nueva: no se quitan.
+      const kept = new Set(Object.values(job.completed));
+      await store.commitCloudSong(serializableSong(song), (old?.tracks.map(track => track.fileId) || []).filter(fileId => !kept.has(fileId)), job.id);
       if (app.current?.song.id === song.id) app.unloadCurrent();
       // Lo que hubiera decodificado de la versión anterior ya no sirve.
       app.invalidateSong(song.id);

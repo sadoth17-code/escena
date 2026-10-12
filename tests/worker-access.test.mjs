@@ -312,6 +312,156 @@ test('discard preserves complete audio when publication interleaves after its ca
   assert.ok(await f.bucket.head(key));
 });
 
+// Sube una pista pequeña por el protocolo real (start, part, complete).
+async function uploadTrack(f, key, { songId, revision, trackId }, bytes) {
+  const data = { songId, revision, trackId, size: bytes.length };
+  const started = await (await f.request('/v1/uploads/start', key, { method: 'POST', body: data })).json();
+  const query = new URLSearchParams({ ...data, uploadId: started.uploadId, part: '1' });
+  const part = await (await f.request(`/v1/uploads/part?${query}`, key, { method: 'PUT', body: bytes, headers: { 'x-chunk-sha256': await digest(bytes) } })).json();
+  assert.equal((await f.request('/v1/uploads/complete', key, { method: 'POST', body: { ...data, uploadId: started.uploadId, parts: [part] } })).status, 200);
+  return await digest(bytes);
+}
+
+const trackEntry = (id, bytes, hash, extra = {}) => ({ id, name: `${id}.wav`, type: 'audio/wav', size: bytes.length, hashes: [hash], ...extra });
+const songManifest = (songId, revision, files, title = 'Canción con versiones') => ({ schema: 1, id: songId, revision, chunkSize: CHUNK,
+  song: { title, tracks: files.map(file => ({ id: file.id })), tempoMap: [{ bpm: 120 }], markers: [] }, files });
+const readAudio = async (f, key, songId, revision, trackId) => {
+  const response = await f.request(`/v1/audio/${songId}/${revision}/${trackId}`, key, { headers: { range: 'bytes=0-3' } });
+  return { status: response.status, bytes: response.status === 206 ? new Uint8Array(await response.arrayBuffer()) : null };
+};
+
+test('ping advertises that the Worker can reuse audio that did not change', async () => {
+  const f = fixture();
+  assert.equal((await (await f.request('/v1/ping')).json()).features.reuseAudio, true);
+});
+
+test('a new revision reuses unchanged audio; only the changed track is stored again and everyone reads the current revision address', async () => {
+  const f = fixture(), editor = await f.create('Editor', 'editor'), player = await f.create();
+  const songId = 'song0010', one = Uint8Array.of(1, 2, 3, 4), two = Uint8Array.of(5, 6, 7, 8), twoNew = Uint8Array.of(9, 10, 11, 12);
+  const hashOne = await uploadTrack(f, editor.key, { songId, revision: 'revision10', trackId: 'trackone' }, one);
+  const hashTwo = await uploadTrack(f, editor.key, { songId, revision: 'revision10', trackId: 'tracktwo' }, two);
+  // La primera versión no declara files[].revision: así se publicaron las canciones anteriores.
+  const first = songManifest(songId, 'revision10', [trackEntry('trackone', one, hashOne), trackEntry('tracktwo', two, hashTwo)]);
+  assert.equal((await f.request(`/v1/songs/${songId}/publish`, editor.key, { method: 'POST', body: { manifest: first, expectedRevision: null } })).status, 200);
+
+  // Segunda versión: cambia una pista; la otra apunta al archivo ya subido.
+  const hashTwoNew = await uploadTrack(f, editor.key, { songId, revision: 'revision11', trackId: 'tracktwo' }, twoNew);
+  const second = songManifest(songId, 'revision11', [trackEntry('trackone', one, hashOne, { revision: 'revision10' }), trackEntry('tracktwo', twoNew, hashTwoNew)], 'Portada nueva');
+  assert.equal((await f.request(`/v1/songs/${songId}/publish`, editor.key, { method: 'POST', body: { manifest: second, expectedRevision: 'revision10' } })).status, 200);
+  assert.equal(f.bucket.rows.has(`audio/${songId}/revision11/trackone`), false, 'the unchanged track is not stored again');
+  assert.equal((await (await f.request('/v1/songs', player.key)).json()).songs[0].revision, 'revision11');
+
+  for (const key of [player.key, editor.key, MASTER]) {
+    assert.deepEqual((await readAudio(f, key, songId, 'revision11', 'trackone')).bytes, one);
+    assert.deepEqual((await readAudio(f, key, songId, 'revision11', 'tracktwo')).bytes, twoNew);
+  }
+  // La revisión anterior sigue sin estar disponible para músicos y editores.
+  for (const key of [player.key, editor.key]) assert.equal((await readAudio(f, key, songId, 'revision10', 'trackone')).status, 403);
+  assert.deepEqual((await readAudio(f, MASTER, songId, 'revision10', 'tracktwo')).bytes, two);
+
+  // Tercera versión: ambas pistas se reutilizan, cada una desde donde se guardó.
+  const third = songManifest(songId, 'revision12', [trackEntry('trackone', one, hashOne, { revision: 'revision10' }), trackEntry('tracktwo', twoNew, hashTwoNew, { revision: 'revision11' })], 'Secciones nuevas');
+  assert.equal((await f.request(`/v1/songs/${songId}/publish`, editor.key, { method: 'POST', body: { manifest: third, expectedRevision: 'revision11' } })).status, 200);
+  assert.equal([...f.bucket.rows.keys()].some(key => key.startsWith(`audio/${songId}/revision12/`)), false);
+  for (const key of [player.key, editor.key, MASTER]) {
+    assert.deepEqual((await readAudio(f, key, songId, 'revision12', 'trackone')).bytes, one);
+    assert.deepEqual((await readAudio(f, key, songId, 'revision12', 'tracktwo')).bytes, twoNew);
+  }
+  assert.equal((await readAudio(f, player.key, songId, 'revision11', 'tracktwo')).status, 403);
+  assert.equal((await readAudio(f, player.key, songId, 'revision12', 'unlisted1')).status, 403);
+});
+
+test('audio can only be reused when it matches what is already published', async () => {
+  const f = fixture(), editor = await f.create('Editor', 'editor');
+  const songId = 'song0011', one = Uint8Array.of(1, 2, 3, 4), other = Uint8Array.of(8, 8, 8, 8);
+  const hashOne = await uploadTrack(f, editor.key, { songId, revision: 'revision20', trackId: 'trackone' }, one);
+  const hashOther = await digest(other);
+  const publish = (manifest, expectedRevision) => f.request(`/v1/songs/${songId}/publish`, editor.key, { method: 'POST', body: { manifest, expectedRevision } });
+  // No hay versión publicada de la que reutilizar.
+  assert.equal((await publish(songManifest(songId, 'revision21', [trackEntry('trackone', one, hashOne, { revision: 'revision20' })]), null)).status, 409);
+  assert.equal((await publish(songManifest(songId, 'revision20', [trackEntry('trackone', one, hashOne)]), null)).status, 200);
+
+  const published = async () => (await (await f.request(`/v1/songs/${songId}`, MASTER)).json()).revision;
+  const attempts = [
+    ['same track with different checks', [trackEntry('trackone', one, hashOther, { revision: 'revision20' })], 409],
+    ['same track with a different size', [{ ...trackEntry('trackone', one, hashOne, { revision: 'revision20' }), size: 5 }], 409],
+    ['a track that was not published', [trackEntry('tracknew1', one, hashOne, { revision: 'revision20' })], 409],
+    ['an unrelated storage folder', [trackEntry('trackone', one, hashOne, { revision: 'revision99' })], 409],
+    ['a malformed revision', [trackEntry('trackone', one, hashOne, { revision: '../revision20' })], 400],
+    ['a non-text revision', [trackEntry('trackone', one, hashOne, { revision: 12345678 })], 400],
+  ];
+  await f.bucket.put(`audio/${songId}/revision99/trackone`, one); // existe, pero la versión publicada no lo usa
+  for (const [label, files, status] of attempts) {
+    const response = await publish(songManifest(songId, 'revision22', files), 'revision20');
+    assert.equal(response.status, status, label);
+    assert.equal(await published(), 'revision20', `${label} leaves the published version untouched`);
+  }
+  // La nube sigue sirviendo la versión anterior mientras tanto.
+  assert.deepEqual((await readAudio(f, MASTER, songId, 'revision20', 'trackone')).bytes, one);
+  // El archivo ya existente, en cambio, sí se puede reutilizar si todo coincide.
+  assert.equal((await publish(songManifest(songId, 'revision22', [trackEntry('trackone', one, hashOne, { revision: 'revision20' })]), 'revision20')).status, 200);
+});
+
+test('only the owner can delete a song; a stale revision deletes nothing; all of its audio goes and no other song is touched', async () => {
+  const f = fixture(), editor = await f.create('Editor', 'editor'), player = await f.create();
+  const one = Uint8Array.of(1, 2, 3, 4), two = Uint8Array.of(5, 6, 7, 8), twoNew = Uint8Array.of(9, 10, 11, 12), other = Uint8Array.of(21, 22, 23, 24);
+  const publish = (songId, manifest, expectedRevision) => f.request(`/v1/songs/${songId}/publish`, editor.key, { method: 'POST', body: { manifest, expectedRevision } });
+  // Canción X con dos versiones (la segunda reutiliza audio de la primera) y un archivo de una subida abandonada.
+  const hashOne = await uploadTrack(f, editor.key, { songId: 'song0020', revision: 'revision30', trackId: 'trackone' }, one);
+  const hashTwo = await uploadTrack(f, editor.key, { songId: 'song0020', revision: 'revision30', trackId: 'tracktwo' }, two);
+  assert.equal((await publish('song0020', songManifest('song0020', 'revision30', [trackEntry('trackone', one, hashOne), trackEntry('tracktwo', two, hashTwo)]), null)).status, 200);
+  const hashTwoNew = await uploadTrack(f, editor.key, { songId: 'song0020', revision: 'revision31', trackId: 'tracktwo' }, twoNew);
+  assert.equal((await publish('song0020', songManifest('song0020', 'revision31', [trackEntry('trackone', one, hashOne, { revision: 'revision30' }), trackEntry('tracktwo', twoNew, hashTwoNew)]), 'revision30')).status, 200);
+  await f.bucket.put('audio/song0020/revision99/abandonado', one);
+  // Canción Y, cuyo identificador empieza igual que el de X.
+  const hashOther = await uploadTrack(f, editor.key, { songId: 'song00200', revision: 'revision40', trackId: 'trackone' }, other);
+  assert.equal((await publish('song00200', songManifest('song00200', 'revision40', [trackEntry('trackone', other, hashOther)]), null)).status, 200);
+
+  const remove = (songId, key, revision) => f.request(`/v1/songs/${songId}/delete`, key, { method: 'POST', body: { revision } });
+  const audioKeys = prefix => [...f.bucket.rows.keys()].filter(key => key.startsWith(prefix));
+  const before = [...f.bucket.rows.keys()].sort();
+
+  // Ni editores ni músicos ni la clave compartida antigua pueden eliminar.
+  f.env.ALLOW_LEGACY_PLAYER = 'true';
+  for (const key of [editor.key, player.key, LEGACY]) assert.equal((await remove('song0020', key, 'revision31')).status, 403);
+  // Una versión que ya no es la publicada, o una revisión inválida, no elimina nada.
+  assert.equal((await remove('song0020', MASTER, 'revision30')).status, 409);
+  assert.equal((await remove('song0020', MASTER, '../revision31')).status, 400);
+  assert.equal((await f.request('/v1/songs/song0020/delete', MASTER, { method: 'POST', body: {} })).status, 400);
+  assert.equal((await f.request('/v1/songs/song0020/delete', MASTER)).status, 404, 'only POST is routed');
+  assert.deepEqual([...f.bucket.rows.keys()].sort(), before);
+
+  const removed = await remove('song0020', MASTER, 'revision31');
+  assert.equal(removed.status, 200);
+  assert.deepEqual(await removed.json(), { deleted: true });
+  assert.equal(f.bucket.rows.has('catalog/song0020.json'), false);
+  assert.deepEqual(audioKeys('audio/song0020/'), [], 'every revision of the song is gone, including abandoned files');
+  // La otra canción sigue intacta, con su catálogo, su audio y su lectura.
+  assert.deepEqual(audioKeys('audio/song00200/'), ['audio/song00200/revision40/trackone']);
+  assert.equal((await (await f.request('/v1/songs', player.key)).json()).songs.map(song => song.id).join(), 'song00200');
+  assert.deepEqual((await readAudio(f, player.key, 'song00200', 'revision40', 'trackone')).bytes, other);
+  assert.equal((await f.request('/v1/songs/song0020', MASTER)).status, 404);
+  assert.equal((await readAudio(f, MASTER, 'song0020', 'revision31', 'trackone')).status, 404);
+  assert.equal((await readAudio(f, player.key, 'song0020', 'revision31', 'trackone')).status, 403);
+  // Ya no existe: repetirlo avisa en vez de fingir éxito.
+  assert.equal((await remove('song0020', MASTER, 'revision31')).status, 404);
+  assert.equal((await remove('no/valido', MASTER, 'revision31')).status, 404);
+});
+
+test('deleting a song keeps working when it has more than one page of audio files', async () => {
+  const f = fixture();
+  const songId = 'song0050', revision = 'revision50';
+  const manifest = songManifest(songId, revision, [trackEntry('trackone', Uint8Array.of(1), await digest(Uint8Array.of(1)))]);
+  await f.bucket.put(`audio/${songId}/${revision}/trackone`, Uint8Array.of(1));
+  assert.equal((await f.request(`/v1/songs/${songId}/publish`, MASTER, { method: 'POST', body: { manifest, expectedRevision: null } })).status, 200);
+  for (let index = 0; index < 2300; index++) await f.bucket.put(`audio/${songId}/old${String(index).padStart(5, '0')}/trackone`, Uint8Array.of(1));
+  await f.bucket.put('audio/song0051/revision50/trackone', Uint8Array.of(7)); // otra canción
+  const response = await f.request(`/v1/songs/${songId}/delete`, MASTER, { method: 'POST', body: { revision } });
+  assert.equal(response.status, 200);
+  assert.deepEqual([...f.bucket.rows.keys()].filter(key => key.startsWith(`audio/${songId}/`)), []);
+  assert.ok(f.bucket.rows.has('audio/song0051/revision50/trackone'));
+});
+
 test('CORS, no-store and preflight remain enforced for successful and denied requests', async () => {
   const f = fixture();
   const allowed = await f.request('/v1/ping', MASTER, { headers: { origin: 'https://app.example.test' } });

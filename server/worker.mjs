@@ -232,6 +232,25 @@ async function manageUsers(request, env, principal, path, method) {
   return json({ user: publicUser(next), ...(credential ? { key: credential.key } : {}) });
 }
 
+// Carpeta (revisión) donde está guardado el audio de una pista publicada.
+// Una pista que no cambió entre versiones conserva el archivo ya subido: su
+// entrada del manifiesto indica la revisión original en files[].revision.
+const audioRevision = (manifest, file) => file?.revision || manifest.revision;
+
+// Elimina todo el audio de una canción, de todas sus revisiones. El prefijo termina
+// en «/», así que nunca alcanza a otra canción cuyo identificador empiece igual.
+async function sweepAudio(bucket, songId) {
+  const prefix = `audio/${songId}/`;
+  let removed = 0;
+  for (let round = 0; round < 200; round++) {
+    const page = await bucket.list({ prefix, limit: 1000 });
+    if (!page.objects.length) return removed;
+    await bucket.delete(page.objects.map(object => object.key));
+    removed += page.objects.length;
+  }
+  fail('No se pudieron eliminar todos los archivos de la canción. Vuelve a intentarlo.', 503);
+}
+
 function validateManifest(m, songId) {
 
   if (m?.schema !== 1 || m.id !== songId || !ID.test(m.revision || '') || m.chunkSize !== CHUNK) fail('Versión de canción inválida');
@@ -260,6 +279,8 @@ function validateManifest(m, songId) {
 
     if (typeof file.name !== 'string' || file.name.length > 300 || typeof file.type !== 'string' || file.type.length > 100) fail('Datos de pista inválidos');
 
+    if (file.revision !== undefined && (typeof file.revision !== 'string' || !ID.test(file.revision))) fail('Versión de pista inválida');
+
   }
 
   if (s.tracks.some(track => !ids.has(track.id)) || new Set(s.tracks.map(t => t.id)).size !== ids.size) fail('Referencias de pistas inválidas');
@@ -278,7 +299,7 @@ async function route(request, env, principal) {
     const serverTime = Date.now();
     const { id, name, role, offlineHours } = principal;
     return json({ ok: true, schema: 1, chunkSize: CHUNK, role: role === 'player' ? 'player' : 'master', accessVersion: 2,
-      user: { id, name, role, offlineHours }, permissions: { publish: role !== 'player', manageUsers: role === 'owner' },
+      user: { id, name, role, offlineHours }, permissions: { publish: role !== 'player', manageUsers: role === 'owner' }, features: { reuseAudio: true },
       serverTime, offlineUntil: serverTime + offlineHours * 3600000 });
   }
 
@@ -383,6 +404,25 @@ async function route(request, env, principal) {
 
   }
 
+  const deleteMatch = path.match(/^\/v1\/songs\/([a-zA-Z0-9_-]+)\/delete$/);
+
+  if (deleteMatch && method === 'POST') {
+    // Borrar una canción es irreversible y afecta a todos los equipos: solo el propietario.
+    if (principal.role !== 'owner') fail('Solo el propietario puede eliminar canciones de la nube', 403);
+    const id = validId(deleteMatch[1]), data = await bodyJson(request), catalogKey = `catalog/${id}.json`;
+    const current = await bucket.get(catalogKey);
+    if (!current) fail('La canción ya no está disponible', 404);
+    // La revisión que el propietario vio en su lista: si otra persona publicó mientras tanto, no se borra.
+    if ((await current.json()).revision !== validId(data?.revision)) fail('La canción cambió en la nube. Actualiza la lista antes de eliminarla.', 409);
+    // Primero el audio y al final el catálogo: si algo falla a medias, la canción sigue en la
+    // lista y se puede volver a intentar. La segunda barrida recoge lo que una subida en curso
+    // haya terminado mientras tanto.
+    await sweepAudio(bucket, id);
+    await bucket.delete(catalogKey);
+    await sweepAudio(bucket, id);
+    return json({ deleted: true });
+  }
+
   const publishMatch = path.match(/^\/v1\/songs\/([a-zA-Z0-9_-]+)\/publish$/);
 
   if (publishMatch && method === 'POST') {
@@ -399,7 +439,19 @@ async function route(request, env, principal) {
 
     for (const file of m.files) {
 
-      const head = await bucket.head(`audio/${id}/${m.revision}/${file.id}`);
+      const location = audioRevision(m, file);
+
+      if (location !== m.revision) {
+        // Solo se puede reutilizar el audio que la versión publicada ya usa, con
+        // el mismo tamaño y las mismas comprobaciones. Así no se enlaza audio
+        // ajeno, a medio subir ni de otra pista.
+        const before = Array.isArray(previous?.files) ? previous.files.find(item => item.id === file.id) : null;
+        const same = before && audioRevision(previous, before) === location && before.size === file.size
+          && Array.isArray(before.hashes) && before.hashes.length === file.hashes.length && before.hashes.every((hash, index) => hash === file.hashes[index]);
+        if (!same) fail(`La pista «${file.name}» ya no coincide con la versión publicada. Vuelve a publicar la canción.`, 409);
+      }
+
+      const head = await bucket.head(`audio/${id}/${location}/${file.id}`);
 
       if (!head || head.size !== file.size) fail(`La pista «${file.name}» está incompleta`, 409);
 
@@ -429,15 +481,22 @@ async function route(request, env, principal) {
 
     const [songId, revision, trackId] = audioMatch.slice(1).map(validId);
 
-    const { key } = paths({ songId, revision, trackId });
+    let published = null;
+    try {
+      const catalog = await bucket.get(`catalog/${songId}.json`);
+      published = catalog ? await catalog.json() : null;
+    } catch { published = null; }
+    const entry = published?.revision === revision && Array.isArray(published.files) ? published.files.find(file => file.id === trackId) : null;
 
     if (principal.role !== 'owner') {
-      const catalog = await bucket.get(`catalog/${songId}.json`);
-      const published = catalog ? await catalog.json() : null;
-      if (!published || published.revision !== revision || !Array.isArray(published.files) || !published.files.some(file => file.id === trackId) || !Array.isArray(published.song?.tracks) || !published.song.tracks.some(track => track.id === trackId)) {
+      if (!published || published.revision !== revision || !entry || !Array.isArray(published.song?.tracks) || !published.song.tracks.some(track => track.id === trackId)) {
         fail('El audio no pertenece a la versión publicada de la canción', 403);
       }
     }
+
+    // La dirección que usan las apps es la de la versión publicada. Si la pista
+    // no cambió, el archivo sigue guardado en la revisión donde se subió.
+    const { key } = paths({ songId, revision: entry ? audioRevision(published, entry) : revision, trackId });
 
     const range = request.headers.get('range')?.match(/^bytes=(\d+)-(\d+)$/);
 

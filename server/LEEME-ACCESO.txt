@@ -81,6 +81,31 @@ canción y revisión; esa coordinación no se implementó en esta actualización
 La firma Android expuesta anteriormente necesita una migración aparte; no
 cambies su clave a ciegas porque afecta a las actualizaciones instaladas.
 
+11. PUBLICAR Y ACTUALIZAR SOLO LO QUE CAMBIÓ
+Al publicar una nueva versión de una canción, la app compara cada pista con la
+que ya está en la nube. Si el audio es idéntico no se vuelve a subir: la versión
+nueva apunta al archivo que ya existe. Cambiar solo la portada, las secciones,
+el tempo o los ajustes se publica en segundos. Una pista modificada se sube completa.
+En los demás equipos, Actualizar conserva las pistas idénticas y baja solo las nuevas.
+Para activarlo publica de nuevo el Worker (server/worker.mjs) y después la app.
+Con un Worker anterior la app sigue subiendo todo, como antes. Las apps ya instaladas
+siguen descargando estas canciones, pero necesitan la versión nueva para reutilizar audio.
+El audio de una versión anterior puede seguir en uso por la versión publicada.
+Cualquier limpieza futura de revisiones antiguas debe conservar las que el
+manifiesto publicado todavía usa (files[].revision).
+
+12. ELIMINAR UNA CANCIÓN DE LA NUBE
+En Setlist, Nube, cada tarjeta tiene el botón Eliminar de la nube (solo propietario).
+Quitar del dispositivo solo borra la copia de ese equipo; este botón borra la canción
+del servicio, con todo su audio. La confirmación muestra título, pistas, tamaño y fecha
+de publicación para no borrar la tarjeta equivocada cuando hay dos con el mismo nombre.
+Si alguien publicó una versión nueva mientras tenías la lista abierta, no se borra
+nada y se pide actualizar la lista. No hay papelera: borrar es definitivo.
+Los equipos que ya descargaron la canción conservan su copia. En tu equipo la copia
+queda sin enlace con la nube y puedes subirla otra vez como canción nueva.
+Para usarlo hay que publicar el Worker nuevo y después la app. Si la app llega antes,
+el botón avisa de que falta publicar el Worker nuevo y no borra nada.
+
 VALIDACIÓN LOCAL
 Ejecuta npm test para las regresiones de audio, servidor y cliente.
 Las pruebas gráficas usan npm run test:browser y requieren Playwright y un

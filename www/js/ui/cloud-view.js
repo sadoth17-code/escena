@@ -6,6 +6,10 @@ import { access } from '../access.js';
 import { icon, openModal, field, confirmDialog } from './kit.js';
 import { openUsers } from './users.js';
 
+const fmtDate = value => {
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toLocaleString('es', { dateStyle: 'short', timeStyle: 'short' }) : '';
+};
 const report = error => app.toast(error.message || 'No se pudo completar la operación', 'error');
 const act = fn => async () => { try { await fn(); } catch (error) { report(error); } };
 const button = (text, fn, kind = '', disabled = false) => h('button', { type: 'button', class: `btn small ${kind}`, disabled, onClick: act(fn) }, text);
@@ -48,7 +52,7 @@ export async function openCloudUpload() {
   const updateMessage = () => {
     const song = app.songs.get(select.value);
     const linked = song?.cloud?.endpoint === cloud.api;
-    message.textContent = linked && !asNew.checked ? 'Publica tus cambios como nueva versión: portada, secciones, pistas y ajustes. En los otros equipos, pulsa «Actualizar lista» y luego «Actualizar» en esta canción.' : 'Se creará una canción en tu biblioteca privada. Incluye portada, pistas de audio, mezcla, tonalidad, tempo, click, guía y secciones.';
+    message.textContent = linked && !asNew.checked ? 'Publica tus cambios como nueva versión: portada, secciones, pistas y ajustes. Solo se suben las pistas de audio que cambiaron. En los otros equipos, pulsa «Actualizar lista» y luego «Actualizar» en esta canción.' : 'Se creará una canción en tu biblioteca privada. Incluye portada, pistas de audio, mezcla, tonalidad, tempo, click, guía y secciones.';
   };
   select.addEventListener('change', updateMessage); asNew.addEventListener('change', updateMessage); updateMessage();
   const modal = openModal({ title: 'Subir canción a mi nube', body: h('div', {}, field('Canción del dispositivo', select),
@@ -131,15 +135,20 @@ export function createCloudView() {
         actions.append(button('Abrir', () => app.loadSong(local.id)), button('Al setlist', () => app.addToSetlist([local.id])));
         if (cloud.canPublish && access.canEdit) actions.append(button('Publicar cambios', () => cloud.upload(local), '', !!cloud.active || pendingSong || offline));
         if (update) actions.append(button('Actualizar', async () => {
-          if (await confirmDialog({ title: 'Actualizar canción', message: dirty ? 'Esta copia tiene cambios locales sin publicar. La actualización sustituye portada, secciones, pistas y ajustes. Publica o exporta primero los cambios que quieras conservar.' : 'Se aplicará la nueva portada, secciones, pistas y ajustes publicados por el maestro. Se conserva la identidad de la canción en tus setlists.', confirm: 'Actualizar' })) await cloud.download(remote.id);
+          if (await confirmDialog({ title: 'Actualizar canción', message: dirty ? 'Esta copia tiene cambios locales sin publicar. La actualización sustituye portada, secciones, pistas y ajustes. Publica o exporta primero los cambios que quieras conservar.' : 'Se aplicará la nueva portada, secciones, pistas y ajustes publicados por el maestro. Las pistas que no cambiaron se conservan sin volver a descargarse. Se conserva la identidad de la canción en tus setlists.', confirm: 'Actualizar' })) await cloud.download(remote.id);
         }, 'primary', !!cloud.active || !cloud.connected || pendingSong || offline));
         if (access.canEdit) actions.append(button('Quitar del dispositivo', async () => {
           if (await confirmDialog({ title: 'Liberar espacio', message: `Se quitará «${local.title}» de este dispositivo y sus setlists. La copia de la nube se conserva para descargarla de nuevo.`, confirm: 'Quitar', danger: true })) await app.deleteSong(local.id);
         }, '', !!cloud.active));
       } else actions.append(button('Descargar', () => cloud.download(remote.id), 'primary', !!cloud.active || !cloud.connected || pendingSong || offline));
+      if (cloud.canDelete && access.canEdit) actions.append(button('Eliminar de la nube', async () => {
+        const published = fmtDate(remote.updatedAt);
+        const ok = await confirmDialog({ title: 'Eliminar de la nube', message: `Se eliminará «${remote.title}» (${remote.tracks} pistas, ${fmtBytes(remote.size)}${published ? `, publicada el ${published}` : ''}) de tu nube, con todo su audio. Nadie podrá descargarla de nuevo. Los equipos que ya la descargaron conservan su copia. Esta acción no se puede deshacer.`, confirm: 'Eliminar de la nube', danger: true });
+        if (ok) await cloud.deleteSong(remote);
+      }, 'danger', !!cloud.active || pendingSong || offline));
       songs.append(h('article', { class: 'cloud-card' }, h('b', { text: remote.title }),
         remote.artist ? h('span', { class: 'field-hint', text: remote.artist }) : null,
-        h('span', { class: 'field-hint', text: `${remote.tracks} pistas · ${fmtBytes(remote.size)}${remote.bpm ? ` · ${Number(Number(remote.bpm).toFixed(2))} BPM` : ''}` }),
+        h('span', { class: 'field-hint', text: `${remote.tracks} pistas · ${fmtBytes(remote.size)}${remote.bpm ? ` · ${Number(Number(remote.bpm).toFixed(2))} BPM` : ''}${fmtDate(remote.updatedAt) ? ` · ${fmtDate(remote.updatedAt)}` : ''}` }),
         h('span', { class: `cloud-badge ${local ? 'downloaded' : ''}`, text: state }), actions));
     }
   };

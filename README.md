@@ -80,6 +80,62 @@ el mismo bucket, bajo `auth/`. La clave compartida `ESCENA_PLAYER_KEY` queda
 rechazada por defecto; activarla temporalmente con `ALLOW_LEGACY_PLAYER=true`
 conserva un acceso compartido que no puede bloquearse por persona.
 
+### Publicar y actualizar solo lo que cambió
+
+Publicar una canción ya enlazada con la nube y «Actualizar» en otro equipo dejan de mover
+todo el audio cuando solo cambian la portada, las secciones, el tempo o los ajustes.
+
+- **Al publicar**, la app compara cada pista local con la publicada, parte por parte
+  (SHA-256 de bloques de 8 MiB). Si es idéntica no se sube: la versión nueva apunta al
+  archivo que ya existe mediante `files[].revision` en el manifiesto. Una pista modificada,
+  aunque sea un solo byte o un cambio de tamaño, se sube completa. La comprobación lee las
+  pistas locales (unos segundos por GB); subirlas de nuevo tardaba minutos.
+- **Al actualizar**, la copia local conserva las pistas cuyo audio coincide con el publicado y
+  descarga solo las distintas. Los archivos conservados nunca se borran al aplicar la versión.
+- **El Worker valida la reutilización**: solo acepta audio que la versión publicada ya usa, con
+  el mismo tamaño y las mismas comprobaciones, y comprueba que el archivo exista. Las apps usan
+  siempre la dirección de la versión publicada; el Worker la resuelve al archivo guardado.
+  Músicos y editores siguen sin poder pedir revisiones anteriores.
+- **Compatibilidad**: el Worker anuncia `features.reuseAudio` en `/v1/ping`. Con un Worker
+  anterior la app sube todo, como antes. Las apps ya instaladas siguen descargando estas
+  canciones (sin reutilizar lo que tienen); para publicar o actualizar de forma incremental
+  necesitan la versión nueva de la app. Hay que publicar primero el Worker y después la app.
+- **Limpieza futura**: el audio de una revisión anterior puede seguir en uso por la versión
+  publicada. Un proceso que elimine revisiones antiguas debe conservar toda revisión
+  referenciada en `files[].revision` del manifiesto publicado.
+
+Pruebas: `tests/cloud-reuse.test.mjs` ejecuta la app real contra el Worker real con R2 en
+memoria (propietario y músico): publicación sin cambios de audio, un solo byte cambiado en
+la segunda parte de una pista, cambio de tamaño, actualización del músico, Worker anterior
+y reanudación tras una interrupción. `tests/cloud-delete.test.mjs` cubre el borrado de
+canciones de la nube (propietario, editores y músicos, versión desactualizada, transferencias
+pendientes, copias de otros equipos, un Worker anterior y una canción ya eliminada desde otro
+equipo).
+
+### Eliminar una canción de la nube
+
+Cada tarjeta de **Setlist → Nube** tiene el botón **Eliminar de la nube** para el propietario.
+«Quitar del dispositivo» solo borra la copia de ese equipo; este botón borra la canción del
+servicio, con todo su audio.
+
+- La confirmación muestra título, número de pistas, tamaño y fecha de publicación, para no
+  borrar la tarjeta equivocada cuando hay dos con el mismo nombre. La fecha también aparece
+  en la tarjeta.
+- Solo el propietario puede hacerlo (el Worker lo exige en `POST /v1/songs/{id}/delete`). La
+  petición lleva la revisión que el propietario vio en su lista: si alguien publicó una versión
+  nueva mientras tanto, no se borra nada y se pide actualizar la lista.
+- El Worker borra primero todo el audio de esa canción (todas sus revisiones, también archivos
+  de subidas abandonadas) y al final su entrada del catálogo; si algo falla a medias, la
+  canción sigue en la lista y se puede repetir. Nunca toca otra canción.
+- En el equipo del propietario la copia local se conserva, ya sin enlace con la nube: puede
+  subirse de nuevo como canción nueva. Los equipos que ya descargaron la canción conservan su
+  copia; un editor que intente publicar cambios sobre ella verá que debe subirla como nueva.
+  Un músico no puede quitar copias de su equipo en esta versión.
+- Si la app se actualiza antes que el Worker, el botón avisa de que hay que publicar primero
+  el Worker nuevo y no borra nada. Si la canción ya la eliminaron desde otro equipo, la lista
+  se pone al día y la tarjeta desaparece.
+- No hay papelera: borrar es definitivo.
+
 La nube debe mantener desactivadas **todas** las vías de lectura pública de R2,
 incluyendo r2.dev y los dominios públicos directos. El Worker no puede impedir
 que se evite su autorización si otro dominio entrega los archivos sin ella.
