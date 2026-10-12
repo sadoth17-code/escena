@@ -138,7 +138,9 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
   const toggleBar = h('div', { class: 'toggles' }, Object.values(toggles));
   const preloadText = h('span');
   const preloadButton = h('button', { type: 'button', class: 'btn small', onClick: () => app.prepareNextSong() }, 'Preparar siguiente');
-  const prepareListButton = h('button', { type: 'button', class: 'btn small', onClick: () => app.prepareSetlist().catch(error => app.toast(error.message, 'error')) }, icon('check', 16), 'Preparar setlist');
+  const prepareListButton = h('button', { type: 'button', class: 'btn small', onClick: async () => {
+    try { await app.prepareSetlist(); } catch (error) { app.toast(error.message, 'error'); }
+  } }, icon('check', 16), 'Preparar setlist');
   const listStatus = h('span', { class: 'setlist-preparation', role: 'status' });
   const preloadStatus = h('div', { class: 'preload-status' }, h('div', { class: 'preparation-copy' }, preloadText, listStatus), preloadButton, prepareListButton);
 
@@ -178,11 +180,12 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
   const renderLoading = (state) => {
     lastLoading = state;
     loading.hidden = !state;
+    loading.classList.toggle('is-switching', Boolean(state && entry));
+    updateVisibility();
     if (!state) return;
-    loadingTitle.textContent = `Cargando «${state.song.title}»`;
+    loadingTitle.textContent = `Preparando «${state.song.title}»`;
     loadingText.textContent = state.label ? `${state.done} de ${state.total} · ${state.label}` : 'Preparando…';
     loadingBar.style.width = `${state.total ? (state.done / state.total) * 100 : 5}%`;
-    updateVisibility();
   };
 
   const updateVisibility = () => {
@@ -242,6 +245,7 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
     }
     renderEmpty();
     updateVisibility();
+    loading.classList.toggle('is-switching', Boolean(lastLoading && entry));
   };
 
   const refresh = () => {

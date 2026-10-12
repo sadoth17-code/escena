@@ -1,5 +1,122 @@
 # Escena · edición v6: tonalidad, precarga, portadas y pad
 
+## Corrección sobre v1.0.20: cambio de canciones y revisión de acceso
+
+La versión v1.0.20 prepara automáticamente solo los temas cercanos; el resto del
+setlist depende de pulsar «Preparar setlist». Además, un cambio a una canción ya
+lista cancela la preparación de los otros temas y una carga pendiente vacía el
+reproductor. Esta corrección prepara el setlist activo al iniciar la sesión y
+conserva las tareas útiles durante los cambios a canciones listas.
+
+- Con «Precarga inteligente» activada, se prepara automáticamente el setlist
+  completo hasta el límite de memoria del dispositivo. La siguiente y la anterior
+  mantienen prioridad. No se incrementa automáticamente el presupuesto de RAM.
+- Cambiar a cualquier canción que muestre «Lista para sonar» reutiliza el audio
+  preparado. En móviles, cambiar de tema conserva la pestaña que se estaba usando;
+  la primera selección puede abrir el reproductor.
+- Si una canción todavía necesita preparación y cabe junto con la actual, la
+  pantalla y los controles actuales siguen disponibles, con avance compacto.
+  La canción actual se sustituye cuando la nueva está lista. Las selecciones
+  posteriores cancelan la intención anterior; volver a la actual también cancela
+  un cambio pendiente.
+- Si la memoria no alcanza para ambas, sigue siendo necesario liberar audio y
+  mostrar el progreso de preparación. «Descargada» significa archivo local, no
+  audio preparado en RAM. Reiniciar la app requiere preparar los archivos locales
+  de nuevo; no implica descargarlos otra vez.
+- El setlist muestra cuántas canciones están listas y permite reactivar la
+  preparación desde la propia lista. Se corrige también el botón «Preparar
+  setlist», que intentaba usar `.catch()` sobre un resultado sin promesa.
+
+Para aplicar el paquete de cambios, copia sus archivos conservando las rutas
+desde la raíz de tu proyecto v1.0.20. El flujo de construcción existente genera
+la web y los instaladores cuando publicas el código. Un instalador ya descargado
+necesita actualizarse; este paquete contiene código, no un APK, EXE ni DMG nuevo.
+No es necesario borrar canciones ni volver a subirlas a la nube.
+
+Validación de esta corrección: `npm test` incluye 16 regresiones del controlador
+de audio; `node tests/browser-song-switch.cjs` aprueba seis escenarios de interfaz
+con WAV sintéticos decodificados por Chromium. Este último necesita Playwright
+y un navegador instalado; admite `ESCENA_CHROMIUM` para indicar su ejecutable.
+Se comprobó la ausencia de relectura/decodificación en cambios a temas preparados,
+la conservación de pantalla y la última selección. No se comprobó el sonido en
+equipos físicos ni se compilaron instaladores.
+
+### Control de usuarios integrado
+
+El Worker adjunto se recuperó del Markdown y ahora forma parte de
+`server/worker.mjs`. El acceso requiere una clave aprobada antes de inicializar
+el reproductor. La clave `ESCENA_KEY` existente identifica al propietario; el
+panel **Setlist → Nube → Usuarios** crea claves individuales para músicos y
+editores. No hay registro público. Cada clave individual tiene 256 bits aleatorios
+y el servidor guarda únicamente su hash SHA-256.
+
+- El propietario aprueba personas, cambia sus permisos, bloquea/habilita cuentas
+  y renueva claves. Una clave nueva se muestra solo en su ventana de creación o
+  renovación y se copia únicamente mediante un clic.
+- Un editor reproduce, modifica canciones y publica cambios; no administra
+  usuarios. Un músico reproduce y mezcla, sin editar las canciones ni publicar.
+  Los controles locales de edición existentes se conservan.
+- El Worker comprueba la cuenta activa y sus permisos en cada solicitud. Un
+  bloqueo o una renovación rechaza nuevas solicitudes con la clave anterior.
+  Las revisiones de usuarios usan versión e If-Match para evitar cambios perdidos.
+- La app comprueba el acceso al iniciar, al recuperar conexión/visibilidad y cada
+  minuto. Una respuesta 401 cierra la sesión y detiene el reproductor; el plazo de
+  la autorización sin conexión se comprueba cada segundo. Los controles de
+  teclado/MIDI no pueden reactivar una sesión bloqueada por el cliente normal.
+- El propietario puede conceder 0, 24, 72 o 168 horas sin internet; el valor
+  inicial es 24 horas. La autorización se vincula al servicio y a la clave
+  verificada en ese equipo. Caídas transitorias de red conservan la reproducción
+  durante el permiso vigente. Administrar usuarios, publicar y descargar nuevas
+  canciones requieren una verificación online reciente.
+- El ping de acceso tiene un límite de diez segundos y un intento. El catálogo
+  se actualiza en segundo plano para no retrasar el inicio de la app; las
+  transferencias mantienen sus reintentos anteriores.
+
+**Aplicación:** publica primero el nuevo Worker conservando `ESCENA_BUCKET`,
+`ESCENA_KEY` y `ALLOWED_ORIGINS`; luego publica el código de la app y actualiza
+los instaladores. Consulta `server/LEEME-ACCESO.txt`. No hay que crear otra base
+de datos ni mover/republicar canciones. Los registros de usuarios se guardan en
+el mismo bucket, bajo `auth/`. La clave compartida `ESCENA_PLAYER_KEY` queda
+rechazada por defecto; activarla temporalmente con `ALLOW_LEGACY_PLAYER=true`
+conserva un acceso compartido que no puede bloquearse por persona.
+
+La nube debe mantener desactivadas **todas** las vías de lectura pública de R2,
+incluyendo r2.dev y los dominios públicos directos. El Worker no puede impedir
+que se evite su autorización si otro dominio entrega los archivos sin ella.
+Referencia: https://developers.cloudflare.com/r2/buckets/public-buckets/
+
+Músicos y editores solo reciben pistas de la revisión publicada actual. Si una
+canción se publica mientras otro equipo descarga una revisión anterior, ese
+equipo debe descartar la descarga pendiente y descargar la versión actual.
+Descartar una subida aborta las partes pendientes, pero conserva los objetos
+completos privados para evitar borrar una canción publicada simultáneamente.
+La limpieza de esos archivos abandonados requiere un proceso posterior que
+coordine las revisiones. No se ha resuelto completar simultáneamente dos subidas
+con la misma ruta de canción, revisión y pista; debe evitarse esa operación.
+
+**Límites:** todas las personas aprobadas comparten el catálogo; no hay permisos
+por canción, correo, verificación de identidad ni protección frente a compartir
+una clave. La caché de audio permanece en IndexedDB sin cifrado adicional y la
+autorización offline se comprueba en el cliente, no mediante DRM. Un equipo
+manipulado puede saltarse controles locales; una copia antigua o un audio ya
+extraído no se puede borrar a distancia. La revocación de un equipo sin internet
+solo se conoce al reconectarse o al vencer el permiso en esta versión de la app.
+Permitir reproducción implica entregar audio: no se puede impedir completamente
+su extracción o grabación por una persona autorizada.
+
+El repositorio y el código que ejecuta el cliente siguen siendo públicos.
+Proteger servicios y archivos limita el acceso de una copia no autorizada, pero
+no impide reproducir el diseño o inspeccionar/copiar el cliente distribuido.
+La firma privada de Android incluida en el repositorio anterior debe tratarse
+como expuesta y requiere un plan de sustitución que contemple las instalaciones
+existentes. Esta actualización no cambia ni distribuye archivos de firma.
+
+Las pruebas locales de servidor, cliente e interfaz usan cuentas sintéticas,
+R2 en memoria y Chromium. No se modificó ni se probó el servicio de producción,
+no se comprobó el sonido en equipos físicos y no se compilaron instaladores.
+
+## Notas de la edición base v6
+
 Actualización del 12 de octubre de 2026, integrada sobre el ZIP v5 suministrado.
 Lee **[LEEME-V6.txt](LEEME-V6.txt)** para instalarla y usar los controles nuevos.
 

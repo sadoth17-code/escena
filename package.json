@@ -7,6 +7,8 @@
   "license": "UNLICENSED",
   "private": true,
   "scripts": {
+    "test": "node scripts/test-song-switch.mjs && node --test tests/worker-access.test.mjs tests/client-access.test.mjs",
+    "test:browser": "node tests/browser-song-switch.cjs && node tests/browser-users.cjs && node tests/browser-access.cjs",
     "start": "electron .",
     "dist:win": "electron-builder --win --publish never"
   },

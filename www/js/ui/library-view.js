@@ -71,7 +71,11 @@ export function createLibraryView({ onImport, onEdit }) {
     render();
   } }, icon('swap', 16), 'Ordenar');
   const countText = h('span', { class: 'lib-count' });
-  const setlistBar = h('div', { class: 'lib-bar column' }, h('div', { class: 'lib-select' }, select, addList, renameList, deleteList), h('div', { class: 'lib-sub' }, countText, orderButton));
+  const preparationText = h('span', { class: 'setlist-preparation', role: 'status' });
+  const prepareButton = h('button', { type: 'button', class: 'btn small', onClick: async () => {
+    try { await app.prepareSetlist(); } catch (error) { app.toast(error.message, 'error'); }
+  } }, icon('check', 16), 'Preparar setlist');
+  const setlistBar = h('div', { class: 'lib-bar column' }, h('div', { class: 'lib-select' }, select, addList, renameList, deleteList), h('div', { class: 'lib-sub' }, countText, orderButton), h('div', { class: 'lib-sub' }, preparationText, prepareButton));
 
   const search = h('input', {
     type: 'search',
@@ -170,6 +174,7 @@ export function createLibraryView({ onImport, onEdit }) {
             app.songs.size ? h('button', { type: 'button', class: 'btn', onClick: openLibrary }, 'Abrir biblioteca') : null
           )
         );
+        updateStates();
         return;
       }
       songs.forEach((song, index) => list.append(rowFor(song, { index, inSetlist: true })));
@@ -188,6 +193,9 @@ export function createLibraryView({ onImport, onEdit }) {
   };
 
   const updateStates = () => {
+    const prepared = app.preparationStatus();
+    preparationText.textContent = `${prepared.ready}/${prepared.total} listas para sonar${prepared.preparing ? ' · Preparando…' : prepared.limited ? ' · Memoria disponible ocupada' : ''}`;
+    prepareButton.disabled = !prepared.total || prepared.complete || Boolean(prepared.preparing) || Boolean(app.player?.pitchBusy);
     const currentId = app.current ? app.current.song.id : null;
     const loadingId = app.loading ? app.loading.song.id : null;
     const playing = app.player && app.player.state === 'playing';

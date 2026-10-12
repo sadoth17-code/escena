@@ -17,6 +17,7 @@ import { access } from './access.js';
 import { cloud } from './cloud.js';
 import { openAccess } from './ui/access.js';
 import { installOffline, offline } from './offline.js';
+import { ensureApprovedAccess } from './ui/session.js';
 
 function showFatal(error) {
   const root = document.getElementById('app');
@@ -34,11 +35,12 @@ function showFatal(error) {
 
 async function boot() {
   try {
-    await app.init();
     await access.init();
     await cloud.init();
+    await ensureApprovedAccess();
     access.setCloudRole(cloud.role);
-    cloud.on('change', () => access.setCloudRole(cloud.role));
+    app.sessionAllowed = true;
+    await app.init();
   } catch (error) {
     console.error(error);
     showFatal(error);
@@ -86,6 +88,53 @@ async function boot() {
   shell.panels.mix.append(mixer.el);
   document.body.append(stage.el);
 
+  let checkingAccess = false;
+  let returningToAccess = false;
+  const requireAccess = async (reason = '') => {
+    if (returningToAccess) return;
+    returningToAccess = true;
+    app.sessionAllowed = false;
+    access.setCloudRole('player');
+    app.loadToken++;
+    app.wantedId = null;
+    app.cancelAdvance();
+    for (const job of Array.from(app.jobs.values())) app.cancelJob(job);
+    app.discardWarm();
+    app.unloadCurrent();
+    app.endLoading();
+    app.pad?.stop();
+    if (stage.open) stage.close();
+    try {
+      await ensureApprovedAccess(reason);
+      access.setCloudRole(cloud.role);
+      app.sessionAllowed = true;
+      app.warmUp();
+    } finally { returningToAccess = false; }
+  };
+  cloud.on('change', () => {
+    access.setCloudRole(cloud.canAccess ? cloud.role : 'player');
+    if (!cloud.canAccess) requireAccess().catch(error => app.toast(error.message, 'error'));
+  });
+  cloud.on('access:revoked', (reason) => requireAccess(typeof reason === 'string' ? reason : 'Tu acceso ya no está autorizado.').catch(error => app.toast(error.message, 'error')));
+  const checkAccess = async () => {
+    if (checkingAccess || returningToAccess) return;
+    checkingAccess = true;
+    try {
+      await cloud.checkAccess();
+      if (!cloud.canAccess) await requireAccess('Renueva tu autorización para entrar.');
+    } catch (error) {
+      if (!cloud.canAccess) await requireAccess(error.message);
+    } finally { checkingAccess = false; }
+  };
+  // A blocked connected account stops at the next protected request or check.
+  setInterval(checkAccess, 60000);
+  setInterval(() => {
+    if (!returningToAccess && !cloud.canAccess) requireAccess('La autorización sin conexión venció. Conéctate a internet para renovarla.').catch(error => app.toast(error.message, 'error'));
+  }, 1000);
+  window.addEventListener('online', checkAccess);
+  window.addEventListener('offline', checkAccess);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) checkAccess(); });
+
   const dropzone = h('div', { class: 'dropzone', hidden: true }, h('div', { class: 'dropzone-card' }, h('b', { text: 'Suelta aquí tus pistas' }), h('span', { text: 'Archivos de audio, una carpeta o un ZIP' })));
   document.body.append(dropzone);
   let dragDepth = 0;
@@ -115,7 +164,7 @@ async function boot() {
 
   app.on('toast', showToast);
   app.on('loading', (state) => {
-    if (state && !shell.desktop && shell.tab === 'lib') shell.setTab('play');
+    if (state && !state.switching && !shell.desktop && shell.tab === 'lib') shell.setTab('play');
     stage.setLoading(state);
     // Si la carga falló y no queda ninguna canción, el modo escenario no tiene nada que mostrar.
     if (!state && !app.current && stage.open) stage.close();
@@ -125,7 +174,7 @@ async function boot() {
     playerView.setEntry(entry);
     mixer.setEntry(entry);
     stage.setEntry(entry);
-    if (!shell.desktop && shell.tab === 'lib') shell.setTab('play');
+    if (!entry.switching && !shell.desktop && shell.tab === 'lib') shell.setTab('play');
   });
   app.on('song:unloaded', (info) => {
     shell.now.textContent = '';

@@ -75,7 +75,7 @@ class App {
     // decodificaciones en curso, ambas por id de canción.
     this.warm = new Map();
     this.jobs = new Map();
-    // Preparar un setlist completo es una decisión para esta sesión; los audios preparados viven en RAM.
+    // El setlist activo se prepara automáticamente mientras quepa; los audios preparados viven en RAM.
     this.preparingSetlistId = null;
     // Tamaños medidos: evitan reintentar sin fin una canción que ocupa más que la estimación inicial.
     this.memoryCosts = new Map();
@@ -88,6 +88,7 @@ class App {
     this.loopMode = false;
     this.engine = null;
     this.ready = false;
+    this.sessionAllowed = false;
     this.stageLocked = false;
     this.sinkState = 'default';
     this.reviewing = Promise.resolve();
@@ -129,6 +130,7 @@ class App {
     this.startTicker();
     this.ready = true;
     this.emit('ready');
+    this.warmUp();
   }
 
   get player() {
@@ -185,6 +187,7 @@ class App {
   }
 
   async togglePad() {
+    if (!this.sessionAllowed) return;
     if (!this.pad) return;
     if (this.pad.active) { this.pad.stop(); return; }
     if (this.padStarting) return;
@@ -718,22 +721,33 @@ class App {
   // el cambio es inmediato: no hay pantalla de carga, no se cierra el modo escenario y no se espera a nada.
   // Si no, se decodifica con el avance a la vista y con todos los núcleos disponibles.
   async loadSong(id, { autoplay = false, force = false } = {}) {
+    if (!this.sessionAllowed) return;
     const song = this.songs.get(id);
     if (!song) return;
-    if (!force && this.current && this.current.song.id === id) {
-      if (autoplay) await this.play();
-      return;
-    }
     const token = ++this.loadToken;
     this.wantedId = id;
     try {
       this.cancelAdvance();
+      // Volver a la actual también cancela una selección anterior que todavía se estaba preparando.
+      for (const job of Array.from(this.jobs.values())) if (job.claimed && job.id !== id) this.cancelJob(job);
+      if (!force && this.current && this.current.song.id === id) {
+        this.endLoading();
+        if (autoplay) await this.play();
+        return;
+      }
       if (force) this.invalidateSong(id);
-      // Lo que se preparaba para otra canción deja de importar: toda la máquina se dedica a esta.
-      for (const job of Array.from(this.jobs.values())) if (job.id !== id) this.cancelJob(job);
       let entry = this.takeReady(id);
-      if (!entry) entry = await this.loadCold(song, token);
+      if (!entry) {
+        // Solo la carga lenta necesita liberar los decodificadores. Un salto a una canción lista
+        // conserva la preparación útil del resto del setlist.
+        for (const job of Array.from(this.jobs.values())) if (job.id !== id) this.cancelJob(job);
+        entry = await this.loadCold(song, token);
+      }
       if (!entry) return;
+      if (token !== this.loadToken) {
+        this.addWarm(entry);
+        return;
+      }
       // Un click de muestra que se eligió en el editor después de preparar la canción: se espera a que cargue.
       if (isSampleSound(song.click.sound) && !this.engine.clickBank) {
         await this.ensureClickSound(song.click.sound);
@@ -749,7 +763,10 @@ class App {
       this.warmUp();
       if (autoplay) await this.play();
     } finally {
-      if (token === this.loadToken) this.wantedId = null;
+      if (token === this.loadToken) {
+        this.wantedId = null;
+        this.warmUp();
+      }
     }
   }
 
@@ -758,20 +775,21 @@ class App {
   async loadCold(song, token) {
     const id = song.id;
     const old = this.current;
-    // Lo que sonaba se deja guardado en memoria solo si cabe junto con la canción que se va a cargar.
+    // Si ambas caben, la canción actual y su pantalla siguen disponibles hasta que termine la carga.
     const need = this.estimateBytes(song) || (old ? old.bytes : 0);
-    const keep = Boolean(old) && old.song.id !== id && this.settings.preloadNext && old.bytes + need <= this.warmBudget();
-    this.loading = { song, done: 0, total: song.tracks.length, label: '' };
-    this.unloadCurrent({ keep, loading: true });
+    const keep = Boolean(old) && old.song.id !== id && old.bytes + need <= this.warmBudget();
+    const switching = Boolean(old) || Boolean(this.loading?.switching);
+    this.loading = { song, done: 0, total: song.tracks.length, label: '', switching };
+    if (!keep) this.unloadCurrent({ loading: true });
     this.makeRoom(need);
     this.emit('loading', this.loading);
     for (let attempt = 0; attempt < 3; attempt++) {
       const job = this.jobs.get(id) || this.startJob(song, { foreground: true });
       job.claimed = true;
-      job.decoders = FOREGROUND_DECODERS;
+      job.decoders = keep && old.player.state === 'playing' ? BACKGROUND_DECODERS : FOREGROUND_DECODERS;
       job.onProgress = (done, total, label) => {
         if (token !== this.loadToken) return;
-        this.loading = { song, done, total, label };
+        this.loading = { song, done, total, label, switching };
         this.emit('loading', this.loading);
       };
       if (job.done > 0) job.onProgress(job.done, job.total, job.label);
@@ -807,6 +825,7 @@ class App {
   becomeCurrent(entry) {
     this.warm.delete(entry.song.id);
     const old = this.current;
+    entry.switching = Boolean(old) || Boolean(this.loading?.switching);
     this.current = entry;
     this.syncPadSong();
     this.loopMode = false;
@@ -862,9 +881,9 @@ class App {
   // --- Canciones listas en memoria ---------------------------------------------------------------
   //
   // Decodificar todas las pistas de una canción lleva segundos, y con ella en pantalla esperando eso es
-  // justo lo que no se puede permitir en vivo. Por eso la canción que sigue en el setlist se prepara en
-  // segundo plano mientras suena la actual. Las canciones visitadas se conservan mientras quepan, para
-  // volver varios lugares atrás. Si hace falta espacio se libera primero la menos reciente.
+  // justo lo que no se puede permitir en vivo. Por eso se prepara automáticamente el setlist activo en
+  // segundo plano, con prioridad para la siguiente y la anterior. Las canciones visitadas se conservan
+  // mientras quepan; si hace falta espacio se libera primero la menos reciente.
 
   warmBudget() {
     const override = Number(this.settings.warmBudgetMB);
@@ -938,11 +957,12 @@ class App {
   }
 
   // Libera lo que sobre (primero lo menos reciente) para que quepan `extra` bytes más.
-  makeRoom(extra = 0) {
+  makeRoom(extra = 0, { onlyOutsideSetlist = false } = {}) {
     const budget = this.warmBudget();
     const pinned = this.pinnedIds();
     let used = this.memoryUsed();
-    const ids = Array.from(this.warm.keys());
+    const activeIds = new Set(this.activeSetlist()?.songIds || []);
+    const ids = Array.from(this.warm.keys()).filter(id => !onlyOutsideSetlist || !activeIds.has(id));
     // La siguiente se descarta al final si tampoco cabe. Nunca se sacrifica el audio solicitado.
     const evictionOrder = [...ids.filter(id => !pinned.has(id)), ...ids.filter(id => pinned.has(id) && id !== this.wantedId)];
     for (const id of evictionOrder) {
@@ -1030,7 +1050,7 @@ class App {
 
   preparationCandidates() {
     const ids = [this.nextSongId(), this.previousSongId()].filter(Boolean);
-    if (this.preparingSetlistId === this.activeSetlistId) ids.push(...this.activeSetlist().songIds);
+    ids.push(...(this.activeSetlist()?.songIds || []));
     return [...new Set(ids)].filter(id => this.songs.has(id) && id !== this.current?.song.id);
   }
 
@@ -1047,13 +1067,13 @@ class App {
       setlistId: this.activeSetlistId,
       ready, total: ids.length, preparing, failed,
       complete: ids.length > 0 && ready === ids.length,
-      limited: this.preparingSetlistId === this.activeSetlistId && limited && !preparing && !this.loading,
+      limited: this.settings.preloadNext && limited && !preparing && !this.loading,
       usedBytes, budgetBytes,
     };
   }
 
-  // Preparación voluntaria de todo el setlist, una canción a la vez. Si no cabe entero, quedan listas
-  // las que sí caben y se informa del límite; los archivos descargados siguen guardados en el dispositivo.
+  // Vuelve a activar la preparación automática y reintenta fallos. Si no cabe entero, quedan listas
+  // las que sí caben; los archivos descargados siguen guardados en el dispositivo.
   prepareSetlist() {
     if (!this.activeSetlist()?.songIds.some(id => this.songs.has(id))) {
       this.toast('Añade canciones al setlist antes de prepararlo');
@@ -1067,14 +1087,17 @@ class App {
     return this.preparationStatus();
   }
 
-  // Mantiene listas la siguiente y la anterior; conserva las ya visitadas y, si se pidió, prepara
-  // todo el setlist hasta el límite de RAM. La canción siguiente tiene prioridad cuando falta espacio.
+  // Prepara todo el setlist automáticamente hasta el límite de RAM, una canción a la vez.
+  // La siguiente y la anterior van primero; la siguiente tiene prioridad cuando falta espacio.
   warmUp() {
+    if (!this.sessionAllowed) return;
     if (!this.settings.preloadNext) {
       this.discardWarm();
       return;
     }
-    if (this.loading || this.player?.pitchBusy || (!this.current && this.preparingSetlistId !== this.activeSetlistId)) return;
+    if (!this.engine || !this.activeSetlist()) return;
+    this.preparingSetlistId = this.activeSetlistId;
+    if (this.loading || this.player?.pitchBusy) return;
     const candidates = this.preparationCandidates();
     for (const job of Array.from(this.jobs.values())) if (!job.claimed && !candidates.includes(job.id)) this.cancelJob(job);
     this.enforceBudget();
@@ -1090,7 +1113,10 @@ class App {
       }
       if (this.failed.get(id) === decodeSignature(song)) continue;
       const need = this.estimateBytes(song);
+      // No vaciar la caché para una siguiente que ni siquiera cabe junto a la actual.
+      if ((this.current?.bytes || 0) + need > this.warmBudget()) continue;
       if (id === this.nextSongId()) this.makeRoom(need);
+      else this.makeRoom(need, { onlyOutsideSetlist: true });
       const used = this.memoryUsed();
       if (used + need > this.warmBudget()) continue;
       const job = this.startJob(song, { foreground: false });
@@ -1134,6 +1160,9 @@ class App {
     if (this.advancing && this.advancing.from === entry) return;
     if (this.current !== entry) return;
     this.emit('transport', entry);
+    // La actual puede seguir sonando durante una selección manual lenta; al terminar no debe
+    // reemplazar esa selección por el avance automático.
+    if (this.loading) return;
     if (this.settings.afterSong === 'next') {
       const id = this.nextSongId();
       if (id) this.loadSong(id, { autoplay: true });
@@ -1162,7 +1191,7 @@ class App {
       this.activate(target);
       return;
     }
-    if (!this.advancing && player.state === 'playing' && this.settings.afterSong === 'next' && player.timeToEnd(now) < 1.5) {
+    if (!this.loading && !this.advancing && player.state === 'playing' && this.settings.afterSong === 'next' && player.timeToEnd(now) < 1.5) {
       const next = this.next;
       if (!next) return;
       if (!this.isFresh(next)) {
@@ -1179,6 +1208,7 @@ class App {
   }
 
   async play() {
+    if (!this.sessionAllowed) return;
     const player = this.player;
     if (!player) return;
     try {
@@ -1368,6 +1398,7 @@ class App {
   }
 
   runAction(id) {
+    if (!this.sessionAllowed) return;
     const sectionPrefix = this.current && `section:${this.current.song.id}:`;
     if (sectionPrefix && id.startsWith(sectionPrefix)) {
       const markerId = id.slice(sectionPrefix.length);

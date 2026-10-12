@@ -4,6 +4,7 @@ import { cloud } from '../cloud.js';
 import { CLOUD_API_URL } from '../cloud-config.js';
 import { access } from '../access.js';
 import { icon, openModal, field, confirmDialog } from './kit.js';
+import { openUsers } from './users.js';
 
 const report = error => app.toast(error.message || 'No se pudo completar la operación', 'error');
 const act = fn => async () => { try { await fn(); } catch (error) { report(error); } };
@@ -15,10 +16,9 @@ export async function openCloudConnection() {
   const key = h('input', { class: 'input', type: 'password', 'aria-label': 'Clave de acceso', autocomplete: 'current-password', placeholder: 'Tu clave privada de acceso', spellcheck: 'false' });
   const status = h('p', { class: 'cloud-error', role: 'alert' });
   const form = h('form', {},
-    h('p', { class: 'modal-text', text: 'La clave maestra permite publicar cambios. La clave de reproducción permite descargar canciones y usarlas sin editar el catálogo.' }),
+    h('p', { class: 'modal-text', text: 'Entra con tu clave personal. El propietario decide si puedes reproducir o editar canciones y cuánto tiempo puedes usarlas sin internet.' }),
     field('Dirección de tu nube', address), field('Clave de acceso', key),
-    h('p', { class: 'field-hint', text: 'Entrega a los músicos solo la clave de reproducción. La clave dura esta sesión; las canciones y el perfil de reproducción se conservan en este equipo sin internet.' }),
-    !cloud.api ? h('p', { class: 'field-hint', text: 'La primera vez, sigue la guía ACTIVAR-NUBE.html incluida con el proyecto para obtener la dirección y la clave.' }) : null,
+    h('p', { class: 'field-hint', text: 'Cada persona debe usar su propia clave. El propietario crea y bloquea accesos desde Usuarios.' }),
     status,
   );
   const modal = openModal({ title: 'Conectar mi nube', body: form });
@@ -77,9 +77,11 @@ export function createCloudView() {
     const offline = navigator.onLine === false;
     tools.replaceChildren(...(access.canEdit && cloud.role !== 'player' ? [button('Subir canción', openCloudUpload, 'primary', !!cloud.active || offline)] : []),
       button('Actualizar lista', () => cloud.refresh(), '', !cloud.connected || cloud.loading || offline),
-      button(cloud.connected ? 'Desconectar' : 'Conectar', () => cloud.connected ? cloud.disconnect() : openCloudConnection()));
-    connection.replaceChildren(h('span', { class: `cloud-dot ${cloud.connected ? 'on' : ''}` }),
-      h('span', { text: cloud.connected ? (navigator.onLine ? `Nube privada · ${cloud.role === 'master' ? 'Maestro' : 'Solo reproducción'}` : 'Sin internet · las canciones descargadas funcionan') : cloud.role === 'player' ? 'Perfil de reproducción · conecta su clave para descargar actualizaciones' : 'Conecta tu nube para publicar o descargar' }));
+      button(cloud.connected ? 'Desconectar' : 'Conectar', () => cloud.connected ? cloud.disconnect() : openCloudConnection()),
+      ...(cloud.canManageUsers ? [button('Usuarios', openUsers, '', offline)] : []));
+    const roleLabel = cloud.identity?.role === 'owner' ? 'Propietario' : cloud.identity?.role === 'editor' ? 'Editor' : 'Músico';
+    connection.replaceChildren(h('span', { class: `cloud-dot ${cloud.canAccess ? 'on' : ''}` }),
+      h('span', { text: cloud.canAccess ? `${cloud.identity.name} · ${roleLabel}${navigator.onLine === false || cloud.offline ? ' · Sin conexión' : ''}` : 'Inicia sesión con tu clave personal' }));
     const progress = cloud.progress;
     transfers.replaceChildren();
     if (progress) {

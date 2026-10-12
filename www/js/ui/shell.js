@@ -2,6 +2,7 @@ import { h, $ } from '../util.js';
 import { icon, iconButton } from './kit.js';
 import { access } from '../access.js';
 import { offline } from '../offline.js';
+import { cloud } from '../cloud.js';
 
 const MARK = `<svg viewBox="0 0 64 64" width="28" height="28" aria-hidden="true"><g stroke-linecap="round" stroke-width="5" fill="none"><path stroke="#35c9ff" d="M12 26v12M21 19v26M30 12v40M46 17v30M55 25v14"/><path stroke="#ffb020" d="M38 7v50"/></g></svg>`;
 
@@ -20,13 +21,17 @@ export function createShell({ onSettings, onStage, onAccess }) {
   const network = h('span', { class: 'network-badge', role: 'status' });
   const accessButton = h('button', { type: 'button', class: 'btn small access-launcher', onClick: onAccess }, icon('shield', 16), h('span'));
   const refreshStatus = () => {
-    network.textContent = offline.online ? 'Con conexión' : 'Sin conexión';
-    network.classList.toggle('is-offline', !offline.online);
-    accessButton.querySelector('span:last-child').textContent = access.label;
+    const online = offline.online && !cloud.offline;
+    network.textContent = online ? 'Con conexión' : 'Sin conexión';
+    network.classList.toggle('is-offline', !online);
+    const role = cloud.identity?.role;
+    accessButton.querySelector('span:last-child').textContent = role === 'player' ? 'Músico' : access.canEdit ? role === 'owner' ? 'Propietario' : 'Editor' : 'Edición bloqueada';
+    accessButton.title = `${cloud.identity?.name || 'Acceso'} · Controles de edición de este equipo`;
     document.body.dataset.access = access.canEdit ? 'master' : 'player';
   };
   access.on('change', refreshStatus);
   offline.on('network', refreshStatus);
+  cloud.on('change', refreshStatus);
   refreshStatus();
   const topbar = h(
     'header',

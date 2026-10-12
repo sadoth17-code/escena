@@ -1,0 +1,88 @@
+ESCENA — ACTIVAR EL CONTROL DE USUARIOS
+
+El paquete combina la corrección de canciones sobre v1.0.20 y el nuevo control
+de usuarios. Contiene código fuente y pruebas; los instaladores se generan
+mediante el procedimiento de construcción de tu proyecto.
+
+1. CONSERVAR UNA COPIA
+Guarda el código actual del Worker y una copia de tu proyecto antes de sustituir
+archivos. No borres el bucket, las canciones ni la biblioteca del dispositivo.
+
+2. ACTUALIZAR EL WORKER EXISTENTE
+Copia íntegro server/worker.mjs en el Worker que ya usa Escena y publica.
+Mantén el vínculo R2 llamado ESCENA_BUCKET, el secreto ESCENA_KEY y los orígenes
+de ALLOWED_ORIGINS. La dirección del servicio permanece igual.
+No pegues una clave secreta dentro del código ni dentro del repositorio.
+No necesitas D1, otro bucket, otro servicio ni otro registro de usuarios.
+
+3. COMPROBAR QUE EL BUCKET ES PRIVADO
+En el bucket, desactiva Public Development URL (r2.dev). Comprueba también que
+no existan dominios personalizados que den lectura pública directa al bucket.
+Desactivar r2.dev no desactiva otros dominios públicos. Conservar el binding R2
+del Worker permite que este lea archivos después de esas restricciones.
+Guía oficial: https://developers.cloudflare.com/r2/buckets/public-buckets/
+
+4. ACTUALIZAR LA APP
+Copia el contenido de actualizacion/ a la raíz del proyecto, conservando sus
+rutas y sustituyendo únicamente los archivos incluidos. Publica el código con
+tu procedimiento habitual de GitHub y actualiza los instaladores de los equipos.
+Publicar el cliente nuevo antes del Worker deja el acceso bloqueado hasta que
+el servidor reconozca el control de usuarios. Por eso el Worker va primero.
+
+5. ENTRAR COMO PROPIETARIO
+En la pantalla Entrar a Escena, usa tu clave ESCENA_KEY existente.
+No la entregues a otras personas. El control de edición local es independiente
+del permiso del propietario para administrar usuarios.
+
+6. APROBAR CADA PERSONA
+Abre Setlist, Nube, Usuarios y pulsa Aprobar usuario. Escribe su nombre, elige
+Músico o Editor y el plazo permitido sin internet: 0, 24, 72 o 168 horas.
+Músico: reproducir y mezclar. Editor: además editar canciones y publicar.
+Solo el propietario administra usuarios. Todos comparten el mismo catálogo.
+Guarda la clave personal que se muestra y entrégala únicamente a esa persona.
+Se muestra una sola vez; copiarla necesita pulsar Copiar clave. No se envía
+automáticamente por correo, WhatsApp ni otro medio.
+
+7. BLOQUEAR O CAMBIAR ACCESO
+Desde Usuarios puedes bloquear/habilitar una persona o editar su rol y plazo.
+Renovar clave deja inválida la clave anterior en las nuevas solicitudes.
+Si la lista cambió en otro equipo, actualízala antes de guardar.
+En línea, cada petición protegida comprueba la cuenta; el cliente también
+consulta cada minuto. Sin internet, el cliente normal conserva acceso hasta
+el vencimiento concedido. No se pueden retirar audios ya extraídos ni hacer
+que una copia antigua sin controles obedezca estas reglas.
+
+8. MIGRAR LA CLAVE COMPARTIDA ANTIGUA
+ESCENA_PLAYER_KEY queda desactivada por defecto. Crea claves personales para
+los músicos y actualiza sus aplicaciones. ALLOW_LEGACY_PLAYER=true permite
+una transición temporal, pero vuelve a habilitar la clave compartida y reduce
+el control individual. No hace falta borrar ni modificar las canciones.
+
+9. ANTES DE TOCAR
+Verifica el acceso con internet, descarga el repertorio y espera Lista para
+sonar. Las canciones preparadas cambian sin repetir lectura/decodificación.
+Si todo el setlist supera la RAM disponible, algunas requieren preparación.
+Una autorización de 0 horas necesita conexión; 24 horas permite tocar sin
+internet durante ese plazo desde la última validación en este dispositivo.
+Una caída de red conserva la reproducción aprobada mientras el plazo siga
+vigente; publicar, administrar y descargar nuevas canciones requieren red.
+
+10. LÍMITES Y CONSERVACIÓN DE DATOS
+Los multitracks siguen siendo audio local sin cifrado adicional. Una persona
+autorizada puede intentar extraerlo o grabarlo; no hay una garantía anticopia.
+Mantener privados el almacenamiento y los permisos del Worker bloquea a
+quienes no tienen una clave válida, incluso si copian la interfaz.
+Las cuentas están en auth/users y auth/keys dentro del mismo bucket; no se
+mezclan con catalog/ ni audio/. Se guardan hashes, no claves personales.
+Descartar una subida conserva archivos completos privados para evitar borrar
+audio publicado a la vez. Su limpieza posterior debe comprobar y coordinar
+las revisiones. Evita completar dos subidas simultáneas de la misma pista,
+canción y revisión; esa coordinación no se implementó en esta actualización.
+La firma Android expuesta anteriormente necesita una migración aparte; no
+cambies su clave a ciegas porque afecta a las actualizaciones instaladas.
+
+VALIDACIÓN LOCAL
+Ejecuta npm test para las regresiones de audio, servidor y cliente.
+Las pruebas gráficas usan npm run test:browser y requieren Playwright y un
+navegador instalado. ESCENA_CHROMIUM permite indicar su ejecutable.
+Las pruebas no usan cuentas, claves ni datos del servicio de producción.

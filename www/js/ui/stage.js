@@ -136,6 +136,7 @@ export function createStage() {
     },
     setEntry(next) {
       entry = next;
+      loadingBox.classList.toggle('is-switching', Boolean(entry && !loadingBox.hidden));
       ledKey = '';
       chipKey = '';
       if (next) {
@@ -156,8 +157,9 @@ export function createStage() {
     },
     setLoading(state) {
       loadingBox.hidden = !state;
+      loadingBox.classList.toggle('is-switching', Boolean(state && entry));
       if (!state) return;
-      loadingTitle.textContent = `Cargando «${state.song.title}»`;
+      loadingTitle.textContent = `Preparando «${state.song.title}»`;
       loadingText.textContent = state.label ? `${state.done} de ${state.total} · ${state.label}` : 'Preparando…';
       loadingBar.style.width = `${state.total ? (state.done / state.total) * 100 : 5}%`;
     },

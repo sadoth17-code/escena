@@ -26,6 +26,51 @@
   color-scheme: dark;
 }
 
+body[data-session="locked"] #app,
+body[data-session="locked"] .stage,
+body[data-session="locked"] .dropzone,
+body[data-session="locked"] .modal-layer {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.session-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  padding: 24px 16px;
+  background: var(--bg);
+}
+
+.session-card {
+  width: min(420px, 100%);
+  padding: 28px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: 0 20px 60px #0005;
+}
+
+.session-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--accent);
+  font-weight: 800;
+  letter-spacing: 0.15em;
+  margin-bottom: 24px;
+}
+
+.session-card h1 { font-size: 24px; margin: 0 0 12px; }
+.session-copy { color: var(--text-2); line-height: 1.55; margin-bottom: 22px; }
+.session-form, .session-label { display: flex; flex-direction: column; gap: 10px; }
+.session-error { color: var(--red); font-size: 13px; line-height: 1.4; margin: 0; }
+.session-error:empty { display: none; }
+.session-card > .field-hint { margin: 18px 0 0; line-height: 1.5; }
+
 .pitch-panel {
   display: flex;
   flex-direction: column;
@@ -3331,6 +3376,28 @@ p {
 
 .stage-loading .loading-card {
   width: min(460px, 100%);
+}
+
+/* A song that is still available keeps its controls while another is prepared. */
+.pv-loading.is-switching,
+.stage-loading.is-switching {
+  inset: 12px 12px auto auto;
+  padding: 0;
+  max-width: min(380px, calc(100% - 24px));
+  background: transparent;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  pointer-events: none;
+}
+
+.is-switching .loading-card {
+  padding: 12px;
+  gap: 6px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+}
+
+.stage-loading.is-switching {
+  top: 92px;
 }
 
 .stage-veil {

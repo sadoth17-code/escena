@@ -12,7 +12,7 @@ export function openAccess() {
   const render = () => {
     error.textContent = '';
     if (access.cloudRole === 'player') {
-      body.replaceChildren(h('div', { class: 'access-banner' }, icon('shield', 26), h('b', { text: 'Acceso de reproducción' })), h('p', { class: 'modal-text', text: 'Puedes reproducir, mezclar, cambiar el tono para esta sesión y usar el pad. Las portadas, secciones y pistas quedan protegidas.' }), h('p', { class: 'field-hint', text: 'Para administrar la biblioteca, conecta una clave maestra desde Nube. La clave local no cambia los permisos de la nube.' }));
+      body.replaceChildren(h('div', { class: 'access-banner' }, icon('shield', 26), h('b', { text: 'Acceso de músico' })), h('p', { class: 'modal-text', text: 'Puedes reproducir, mezclar, cambiar el tono para esta sesión y usar el pad. Las portadas, secciones y pistas quedan protegidas.' }), h('p', { class: 'field-hint', text: 'El propietario puede concederte permiso de editor desde Usuarios. Vuelve a validar tu acceso con internet para aplicar el cambio. La clave local no modifica esos permisos.' }));
       modal?.setActions([{ label: 'Listo', kind: 'primary', onClick: api => api.close() }]);
       return;
     }

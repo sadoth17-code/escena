@@ -28,7 +28,7 @@ class Access {
     this.bus.emit('change');
   }
   assertEdit() {
-    if (!this.canEdit) throw new Error('Modo reproducción: el acceso maestro es necesario para editar canciones.');
+    if (!this.canEdit) throw new Error(this.cloudRole === 'player' ? 'Tu cuenta permite reproducir. El propietario debe concederte permiso de editor para modificar canciones.' : 'Desbloquea la edición de este equipo para modificar canciones.');
   }
   async derive(value, salt) {
     const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(value), 'PBKDF2', false, ['deriveBits']);
@@ -46,7 +46,7 @@ class Access {
     this.bus.emit('change');
   }
   async unlock(value) {
-    if (this.cloudRole === 'player') throw new Error('Este equipo usa acceso de reproducción. Conecta la clave maestra de la nube para editar.');
+    if (this.cloudRole === 'player') throw new Error('Tu cuenta tiene permiso de reproducción. El propietario debe concederte permiso de editor.');
     if (Date.now() < this.retryAt) throw new Error('Espera 30 segundos antes de volver a intentar.');
     if (!this.record) throw new Error('Primero configura una clave maestra local.');
     const hash = await this.derive(value, this.record.salt);
