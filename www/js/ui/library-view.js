@@ -4,6 +4,7 @@ import { songDuration, songBytes } from '../library.js';
 import { icon, iconButton, createSegmented, confirmDialog, promptDialog } from './kit.js';
 import { createCloudView } from './cloud-view.js';
 import { createCover } from './cover.js';
+import { access } from '../access.js';
 
 function songMeta(song) {
   const first = song.tempoMap[0];
@@ -86,7 +87,7 @@ export function createLibraryView({ onImport, onEdit }) {
 
   const list = h('div', { class: 'song-list', role: 'list' });
   const cloudView = createCloudView();
-  const importButton = h('button', { type: 'button', class: 'btn primary block', onClick: onImport }, icon('upload', 18), 'Importar canciones');
+  const importButton = h('button', { type: 'button', class: 'btn primary block', 'data-master-only': '', onClick: onImport }, icon('upload', 18), 'Importar canciones');
   const el = h('div', { class: 'lib' }, h('div', { class: 'lib-head' }, modeSwitch.el), setlistBar, searchBar, list, cloudView.el, h('div', { class: 'lib-foot' }, importButton));
 
   const rowFor = (song, { index, inSetlist }) => {
@@ -123,11 +124,11 @@ export function createLibraryView({ onImport, onEdit }) {
           label: already ? 'Ya está en el setlist' : 'Añadir al setlist',
           onClick: stop(() => (already ? app.toast('Ya está en el setlist') : app.addToSetlist([song.id]))),
           className: already ? 'on' : '',
-        }),
-        iconButton({ name: 'edit', label: 'Editar canción', onClick: stop(() => onEdit(song)) })
+        })
       );
+      if (access.canEdit) actions.append(iconButton({ name: 'edit', label: 'Editar canción', onClick: stop(() => onEdit(song)) }));
     } else {
-      actions.append(iconButton({ name: 'edit', label: 'Editar canción', onClick: stop(() => onEdit(song)) }));
+      if (access.canEdit) actions.append(iconButton({ name: 'edit', label: 'Editar canción', onClick: stop(() => onEdit(song)) }));
     }
     row.append(lead, createCover(song), main, actions);
     if (current) row.classList.add('current');
@@ -218,6 +219,7 @@ export function createLibraryView({ onImport, onEdit }) {
   app.on('loading', updateStates);
   app.on('transport', updateStates);
   app.on('warm', updateStates);
+  access.on('change', render);
   render();
 
   return { el, render };

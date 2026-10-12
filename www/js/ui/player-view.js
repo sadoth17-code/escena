@@ -7,6 +7,7 @@ import { createPitchControl } from './pitch-control.js';
 import { songPitchText } from '../pitch-utils.js';
 import { createCover, updateCover } from './cover.js';
 import { createPadControl } from './pad-control.js';
+import { access } from '../access.js';
 
 const JUMP_MODES = [
   { id: 'bar', label: 'Salto en compás' },
@@ -72,7 +73,7 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
     { class: 'pv-head' },
     h('div', { class: 'pv-titles with-cover' }, cover, h('div', { class: 'pv-title-copy' }, title, subtitle)),
     pills,
-    h('div', { class: 'pv-head-actions' }, iconButton({ name: 'edit', label: 'Editar canción', onClick: () => onEdit('general') }))
+    h('div', { class: 'pv-head-actions' }, h('button', { type: 'button', class: 'btn edit-launcher', 'aria-label': 'Editar canción', 'data-master-only': '', onClick: () => onEdit('general') }, icon('edit', 18), 'Editar'))
   );
 
   const barLabel = h('span', { class: 'ro-label' });
@@ -95,7 +96,7 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
   const chips = h('div', { class: 'chips', role: 'group', 'aria-label': 'Secciones' });
   const noSections = h(
     'button',
-    { type: 'button', class: 'chips-hint', onClick: () => onEdit('sections') },
+    { type: 'button', class: 'chips-hint', 'data-master-only': '', onClick: () => onEdit('sections') },
     icon('plus', 16),
     'Añade secciones (Intro, Verso, Coro…) para saltar entre ellas y tener guía de voz'
   );
@@ -137,22 +138,25 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
   const toggleBar = h('div', { class: 'toggles' }, Object.values(toggles));
   const preloadText = h('span');
   const preloadButton = h('button', { type: 'button', class: 'btn small', onClick: () => app.prepareNextSong() }, 'Preparar siguiente');
-  const preloadStatus = h('div', { class: 'preload-status' }, preloadText, preloadButton);
+  const prepareListButton = h('button', { type: 'button', class: 'btn small', onClick: () => app.prepareSetlist().catch(error => app.toast(error.message, 'error')) }, icon('check', 16), 'Preparar setlist');
+  const listStatus = h('span', { class: 'setlist-preparation', role: 'status' });
+  const preloadStatus = h('div', { class: 'preload-status' }, h('div', { class: 'preparation-copy' }, preloadText, listStatus), preloadButton, prepareListButton);
 
   const loadingText = h('span');
   const loadingBar = h('i');
   const loading = h('div', { class: 'pv-loading', hidden: true, role: 'status' }, h('div', { class: 'loading-card' }, h('b', { class: 'loading-title' }), loadingText, h('div', { class: 'progress' }, loadingBar)));
   const loadingTitle = loading.querySelector('.loading-title');
 
-  const importButton = h('button', { type: 'button', class: 'btn primary big', onClick: onImport }, icon('upload', 20), 'Importar canción');
-  const demoButton = h('button', { type: 'button', class: 'btn big', onClick: onDemo }, icon('music', 20), 'Crear canción de prueba');
+  const importButton = h('button', { type: 'button', class: 'btn primary big', 'data-master-only': '', onClick: onImport }, icon('upload', 20), 'Importar canción');
+  const demoButton = h('button', { type: 'button', class: 'btn big', 'data-master-only': '', onClick: onDemo }, icon('music', 20), 'Crear canción de prueba');
   const emptyTitle = h('h3');
   const emptyText = h('p');
   const emptyActions = h('div', { class: 'empty-actions' }, importButton, demoButton);
   const empty = h('div', { class: 'pv-empty' }, h('div', { class: 'empty-art' }, icon('wave', 44)), emptyTitle, emptyText, emptyActions);
 
-  const live = h('div', { class: 'pv-live' }, head, pitch.el, readout, timeline.el, chips, noSections, transport, toggleBar, preloadStatus, meters);
-  const el = h('div', { class: 'pv' }, live, empty, createPadControl(), loading);
+  const tools = h('div', { class: 'performance-tools' }, pitch.el, createPadControl());
+  const live = h('div', { class: 'pv-live' }, head, tools, readout, timeline.el, chips, noSections, transport, toggleBar, preloadStatus, meters);
+  const el = h('div', { class: 'pv' }, live, empty, loading);
 
   let entry = null;
   let ledKey = '';
@@ -166,7 +170,7 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
     emptyTitle.textContent = has ? 'Elige una canción' : 'Empieza con tu primera canción';
     emptyText.textContent = has
       ? 'Toca una canción del setlist o de la biblioteca para cargarla.'
-      : 'Importa las pistas de una canción (WAV, MP3, FLAC…, una carpeta o un ZIP). Click y guías se crean solos a partir del tempo.';
+      : access.canEdit ? 'Importa las pistas de una canción (WAV, MP3, FLAC…, una carpeta o un ZIP). Click y guías se crean solos a partir del tempo.' : 'Descarga canciones desde Nube para tocar en este equipo.';
     emptyActions.hidden = has;
     updateVisibility();
   };
@@ -281,12 +285,16 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
     setText(toggles.jump.querySelector('.tog-text'), mode.label);
     buttons.prevSong.disabled = !app.previousSongId();
     const nextId = app.nextSongId();
-    preloadStatus.hidden = !nextId;
+    preloadStatus.hidden = !app.setlistSongs().length;
     const nextSong = nextId && app.songs.get(nextId);
     const ready = nextId && app.isReady(nextId);
     const warming = nextId && app.isWarming(nextId);
     setText(preloadText, nextSong ? `${nextSong.title} · ${ready ? 'Lista para sonar' : warming ? 'Preparando audio…' : 'Descargada · pendiente de preparar'}` : '');
     preloadButton.hidden = Boolean(ready || warming);
+    preloadButton.hidden ||= !nextId;
+    const prepared = app.preparationStatus();
+    setText(listStatus, `${prepared.ready}/${prepared.total} listas para sonar · RAM ${fmtBytes(prepared.usedBytes)} / ${fmtBytes(prepared.budgetBytes)}${prepared.limited ? ' · El resto se prepara al abrir' : prepared.preparing ? ' · Preparando…' : ''}`);
+    prepareListButton.disabled = prepared.preparing || prepared.complete || Boolean(player.pitchBusy);
     preloadButton.disabled = Boolean(player.pitchBusy);
     buttons.play.disabled = Boolean(player.pitchBusy);
     buttons.nextSong.disabled = !nextId;
@@ -349,6 +357,7 @@ export function createPlayerView({ onEdit, onImport, onDemo }) {
 
   app.on('loading', renderLoading);
   app.on('songs', renderEmpty);
+  access.on('change', renderEmpty);
 
   return { el, frame, setEntry, refresh, timeline, renderEmpty, renderLoading };
 }

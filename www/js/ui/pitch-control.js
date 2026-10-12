@@ -1,9 +1,11 @@
 import { h } from '../util.js';
 import { app } from '../app.js';
 import { MIN_PITCH, MAX_PITCH, normalizePitch, pitchLabel, transposeKey, defaultPitchEnabled } from '../pitch-utils.js';
-import { setText } from './kit.js';
+import { setText, icon, openModal } from './kit.js';
+import { access } from '../access.js';
 
 export function createPitchControl() {
+  let modal = null;
   let entry = null;
   let draft = 0;
   let progress = null;
@@ -25,10 +27,18 @@ export function createPitchControl() {
   const summary = h('summary');
   const details = h('details', { class: 'pitch-details' }, summary,
     h('p', { class: 'pitch-hint', text: 'Marca las pistas musicales. Deja sin marcar click, guías y percusión para conservar su sonido.' }), list);
-  const el = h('section', { class: 'pitch-panel', 'aria-label': 'Tonalidad de la canción' },
+  const panel = h('section', { class: 'pitch-panel', 'aria-label': 'Tonalidad de la canción' },
     h('div', { class: 'pitch-heading' }, h('b', { text: 'Tonalidad' }), current),
     h('div', { class: 'pitch-controls' }, h('div', { class: 'pitch-stepper' }, down, value, up), apply, reset, cancel),
     hint, bar, details);
+  const launcherLabel = h('span', { class: 'pitch-launcher-label' });
+  const el = h('button', { type: 'button', class: 'btn pitch-launcher', 'aria-label': 'Abrir tonalidad', onClick: () => open() }, icon('music', 18), h('span', { text: 'Tonalidad' }), launcherLabel);
+  const open = () => {
+    if (modal) { modal.el.focus(); return modal; }
+    modal = openModal({ title: 'Tonalidad', size: 'lg', className: 'pitch-modal', body: panel, actions: [{ label: 'Listo', kind: 'primary', onClick: api => api.close() }], onClose: () => { modal = null; } });
+    frame();
+    return modal;
+  };
 
   const frame = () => {
     const player = entry?.player;
@@ -44,7 +54,9 @@ export function createPitchControl() {
     cancel.hidden = !busy;
     bar.hidden = !busy;
     for (const { input } of checkboxes) input.disabled = blocked;
-    el.setAttribute('aria-busy', String(busy));
+    panel.setAttribute('aria-busy', String(busy));
+    el.disabled = !entry;
+    setText(launcherLabel, transposeKey(entry?.song.key, applied) || pitchLabel(applied));
     setText(value, pitchLabel(draft));
     const song = entry?.song;
     const originalKey = song?.key || 'sin indicar';
@@ -56,7 +68,7 @@ export function createPitchControl() {
       bar.value = fraction;
       setText(hint, `Preparando ${Math.round(fraction * 100)} %${progress?.label ? ` · ${progress.label}` : ''}`);
     } else {
-      setText(hint, playing ? 'Pausa la canción para cambiar la tonalidad.' : '1 paso = 1 semitono · El tempo se mantiene · El ajuste se guarda por canción.');
+      setText(hint, playing ? 'Pausa la canción para cambiar la tonalidad.' : `1 paso = 1 semitono · El tempo se mantiene · ${access.canEdit ? 'El ajuste se guarda por canción.' : 'El ajuste se aplica solo a esta sesión.'}`);
     }
   };
 
@@ -82,5 +94,5 @@ export function createPitchControl() {
     progress = state.total ? state : null;
     frame();
   });
-  return { el, setEntry, frame };
+  return { el, panel, open, setEntry, frame };
 }

@@ -5,8 +5,9 @@ import { normalizeSong, serializableSong, createSong, createTrackDef, createSetl
 import { normalizeTempoEntries, detectTempoFromBuffer } from './tempo.js';
 import { renderPreview, isSampleSound } from './synth.js';
 import { DEFAULT_GUIDE_LANG, isGuideLanguage, guideLanguageName } from './voices.js';
-import { normalizePitch, pitchLabel, keyPitchClass } from './pitch-utils.js';
-import { AmbientPad } from './pad.js';
+import { normalizePitch, pitchLabel, keyPitchClass, defaultPitchEnabled } from './pitch-utils.js';
+import { AmbientPad, normalizePadStyle } from './pad.js';
+import { access } from './access.js';
 
 const MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || isIOS();
 
@@ -15,9 +16,6 @@ const GB = 1024 ** 3;
 // núcleos; en segundo plano (precarga mientras suena otra canción) solo dos, para no molestar al audio.
 const FOREGROUND_DECODERS = MOBILE ? 1 : clamp((Number(navigator.hardwareConcurrency) || 4) - 1, 2, 4);
 const BACKGROUND_DECODERS = MOBILE ? 1 : 2;
-// Además de la que sigue, se guarda lista en memoria como mucho una canción que se acaba de dejar,
-// por si hay que volver a ella (siempre que quepa en el presupuesto de memoria).
-const KEPT_BEHIND = 1;
 
 class Cancelled extends Error {
   constructor() {
@@ -26,8 +24,8 @@ class Cancelled extends Error {
   }
 }
 
-// Lo que obliga a decodificar de nuevo: las pistas, sus archivos y si se mezclan a mono.
-const decodeSignature = (song) => song.tracks.map((track) => `${track.id}:${track.fileId}:${track.mono ? 1 : 0}`).join('|');
+// Pistas, archivos, mezcla a mono y transposición: cualquiera de estos cambios invalida el audio preparado.
+const decodeSignature = (song) => `${normalizePitch(song.pitchSemitones)}|${song.tracks.map((track) => `${track.id}:${track.fileId}:${track.mono ? 1 : 0}:${(track.pitchEnabled ?? defaultPitchEnabled(track)) ? 1 : 0}`).join('|')}`;
 
 export const DEFAULT_SETTINGS = {
   output: { ...DEFAULT_OUTPUT },
@@ -44,7 +42,7 @@ export const DEFAULT_SETTINGS = {
   midiEnabled: false,
   bindings: null,
   guideLang: DEFAULT_GUIDE_LANG,
-  pad: { volume: 0.35, note: 0, followSong: true, style: 'soft' },
+  pad: { volume: 0.35, note: 0, followSong: true, style: 'soft', fade: 2 },
 };
 
 function mergeSettings(saved) {
@@ -53,7 +51,8 @@ function mergeSettings(saved) {
   merged.pad.volume = clamp(Number(merged.pad.volume) || 0, 0, 1);
   merged.pad.note = ((Math.round(Number(merged.pad.note) || 0) % 12) + 12) % 12;
   merged.pad.followSong = Boolean(merged.pad.followSong);
-  merged.pad.style = merged.pad.style === 'warm' ? 'warm' : 'soft';
+  merged.pad.style = normalizePadStyle(merged.pad.style);
+  merged.pad.fade = [1, 2, 4].includes(Number(merged.pad.fade)) ? Number(merged.pad.fade) : 2;
   if (!isGuideLanguage(merged.guideLang)) merged.guideLang = DEFAULT_GUIDE_LANG;
   // This live-performance update starts every device in bar mode once.
   // Later, deliberate changes in Ajustes are retained.
@@ -76,6 +75,10 @@ class App {
     // decodificaciones en curso, ambas por id de canción.
     this.warm = new Map();
     this.jobs = new Map();
+    // Preparar un setlist completo es una decisión para esta sesión; los audios preparados viven en RAM.
+    this.preparingSetlistId = null;
+    // Tamaños medidos: evitan reintentar sin fin una canción que ocupa más que la estimación inicial.
+    this.memoryCosts = new Map();
     // Canciones que no se pudieron leer en segundo plano (id → firma): no se reintentan en bucle.
     this.failed = new Map();
     this.advancing = null;
@@ -89,7 +92,9 @@ class App {
     this.sinkState = 'default';
     this.reviewing = Promise.resolve();
     this.saveSettings = debounce(() => store.setMeta('settings', this.settings).catch(() => {}), 300);
-    this.persistSongSoon = debounce((song) => this.saveSong(song, true).catch((error) => this.toast(error.message, 'error')), 400);
+    this.persistSongSoon = debounce((song) => {
+      if (access.canEdit) this.saveSong(song, true).catch((error) => this.toast(error.message, 'error'));
+    }, 400);
   }
 
   on(name, fn) {
@@ -138,7 +143,8 @@ class App {
 
   // ¿Se puede poner esta canción ya mismo? Es la actual o está decodificada en memoria.
   isReady(id) {
-    return Boolean(this.current && this.current.song.id === id) || this.warm.has(id);
+    const entry = this.warm.get(id);
+    return Boolean(this.current && this.current.song.id === id) || Boolean(entry && this.isFresh(entry));
   }
 
   isWarming(id) {
@@ -155,11 +161,13 @@ class App {
     const next = { ...this.settings.pad, ...patch };
     next.volume = clamp(Number(next.volume) || 0, 0, 1);
     next.note = ((Math.round(Number(next.note) || 0) % 12) + 12) % 12;
-    next.style = next.style === 'warm' ? 'warm' : 'soft';
+    next.style = normalizePadStyle(next.style);
+    next.fade = [1, 2, 4].includes(Number(next.fade)) ? Number(next.fade) : 2;
     next.followSong = Boolean(next.followSong);
     this.settings.pad = next;
     if (this.pad) {
       this.pad.setVolume(next.volume);
+      this.pad.setFade(next.fade);
       this.pad.setStyle(next.style);
       if (!next.followSong) this.pad.setNote(next.note);
       else this.syncPadSong();
@@ -185,13 +193,17 @@ class App {
       return;
     }
     this.padStarting = true;
+    const padRequest = this.pad.requestId;
+    this.emit('pad');
     try {
       await this.engine.resume();
+      if (this.pad.requestId !== padRequest) return;
       if (this.settings.pad.followSong && keyPitchClass(this.current?.song.key) === null) throw new Error('Indica la tonalidad de la canción antes de iniciar el pad');
       this.syncPadSong();
-      this.pad.start();
+      const started = await this.pad.start();
+      if (!started && this.pad.error) this.toast(this.pad.error, 'error');
     } catch (error) { this.toast(error.message || 'No se pudo activar el pad', 'error'); }
-    finally { this.padStarting = false; }
+    finally { this.padStarting = false; this.emit('pad'); }
   }
 
   resetSettings() {
@@ -328,6 +340,7 @@ class App {
   }
 
   async saveSong(song, silent = false) {
+    access.assertEdit();
     song.updatedAt = Date.now();
     this.songs.set(song.id, song);
     await store.put('songs', serializableSong(song));
@@ -335,6 +348,7 @@ class App {
   }
 
   async importSong(title, drafts, onProgress, extra = {}) {
+    access.assertEdit();
     const chosen = drafts.filter((draft) => draft.keep);
     const stored = [];
     const defs = [];
@@ -368,6 +382,7 @@ class App {
   }
 
   async addTracks(song, drafts, onProgress) {
+    access.assertEdit();
     const chosen = drafts.filter((draft) => draft.keep);
     const stored = [];
     const defs = [];
@@ -390,6 +405,7 @@ class App {
   }
 
   async updateSong(song, kind = 'meta') {
+    access.assertEdit();
     const entry = this.current && this.current.song === song ? this.current : null;
     if (entry) {
       const player = entry.player;
@@ -509,6 +525,7 @@ class App {
   }
 
   async removeTrack(song, trackId) {
+    access.assertEdit();
     const track = song.tracks.find((item) => item.id === trackId);
     if (!track) return;
     song.tracks = song.tracks.filter((item) => item.id !== trackId);
@@ -518,6 +535,7 @@ class App {
   }
 
   async deleteSong(id) {
+    access.assertEdit();
     const song = this.songs.get(id);
     if (!song) return;
     if (this.current && this.current.song.id === id) this.unloadCurrent();
@@ -663,7 +681,7 @@ class App {
     if (job) job.boost = null;
     if (stopped()) throw new Cancelled();
     if (!buffers.size) throw new Error('No se pudo leer ninguna pista de esta canción. Revisa el formato de los archivos');
-    this.saveSong(song, true).catch(() => {});
+    if (access.canEdit) this.saveSong(song, true).catch(() => {});
     for (const track of song.tracks) track.solo = false;
     song.click.solo = false;
     song.guide.solo = false;
@@ -696,7 +714,7 @@ class App {
     return entry;
   }
 
-  // Cambia de canción. Si ya está decodificada en memoria (la siguiente del setlist, o la que se acaba de dejar)
+  // Cambia de canción. Si ya está decodificada en memoria (precargada o abierta antes en esta sesión)
   // el cambio es inmediato: no hay pantalla de carga, no se cierra el modo escenario y no se espera a nada.
   // Si no, se decodifica con el avance a la vista y con todos los núcleos disponibles.
   async loadSong(id, { autoplay = false, force = false } = {}) {
@@ -805,6 +823,8 @@ class App {
     song.click.solo = false;
     song.guide.solo = false;
     entry.player.syncWithSong(this.guideVoices);
+    entry.bytes = entry.player.memoryBytes();
+    this.memoryCosts.set(song.id, { signature: entry.signature, bytes: entry.bytes });
   }
 
   // La canción que se deja: si puede hacer falta de nuevo (volver atrás) queda lista en memoria; si no, se libera.
@@ -843,18 +863,20 @@ class App {
   //
   // Decodificar todas las pistas de una canción lleva segundos, y con ella en pantalla esperando eso es
   // justo lo que no se puede permitir en vivo. Por eso la canción que sigue en el setlist se prepara en
-  // segundo plano mientras suena la actual, y la que se acaba de dejar se conserva por si hay que volver.
-  // Todo cabe en un presupuesto de memoria; la que sigue nunca se descarta.
+  // segundo plano mientras suena la actual. Las canciones visitadas se conservan mientras quepan, para
+  // volver varios lugares atrás. Si hace falta espacio se libera primero la menos reciente.
 
   warmBudget() {
     const override = Number(this.settings.warmBudgetMB);
-    if (override > 0) return override * 1048576;
+    if (Number.isFinite(override) && override > 0) return override * 1048576;
     if (MOBILE) return clamp((Number(navigator.deviceMemory) || 4) * 0.12, 0.25, 0.75) * GB;
     return clamp((Number(navigator.deviceMemory) || 4) * 0.45, 1, 4) * GB;
   }
 
   // Memoria que ocupará la canción una vez decodificada (0 si aún no se sabe cuánto duran sus pistas).
   estimateBytes(song) {
+    const measured = this.memoryCosts.get(song.id);
+    if (measured?.signature === decodeSignature(song)) return measured.bytes;
     const rate = this.engine.ctx.sampleRate || 48000;
     const duration = Math.max(0, ...song.tracks.map(track => track.duration || 0));
     // createPlayer pads each stem to the longest one. Include generated click/guide too.
@@ -864,7 +886,14 @@ class App {
     return total * (normalizePitch(song.pitchSemitones) ? 2 : 1);
   }
 
-  // Las canciones que no se pueden descartar: la que sigue y la que se está cargando.
+  memoryUsed() {
+    let bytes = this.current ? this.current.bytes : 0;
+    for (const entry of this.warm.values()) bytes += entry.bytes;
+    return bytes;
+  }
+
+  // La solicitada se protege mientras la carga principal termina. La siguiente tiene prioridad de
+  // retención, pero se puede liberar si el tamaño real supera la estimación.
   pinnedIds() {
     return new Set([this.nextSongId(), this.wantedId].filter(Boolean));
   }
@@ -891,6 +920,7 @@ class App {
 
   addWarm(entry) {
     const id = entry.song.id;
+    this.memoryCosts.set(id, { signature: entry.signature, bytes: entry.bytes });
     const old = this.warm.get(id);
     if (old && old !== entry) old.player.dispose();
     this.warm.delete(id);
@@ -907,29 +937,28 @@ class App {
     this.emit('warm');
   }
 
-  // Libera lo que sobre (primero lo más antiguo, sin tocar lo fijado) para que quepan `extra` bytes más.
+  // Libera lo que sobre (primero lo menos reciente) para que quepan `extra` bytes más.
   makeRoom(extra = 0) {
     const budget = this.warmBudget();
     const pinned = this.pinnedIds();
-    let used = this.current ? this.current.bytes : 0;
-    for (const entry of this.warm.values()) used += entry.bytes;
-    for (const id of Array.from(this.warm.keys())) {
+    let used = this.memoryUsed();
+    const ids = Array.from(this.warm.keys());
+    // La siguiente se descarta al final si tampoco cabe. Nunca se sacrifica el audio solicitado.
+    const evictionOrder = [...ids.filter(id => !pinned.has(id)), ...ids.filter(id => pinned.has(id) && id !== this.wantedId)];
+    for (const id of evictionOrder) {
       if (used + extra <= budget) break;
-      if (pinned.has(id)) continue;
       used -= this.warm.get(id).bytes;
       this.dropWarm(id);
     }
   }
 
-  // De lo que no está fijado se conserva a lo sumo KEPT_BEHIND canciones, y solo si caben en el presupuesto.
+  // La cantidad depende del tamaño del audio y de la RAM, nunca de un límite fijo de una canción anterior.
   enforceBudget() {
     if (!this.settings.preloadNext) {
       for (const id of Array.from(this.warm.keys())) if (id !== this.wantedId) this.dropWarm(id);
       return;
     }
-    const pinned = this.pinnedIds();
-    const spare = Array.from(this.warm.keys()).filter((id) => !pinned.has(id));
-    while (spare.length > KEPT_BEHIND) this.dropWarm(spare.shift());
+    for (const [id, entry] of this.warm) if (!this.isFresh(entry)) this.dropWarm(id);
     this.makeRoom(0);
   }
 
@@ -987,6 +1016,7 @@ class App {
   // actualizada desde la nube): se descarta, también lo que estuviera a medias.
   invalidateSong(id) {
     this.failed.delete(id);
+    this.memoryCosts.delete(id);
     this.dropWarm(id);
     const job = this.jobs.get(id);
     if (job) this.cancelJob(job);
@@ -998,20 +1028,61 @@ class App {
     for (const id of Array.from(this.warm.keys())) if (id !== this.wantedId) this.dropWarm(id);
   }
 
-  // Mantiene lista la canción que sigue en el setlist para que el cambio sea inmediato.
+  preparationCandidates() {
+    const ids = [this.nextSongId(), this.previousSongId()].filter(Boolean);
+    if (this.preparingSetlistId === this.activeSetlistId) ids.push(...this.activeSetlist().songIds);
+    return [...new Set(ids)].filter(id => this.songs.has(id) && id !== this.current?.song.id);
+  }
+
+  preparationStatus() {
+    const ids = [...new Set(this.activeSetlist()?.songIds || [])].filter(id => this.songs.has(id));
+    const ready = ids.filter(id => this.isReady(id)).length;
+    const preparing = ids.filter(id => this.isWarming(id)).length;
+    const failed = ids.filter(id => this.failed.get(id) === decodeSignature(this.songs.get(id))).length;
+    const usedBytes = this.memoryUsed(), budgetBytes = this.warmBudget();
+    const limited = ids.some(id => !this.isReady(id) && !this.isWarming(id) &&
+      this.failed.get(id) !== decodeSignature(this.songs.get(id)) &&
+      usedBytes + this.estimateBytes(this.songs.get(id)) > budgetBytes);
+    return {
+      setlistId: this.activeSetlistId,
+      ready, total: ids.length, preparing, failed,
+      complete: ids.length > 0 && ready === ids.length,
+      limited: this.preparingSetlistId === this.activeSetlistId && limited && !preparing && !this.loading,
+      usedBytes, budgetBytes,
+    };
+  }
+
+  // Preparación voluntaria de todo el setlist, una canción a la vez. Si no cabe entero, quedan listas
+  // las que sí caben y se informa del límite; los archivos descargados siguen guardados en el dispositivo.
+  prepareSetlist() {
+    if (!this.activeSetlist()?.songIds.some(id => this.songs.has(id))) {
+      this.toast('Añade canciones al setlist antes de prepararlo');
+      return this.preparationStatus();
+    }
+    this.preparingSetlistId = this.activeSetlistId;
+    this.failed.clear();
+    this.setSetting('preloadNext', true);
+    this.warmUp();
+    this.emit('warm');
+    return this.preparationStatus();
+  }
+
+  // Mantiene listas la siguiente y la anterior; conserva las ya visitadas y, si se pidió, prepara
+  // todo el setlist hasta el límite de RAM. La canción siguiente tiene prioridad cuando falta espacio.
   warmUp() {
     if (!this.settings.preloadNext) {
       this.discardWarm();
       return;
     }
-    if (!this.current || this.loading || this.player.pitchBusy) return;
-    const candidates = [this.nextSongId()].filter(Boolean);
+    if (this.loading || this.player?.pitchBusy || (!this.current && this.preparingSetlistId !== this.activeSetlistId)) return;
+    const candidates = this.preparationCandidates();
     for (const job of Array.from(this.jobs.values())) if (!job.claimed && !candidates.includes(job.id)) this.cancelJob(job);
     this.enforceBudget();
     // One background song at a time, including on mobile, to protect the live audio.
     if (Array.from(this.jobs.values()).some(job => !job.cancelled)) return;
     for (const id of candidates) {
       const song = this.songs.get(id);
+      if (!song) continue;
       const ready = this.warm.get(id);
       if (ready) {
         if (this.isFresh(ready)) continue;
@@ -1019,9 +1090,8 @@ class App {
       }
       if (this.failed.get(id) === decodeSignature(song)) continue;
       const need = this.estimateBytes(song);
-      if (id === candidates[0]) this.makeRoom(need);
-      let used = this.current.bytes;
-      for (const entry of this.warm.values()) used += entry.bytes;
+      if (id === this.nextSongId()) this.makeRoom(need);
+      const used = this.memoryUsed();
       if (used + need > this.warmBudget()) continue;
       const job = this.startJob(song, { foreground: false });
       job.promise.then(() => this.warmUp(), () => this.warmUp());
@@ -1126,12 +1196,21 @@ class App {
       return false;
     }
     this.cancelAdvance();
-    this.discardWarm();
+    // El cálculo de tonalidad usa CPU y buffers adicionales, pero no invalida las otras canciones.
+    for (const job of Array.from(this.jobs.values())) if (!job.claimed) this.cancelJob(job);
+    const extra = normalizePitch(value) ? entry.player.fileTracks.reduce((bytes, track) => {
+      const include = enabled[track.def.id] ?? track.def.pitchEnabled ?? defaultPitchEnabled(track.def);
+      const buffer = track.originalBuffer;
+      return bytes + (include && buffer ? buffer.length * buffer.numberOfChannels * 4 : 0);
+    }, 0) : 0;
+    this.makeRoom(extra);
     try {
       await entry.player.setPitch(value, { enabled, onProgress: state => this.emit('pitch:progress', { ...state, entry }) });
       entry.bytes = entry.player.memoryBytes();
+      entry.signature = decodeSignature(entry.song);
+      this.memoryCosts.set(entry.song.id, { signature: entry.signature, bytes: entry.bytes });
       this.syncPadSong();
-      await this.saveSong(entry.song, true).catch(() => this.toast('El tono se aplicó, pero no se pudo guardar el ajuste', 'error'));
+      if (access.canEdit) await this.saveSong(entry.song, true).catch(() => this.toast('El tono se aplicó, pero no se pudo guardar el ajuste', 'error'));
       if (this.current === entry) {
         this.emit('song:refresh', entry);
         this.toast(normalizePitch(value) ? `Tonalidad aplicada: ${pitchLabel(value)}` : 'Tonalidad original restaurada');
@@ -1142,6 +1221,7 @@ class App {
       return false;
     } finally {
       if (this.current === entry) this.emit('pitch:progress', { entry, done: 0, total: 0 });
+      this.enforceBudget();
       this.warmUp();
     }
   }

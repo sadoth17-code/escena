@@ -4,6 +4,8 @@ import { normalizeSong, serializableSong } from './library.js';
 import { createEmitter, fmtBytes } from './util.js';
 import { CLOUD_API_URL } from './cloud-config.js';
 import { cloudRequest, TRANSFER_ATTEMPTS } from './cloud-request.js';
+import { cloudSongHash } from './cloud-song-state.js';
+import { access } from './access.js';
 
 const CHUNK = 8 * 1024 * 1024;
 const newId = () => crypto.randomUUID();
@@ -32,6 +34,7 @@ class Cloud {
     this.bus = createEmitter(); this.api = ''; this.key = ''; this.ready = false;
     this.catalog = []; this.active = null; this.progress = null; this.retry = null; this.loading = false;
     this.initPromise = null;
+    this._role = null; this.credentialsVerified = false;
   }
   on(name, fn) { return this.bus.on(name, fn); }
   emit() { this.bus.emit('change'); }
@@ -41,19 +44,46 @@ class Cloud {
       this.api = CLOUD_API_URL.trim() || await store.getMeta('cloudApi', '');
       if (this.api) this.api = normalizeUrl(this.api);
       try { this.key = sessionStorage.getItem(`escena-cloud:${this.api}`) || ''; } catch { /* solo memoria */ }
+      const profile = await store.getMeta('cloudDeviceRole', null);
+      if (['master', 'player'].includes(profile?.role)) this._role = profile.role;
+      if (this.key) {
+        const fingerprint = await hash(new TextEncoder().encode(this.key));
+        const cached = await store.getMeta(`cloudRole:${this.api}:${fingerprint}`, null);
+        if (['master', 'player'].includes(cached)) { this._role = cached; this.credentialsVerified = true; }
+      }
       this.catalog = await store.getMeta(`cloudCatalog:${this.api}`, []);
       this.ready = true; this.emit();
     })();
     return this.initPromise;
   }
   get connected() { return Boolean(this.api && this.key); }
+  // Se conserva al desconectarse: el dispositivo de reproducción sigue protegido
+  // sin internet. Solo una clave maestra verificada puede cambiar ese perfil.
+  get role() { return this._role; }
+  get canPublish() { return this.connected && this.credentialsVerified && this.role === 'master'; }
+  async rememberRole(role) {
+    if (!['master', 'player'].includes(role)) throw new Error('Actualiza el Worker de tu nube para habilitar los perfiles maestro y reproducción.');
+    const fingerprint = await hash(new TextEncoder().encode(this.key));
+    await store.setMeta(`cloudRole:${this.api}:${fingerprint}`, role);
+    await store.setMeta('cloudDeviceRole', { api: this.api, role });
+    this._role = role; this.credentialsVerified = true;
+  }
+  async verifyRole() {
+    const result = await this.request('/v1/ping');
+    await this.rememberRole(result.role); this.emit();
+    return result;
+  }
+  requireMaster() {
+    access.assertEdit();
+    if (!this.canPublish) throw new Error(this.role === 'player' ? 'Este equipo tiene acceso de reproducción. Solo el maestro puede publicar cambios.' : 'Conecta la clave maestra para publicar cambios.');
+  }
   async connect(api, key) {
     if (this.active) throw new Error('Pausa la transferencia antes de cambiar de nube');
     const target = normalizeUrl(api.trim()), secret = key.trim();
     if (!/^[a-f0-9]{64}$/.test(secret)) throw new Error('La clave debe tener 64 caracteres. Usa la generada durante la configuración.');
-    const old = { api: this.api, key: this.key };
-    this.api = target; this.key = secret;
-    try { await this.request('/v1/ping'); }
+    const old = { api: this.api, key: this.key, _role: this._role, credentialsVerified: this.credentialsVerified };
+    this.api = target; this.key = secret; this.credentialsVerified = false;
+    try { await this.verifyRole(); }
     catch (error) { Object.assign(this, old); throw error; }
     await store.setMeta('cloudApi', target);
     try { if (old.api !== target) sessionStorage.removeItem(`escena-cloud:${old.api}`); sessionStorage.setItem(`escena-cloud:${target}`, secret); } catch { /* solo memoria */ }
@@ -64,10 +94,11 @@ class Cloud {
   disconnect() {
     this.pause();
     try { sessionStorage.removeItem(`escena-cloud:${this.api}`); } catch { /* solo memoria */ }
-    this.key = ''; this.emit();
+    this.key = ''; this.credentialsVerified = false; this.emit();
   }
   async request(path, { method = 'GET', data, bytes, headers = {}, signal, binary = false } = {}) {
     if (!this.connected) throw new Error('Conecta tu nube para continuar');
+    if (!['GET', 'HEAD'].includes(method)) this.requireMaster();
     const transferring = Boolean(signal && this.active?.controller.signal === signal);
     return cloudRequest(this.api + path, {
       method, data, bytes, headers: { Authorization: `Bearer ${this.key}`, ...headers }, signal, binary,
@@ -79,6 +110,7 @@ class Cloud {
     if (!this.connected) return;
     this.loading = true; this.emit();
     try {
+      await this.verifyRole();
       const songs = []; let cursor;
       do {
         const page = await this.request('/v1/songs' + (cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''));
@@ -89,6 +121,9 @@ class Cloud {
     } finally { this.loading = false; this.emit(); }
   }
   local(id) { return app.songList().find(song => song.cloud?.endpoint === this.api && song.cloud?.id === id); }
+  async localHasChanges(song) {
+    return Boolean(song?.cloud?.syncedHash && await cloudSongHash(song) !== song.cloud.syncedHash);
+  }
   async pending() { return (await store.all('cloudTransfers')).filter(job => job.endpoint === this.api); }
   pause() { this.active?.controller.abort(); }
   async exclusive(operation) {
@@ -141,12 +176,15 @@ class Cloud {
   async performUpload(song, { asNew = false } = {}) {
     await this.init();
     if (!this.connected) throw new Error('Conecta tu nube antes de subir');
+    this.requireMaster();
+    if (navigator.onLine === false) throw new Error('Sin internet. Los cambios quedan guardados en este equipo; publícalos cuando vuelva la conexión.');
+    await app.persistSongSoon.flushPending?.();
     const jobId = `up:${this.api}:${song.id}`;
     let job = await store.get('cloudTransfers', jobId);
     if (!job) {
       const linked = !asNew && song.cloud?.endpoint === this.api;
       const snapshot = serializableSong(song); delete snapshot.cloud;
-      job = { id: jobId, kind: 'upload', endpoint: this.api, localId: song.id, title: song.title, songId: linked ? song.cloud.id : newId(), revision: newId(), expectedRevision: linked ? song.cloud.revision : null, song: snapshot, files: [], total: 0 };
+      job = { id: jobId, kind: 'upload', endpoint: this.api, localId: song.id, title: song.title, songId: linked ? song.cloud.id : newId(), revision: newId(), expectedRevision: linked ? song.cloud.revision : null, song: snapshot, contentHash: await cloudSongHash(snapshot), files: [], total: 0 };
       for (const track of snapshot.tracks) {
         const file = await store.get('files', track.fileId);
         if (!file?.blob || !file.blob.size) throw new Error(`No se encontró el audio de «${track.name}»`);
@@ -161,6 +199,10 @@ class Cloud {
       }
       await store.put('cloudTransfers', job);
     }
+    // Una reanudación conserva la foto, secciones y pistas de su instantánea.
+    // No publicar esa versión antigua como si incluyera las ediciones más recientes.
+    const savedHash = job.contentHash || await cloudSongHash(job.song);
+    if (await cloudSongHash(song) !== savedHash) throw new Error('La canción cambió desde la subida pendiente. Descarta esa transferencia y vuelve a publicar para incluir la portada, secciones y pistas actuales.');
     return this.run(job, async signal => {
       for (const file of job.files) {
         if (signal.aborted) throw stopError();
@@ -190,7 +232,7 @@ class Cloud {
       this.notify(job, 'Publicando canción…');
       await this.request(`/v1/songs/${job.songId}/publish`, { method: 'POST', data: { manifest, expectedRevision: job.expectedRevision }, signal });
       const current = app.songs.get(job.localId);
-      if (current) { current.cloud = { endpoint: this.api, id: job.songId, revision: job.revision }; await app.saveSong(current); }
+      if (current) { current.cloud = { endpoint: this.api, id: job.songId, revision: job.revision, syncedHash: savedHash }; await app.saveSong(current); }
       await store.remove('cloudTransfers', job.id);
       app.toast('Canción guardada en tu nube');
       await this.refresh();
@@ -199,6 +241,7 @@ class Cloud {
   download(id, resumeJob = null) { return this.exclusive(() => this.performDownload(id, resumeJob)); }
   async performDownload(id, resumeJob = null) {
     await this.init();
+    await app.persistSongSoon.flushPending?.();
     let job = resumeJob;
     if (!job) {
       const manifest = validateDownload(await this.request(`/v1/songs/${id}`));
@@ -206,8 +249,9 @@ class Cloud {
       job = await store.get('cloudTransfers', jobId);
       if (!job) {
         const existing = this.local(id);
+        const savedExisting = existing ? await store.get('songs', existing.id) || existing : null;
         const token = newId();
-        job = { id: jobId, token, kind: 'download', endpoint: this.api, title: manifest.song.title, manifest, localId: existing?.id || newId(), counts: {}, completed: {}, total: manifest.files.reduce((sum, file) => sum + file.size, 0) };
+        job = { id: jobId, token, kind: 'download', endpoint: this.api, title: manifest.song.title, manifest, localId: existing?.id || newId(), localStartHash: savedExisting ? await cloudSongHash(savedExisting) : null, counts: {}, completed: {}, total: manifest.files.reduce((sum, file) => sum + file.size, 0) };
         await store.put('cloudTransfers', job);
       }
     }
@@ -255,10 +299,15 @@ class Cloud {
       }
       if (signal.aborted) throw stopError();
       if (app.current?.song.id === job.localId && app.player?.state === 'playing') throw new Error('La descarga está completa. Detén la canción y reanuda para aplicar la actualización.');
-      const old = app.songs.get(job.localId);
-      const song = normalizeSong({ ...manifest.song, id: job.localId, tracks: manifest.song.tracks.map(track => ({ ...track, fileId: job.completed[track.id] })), cloud: { endpoint: this.api, id: manifest.id, revision: manifest.revision } });
-      // Evita que un guardado pendiente del editor sobrescriba la versión recibida.
+      // Termina el guardado anterior antes de comprobar y sustituir la copia.
       await app.persistSongSoon.flushPending?.();
+      const old = app.songs.get(job.localId);
+      const savedOld = old ? await store.get('songs', job.localId) || old : null;
+      // Los cambios momentáneos del músico en modo reproducción no son ediciones
+      // del catálogo. Compara la copia guardada, que sí puede haber editado el maestro.
+      if (savedOld && job.localStartHash && await cloudSongHash(savedOld) !== job.localStartHash) throw new Error('La copia local cambió durante la descarga. Se conservaron tus cambios. Descarta esta descarga y pulsa «Actualizar» de nuevo cuando hayas guardado lo que necesites.');
+      const song = normalizeSong({ ...manifest.song, id: job.localId, tracks: manifest.song.tracks.map(track => ({ ...track, fileId: job.completed[track.id] })), cloud: { endpoint: this.api, id: manifest.id, revision: manifest.revision } });
+      song.cloud.syncedHash = await cloudSongHash(song);
       await store.commitCloudSong(serializableSong(song), old?.tracks.map(track => track.fileId) || [], job.id);
       if (app.current?.song.id === song.id) app.unloadCurrent();
       // Lo que hubiera decodificado de la versión anterior ya no sirve.

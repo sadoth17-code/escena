@@ -8,6 +8,7 @@ import { gatherAudio, draftTracks, isClickName, songBytes, songDuration } from '
 import { icon, iconButton, openModal, confirmDialog, createSegmented, createSwitch, createSectionPicker, createGuideLanguageSelect, field, settingRow } from './kit.js';
 import { createSectionMap, clockText } from './section-map.js';
 import { createCoverPicker } from './cover.js';
+import { access } from '../access.js';
 
 const TABS = [
   { id: 'general', label: 'General' },
@@ -52,6 +53,7 @@ function numberInput({ value, min, max, step = 1, label, onChange, disabled = fa
 }
 
 export function openEditor(song, tab = 'general') {
+  if (!access.canEdit) { app.toast('Entra como maestro para editar la canción', 'error'); return null; }
   const entry = () => (app.current && app.current.song === song ? app.current : null);
   let active = TABS.some((item) => item.id === tab) ? tab : 'general';
   let dirty = false;
@@ -86,6 +88,7 @@ export function openEditor(song, tab = 'general') {
     body: h('div', { class: 'editor-body' }, tabBar, content),
     actions: [{ label: 'Listo', kind: 'primary', icon: 'check', onClick: (api) => api.close() }],
     onClose: () => {
+      offAccess();
       destroyMap();
       offLoaded();
       offUnloaded();
@@ -93,6 +96,7 @@ export function openEditor(song, tab = 'general') {
       if (current && dirty) app.emit('song:refresh', current);
     },
   });
+  const offAccess = access.on('change', () => { if (!access.canEdit) modal.close(); });
   const titleEl = modal.el.querySelector('.modal-head h2');
 
   const changed = (kind) => {

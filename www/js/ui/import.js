@@ -6,10 +6,12 @@ import { buildDemo } from '../demo.js';
 import { tempoIsShaky, tempoWarning } from '../tempo.js';
 import { icon, openModal, field } from './kit.js';
 import { createCoverPicker } from './cover.js';
+import { access } from '../access.js';
 
 const MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
 export async function importDemo() {
+  access.assertEdit();
   const demo = await buildDemo();
   const song = await app.importSong(demo.title, demo.drafts, null, { tempo: demo.tempo, markers: demo.markers });
   await app.addToSetlist([song.id]);
@@ -25,6 +27,7 @@ function detectLabel(state) {
 }
 
 export function openImport({ files = null, onEdit } = {}) {
+  if (!access.canEdit) { app.toast('Entra como maestro para importar canciones', 'error'); return null; }
   const state = {
     stage: 'pick',
     items: [],

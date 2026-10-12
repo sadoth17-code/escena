@@ -4,6 +4,9 @@ import { store } from '../store.js';
 import { OUTPUT_MODES, ROUTE_KEYS, normalizeRoutes } from '../engine.js';
 import { controls, ACTIONS } from '../controls.js';
 import { platform } from '../platform.js';
+import { access } from '../access.js';
+import { offline } from '../offline.js';
+import { openAccess } from './access.js';
 import { icon, openModal, createSegmented, createSwitch, createRange, createGuideLanguageSelect, settingRow, field, dbLabel, confirmDialog } from './kit.js';
 
 const DIAGRAMS = {
@@ -340,7 +343,7 @@ export function openSettings() {
     field('Al terminar la canción', after.el),
     gap,
     settingRow('Pre-conteo automático', 'Cuenta antes de empezar desde el inicio', autoCount.el),
-    settingRow('Precarga inteligente', 'Prepara la siguiente y conserva la anterior cuando caben en memoria, también en móviles. Descargada significa guardada; Lista significa preparada para sonar.', preload.el),
+    settingRow('Precarga inteligente', 'Conserva las canciones visitadas que caben en memoria y prepara las cercanas. Usa Preparar setlist antes de tocar. Descargada significa guardada; Lista significa preparada para sonar.', preload.el),
     settingRow('Mantener pantalla encendida', 'Evita que el dispositivo se bloquee mientras tocas', awake.el)
   );
 
@@ -456,7 +459,28 @@ export function openSettings() {
   };
   unsubscribe.push(platform.on('install', renderInstall));
   renderInstall();
-  const appSection = section('Aplicación', null, installBox, usageText, persistButton, h('p', { class: 'field-hint', text: 'Escena · Nube v5 · Click y guías · ingvelarde.com' }));
+  const offlineResult = h('div', { class: 'offline-report', role: 'status' });
+  const offlineCheck = h('button', { type: 'button', class: 'btn', onClick: async () => {
+    offlineCheck.disabled = true;
+    offlineResult.textContent = 'Comprobando la aplicación y los archivos locales…';
+    try {
+      const report = await offline.inspect({ songs: app.songList(), isReady: id => app.isReady(id) });
+      const problemSongs = report.songs.filter(song => !song.complete);
+      offlineResult.replaceChildren(
+        h('b', { class: report.ready ? 'offline-ready' : 'warn', text: report.ready ? 'Lista para usar sin internet' : 'Preparación sin internet incompleta' }),
+        h('p', { text: `${report.assets.ready ? 'Aplicación disponible' : report.assets.error || 'Falta guardar la aplicación con conexión'}. ${report.complete}/${report.total} canciones completas · ${report.prepared} preparadas en memoria.` }),
+        ...problemSongs.map(song => h('p', { class: 'warn', text: `${song.title}: faltan ${song.missing.map(track => track.name).join(', ')}. Vuelve a descargar esta canción con conexión.` })),
+        h('p', { class: 'field-hint', text: 'Sin conexión puedes tocar, saltar, mezclar y usar el pad. La nube y las actualizaciones requieren internet. Al cerrar la app, el audio se prepara de nuevo; las canciones descargadas permanecen guardadas.' })
+      );
+    } catch (error) { offlineResult.textContent = error.message; }
+    finally { offlineCheck.disabled = false; }
+  } }, icon('check', 18), 'Comprobar uso sin internet');
+  const appSection = section('Aplicación y uso sin internet', null, installBox, usageText, persistButton, offlineCheck, offlineResult, h('p', { class: 'field-hint', text: 'Escena · Versión 7 · ingvelarde.com' }));
+  const accessStatus = h('p', { class: 'field-hint' });
+  const renderAccess = () => { accessStatus.textContent = access.cloudRole === 'player' ? 'Este equipo tiene acceso de reproducción a la nube. La edición está bloqueada incluso sin internet.' : access.configured ? `Clave local configurada. Modo ${access.canEdit ? 'maestro' : 'reproducción'}.` : 'La edición local aún no tiene clave. Configura el acceso maestro antes de compartir este equipo.'; };
+  unsubscribe.push(access.on('change', renderAccess));
+  renderAccess();
+  const accessSection = section('Acceso maestro', 'La clave local protege la edición de este equipo. En Nube usa claves distintas para maestro y reproducción.', accessStatus, h('button', { type: 'button', class: 'btn', onClick: openAccess }, icon('shield', 18), 'Administrar acceso'));
 
   const wipe = h('button', {
     type: 'button',
@@ -470,6 +494,6 @@ export function openSettings() {
     },
   }, 'Restablecer ajustes');
 
-  modal.body.firstChild.replaceChildren(outputSection, playbackSection, guideSection, controlsSection, appSection, h('div', { class: 'danger-zone' }, wipe));
+  modal.body.firstChild.replaceChildren(outputSection, playbackSection, guideSection, controlsSection, accessSection, appSection, h('div', { class: 'danger-zone' }, wipe));
   return modal;
 }

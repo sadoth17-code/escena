@@ -109,7 +109,7 @@ export function createMixer({ onEdit }) {
     miniPlay,
     h('div', { class: 'mini-text' }, miniTitle, miniInfo),
     h('div', { class: 'legend' }, h('span', { class: 'dest', text: 'SALA' }), h('span', { class: 'dest cue', text: 'CUE' })),
-    h('button', { type: 'button', class: 'btn small', 'aria-label': 'Editar pistas', onClick: () => onEdit('tracks') }, icon('edit', 16), h('span', { class: 'btn-text', text: 'Pistas' }))
+    h('button', { type: 'button', class: 'btn small', 'data-master-only': '', 'aria-label': 'Editar pistas', onClick: () => onEdit('tracks') }, icon('edit', 16), h('span', { class: 'btn-text', text: 'Pistas' }))
   );
   const empty = h('div', { class: 'mixer-empty', text: 'La mezcla aparece al cargar una canción' });
   const touchHint = h('p', { class: 'mixer-touch-hint', text: 'Desliza de lado para ver canales. Arrastra la perilla hacia arriba o abajo para cambiar el volumen.' });

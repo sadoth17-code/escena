@@ -1,5 +1,7 @@
 import { h, $ } from '../util.js';
 import { icon, iconButton } from './kit.js';
+import { access } from '../access.js';
+import { offline } from '../offline.js';
 
 const MARK = `<svg viewBox="0 0 64 64" width="28" height="28" aria-hidden="true"><g stroke-linecap="round" stroke-width="5" fill="none"><path stroke="#35c9ff" d="M12 26v12M21 19v26M30 12v40M46 17v30M55 25v14"/><path stroke="#ffb020" d="M38 7v50"/></g></svg>`;
 
@@ -9,18 +11,29 @@ const TABS = [
   { id: 'lib', label: 'Setlist', icon: 'list' },
 ];
 
-export function createShell({ onSettings, onStage }) {
+export function createShell({ onSettings, onStage, onAccess }) {
   const root = $('#app');
   root.replaceChildren();
   const mark = h('span', { class: 'brand-mark' });
   mark.innerHTML = MARK;
   const now = h('div', { class: 'now' });
+  const network = h('span', { class: 'network-badge', role: 'status' });
+  const accessButton = h('button', { type: 'button', class: 'btn small access-launcher', onClick: onAccess }, icon('shield', 16), h('span'));
+  const refreshStatus = () => {
+    network.textContent = offline.online ? 'Con conexión' : 'Sin conexión';
+    network.classList.toggle('is-offline', !offline.online);
+    accessButton.querySelector('span:last-child').textContent = access.label;
+    document.body.dataset.access = access.canEdit ? 'master' : 'player';
+  };
+  access.on('change', refreshStatus);
+  offline.on('network', refreshStatus);
+  refreshStatus();
   const topbar = h(
     'header',
     { class: 'topbar' },
     h('div', { class: 'brand' }, mark, h('span', { class: 'brand-name', text: 'Escena' })),
     now,
-    h('div', { class: 'top-actions' }, iconButton({ name: 'stage', label: 'Modo escenario', onClick: onStage }), iconButton({ name: 'sliders', label: 'Ajustes', onClick: onSettings }))
+    h('div', { class: 'top-actions' }, network, accessButton, iconButton({ name: 'stage', label: 'Modo escenario', onClick: onStage }), iconButton({ name: 'sliders', label: 'Ajustes', onClick: onSettings }))
   );
   const panels = {
     lib: h('aside', { class: 'panel panel-lib', 'aria-label': 'Setlist y biblioteca' }),
@@ -59,7 +72,7 @@ export function createShell({ onSettings, onStage }) {
       }
     },
     isVisible(name) {
-      return media.matches || layout.dataset.tab === name;
+      return media.matches ? name === 'lib' || (layout.dataset.tab === 'mix' ? name === 'mix' : name === 'play') : layout.dataset.tab === name;
     },
   };
   api.setTab('play');

@@ -13,6 +13,10 @@ import { createStage } from './ui/stage.js';
 import { openImport, importDemo } from './ui/import.js';
 import { openEditor } from './ui/editor.js';
 import { openSettings } from './ui/settings.js';
+import { access } from './access.js';
+import { cloud } from './cloud.js';
+import { openAccess } from './ui/access.js';
+import { installOffline, offline } from './offline.js';
 
 function showFatal(error) {
   const root = document.getElementById('app');
@@ -31,6 +35,10 @@ function showFatal(error) {
 async function boot() {
   try {
     await app.init();
+    await access.init();
+    await cloud.init();
+    access.setCloudRole(cloud.role);
+    cloud.on('change', () => access.setCloudRole(cloud.role));
   } catch (error) {
     console.error(error);
     showFatal(error);
@@ -68,7 +76,7 @@ async function boot() {
     stage.show();
   };
 
-  shell = createShell({ onSettings: openSettings, onStage: openStage });
+  shell = createShell({ onSettings: openSettings, onStage: openStage, onAccess: openAccess });
   stage = createStage();
   playerView = createPlayerView({ onEdit: editCurrent, onImport: () => startImport(null), onDemo: makeDemo });
   mixer = createMixer({ onEdit: editCurrent });
@@ -156,6 +164,11 @@ async function boot() {
 
   controls.init();
   installPlatform();
+  installOffline();
+  offline.on('network', ({ online }) => {
+    app.emit('network', { online });
+    showToast({ message: online ? 'Conexión disponible' : 'Sin conexión. Las canciones descargadas y los pads siguen disponibles.', duration: 6500 });
+  });
   app.startDevices();
   store.requestPersistence();
 
