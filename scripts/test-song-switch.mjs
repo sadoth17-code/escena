@@ -24,6 +24,15 @@ const emitter = () => {
   };
 };
 const store = { setMeta: async () => {}, getMany: async () => [] };
+// Replace storage streaming only; every test below still runs the real App.prepare.
+// The default emulates opening a locally prepared two-second head through the fake engine.
+let fakeDiskAudio = async (engine, blob, options = {}) => {
+  const head = await engine.decode(blob, { cancelled: options.cancelled });
+  return {
+    ...head, stream: true, preparedPitch: true,
+    memoryBytes: () => Math.ceil(Math.min(2, head.duration) * engine.ctx.sampleRate) * head.numberOfChannels * 4,
+  };
+};
 const context = vm.createContext({
   navigator: { userAgent: 'Android', deviceMemory: 4, hardwareConcurrency: 4 },
   AbortController, console,
@@ -32,6 +41,7 @@ const stubs = {
   './util.js': { createEmitter: emitter, debounce: fn => fn, isIOS: () => false, clamp: (n, lo, hi) => Math.min(hi, Math.max(lo, n)) },
   './store.js': { store },
   './audio-info.js': { readAudioInfo: async () => null },
+  './disk-audio.js': { DISK_CHUNK_SECONDS: 2, createDiskAudio: (...args) => fakeDiskAudio(...args) },
   './engine.js': { Engine: class {}, DEFAULT_OUTPUT: { routes: {} }, normalizeRoutes: routes => routes || {} },
   './library.js': { normalizeSong: song => song, serializableSong: song => song, createSong() {}, createTrackDef() {}, createSetlist() {} },
   './tempo.js': { normalizeTempoEntries() {}, detectTempoFromBuffer() {} },
@@ -77,10 +87,13 @@ function entry(song, bytes = song.testBytes) {
   return {
     song, bytes, failed: [], signature: `0|${song.id}-track:${song.id}-file:0:0`,
     player: {
-      state: 'stopped', disposed: false, rewinds: 0,
-      rewind() { this.rewinds++; this.state = 'stopped'; },
+      state: 'stopped', disposed: false, rewinds: 0, playRequest: 0, playOptions: [], liveBytes: bytes,
+      async play(options) { this.playOptions.push(options); this.state = 'playing'; },
+      rewind() { this.rewinds++; this.playRequest++; this.state = 'stopped'; },
+      pause() { this.playRequest++; if (this.state === 'playing') this.state = 'paused'; },
+      stop() { this.playRequest++; this.state = 'stopped'; },
       dispose() { this.disposed = true; },
-      syncWithSong() {}, memoryBytes() { return bytes; },
+      syncWithSong() {}, memoryBytes() { return this.liveBytes; },
     },
   };
 }
@@ -200,17 +213,18 @@ test('opportunistic setlist preparation preserves the last visited library song 
   assert.equal(previous.player.disposed, false);
 });
 
-test('RAM estimates use the original mono channels before any song is decoded', () => {
+test('RAM estimates reserve two-second heads using original mono channels', () => {
   const app = fixture(['a']);
   const original = app.songs.get('a');
   original.tracks = Array.from({ length: 8 }, (_, index) => ({
     id: `mono-${index}`, fileId: `mono-file-${index}`, mono: false,
   }));
   app.audioInfo = new Map(original.tracks.map(track => [track.fileId, { channels: 1, duration: 120 }]));
-  const expectedBytes = 120 * 48000 * 4 * (8 + 2);
+  const expectedBytes = 2 * 48000 * 4 * (8 + 2);
   assert.equal(App.prototype.estimateBytes.call(app, original), expectedBytes);
-  // Two two-minute, eight-stem mono songs fit in 512 MiB with their click and guide.
-  assert.ok(expectedBytes * 2 < 512 * MB);
+  // The duration of the song does not reserve a full-song AudioBuffer in RAM.
+  for (const info of app.audioInfo.values()) info.duration = 300;
+  assert.equal(App.prototype.estimateBytes.call(app, original), expectedBytes);
 });
 
 test('RAM estimates still account for stereo stems and explicit downmixing', () => {
@@ -220,12 +234,12 @@ test('RAM estimates still account for stereo stems and explicit downmixing', () 
     id: `stereo-${index}`, fileId: `stereo-file-${index}`, mono: false, duration: 120,
   }));
   app.audioInfo = new Map(original.tracks.map(track => [track.fileId, { channels: 2, duration: 120 }]));
-  assert.equal(App.prototype.estimateBytes.call(app, original), 120 * 48000 * 4 * (16 + 2));
+  assert.equal(App.prototype.estimateBytes.call(app, original), 2 * 48000 * 4 * (16 + 2));
   for (const track of original.tracks) track.mono = true;
-  assert.equal(App.prototype.estimateBytes.call(app, original), 120 * 48000 * 4 * (8 + 2));
+  assert.equal(App.prototype.estimateBytes.call(app, original), 2 * 48000 * 4 * (8 + 2));
 });
 
-test('pitch memory estimates duplicate only the stems selected for processing', () => {
+test('pitch memory estimates keep only the prepared heads rather than full originals', () => {
   const app = fixture(['a']);
   const original = app.songs.get('a');
   original.pitchSemitones = 2;
@@ -233,10 +247,23 @@ test('pitch memory estimates duplicate only the stems selected for processing', 
     id: `pitch-${index}`, fileId: `pitch-file-${index}`, mono: false, pitchEnabled: index < 4,
   }));
   app.audioInfo = new Map(original.tracks.map(track => [track.fileId, { channels: 1, duration: 120 }]));
-  // Eight mono stems, two generated channels and originals for the four pitched stems.
-  assert.equal(App.prototype.estimateBytes.call(app, original), 120 * 48000 * 4 * (8 + 2 + 4));
+  // Retuned audio lives in persistent chunks; eight heads plus click and guide stay in RAM.
+  assert.equal(App.prototype.estimateBytes.call(app, original), 2 * 48000 * 4 * (8 + 2));
   for (const track of original.tracks) track.pitchEnabled = false;
-  assert.equal(App.prototype.estimateBytes.call(app, original), 120 * 48000 * 4 * (8 + 2));
+  assert.equal(App.prototype.estimateBytes.call(app, original), 2 * 48000 * 4 * (8 + 2));
+});
+
+test('RAM accounting follows streamed block allocation and release after preparation', () => {
+  const app = fixture(['a', 'b']);
+  app.current = entry(app.songs.get('a'));
+  app.addWarm(entry(app.songs.get('b')));
+  assert.equal(app.memoryUsed(), 20 * MB);
+  app.current.player.liveBytes = 15 * MB;
+  app.warm.get('b').player.liveBytes = 3 * MB;
+  assert.equal(app.memoryUsed(), 18 * MB);
+  // Snapshot costs deliberately stay stale: live player accounting must take priority.
+  assert.equal(app.current.bytes, 10 * MB);
+  assert.equal(app.warm.get('b').bytes, 10 * MB);
 });
 
 test('audio header inspection reads each local file once even when its format is unknown', async () => {
@@ -435,7 +462,7 @@ test('a stale ready entry is discarded and regenerated from local audio', async 
   assert.deepEqual(app.prepared, ['b']);
 });
 
-test('prepared arbitrary selections reuse decoded local stems without reading or decoding them again', async () => {
+test('prepared arbitrary selections reuse local heads without reading or decoding them again', async () => {
   const app = fixture(['a', 'b', 'c']);
   app.setlists[0].songIds = ['a', 'b'];
   const reads = [], decodes = [];
@@ -467,6 +494,270 @@ test('prepared arbitrary selections reuse decoded local stems without reading or
   } finally {
     store.getMany = previousGetMany;
   }
+});
+
+test('preparation passes mono and pitch to local storage once and does not retune an already prepared stream', async () => {
+  const app = fixture(['a']);
+  app.prepare = App.prototype.prepare;
+  const original = app.songs.get('a');
+  original.pitchSemitones = -3;
+  original.tracks[0].mono = true;
+  original.tracks[0].pitchEnabled = true;
+  const previousGetMany = store.getMany, previousDiskAudio = fakeDiskAudio;
+  const calls = [];
+  store.getMany = async (name, ids) => ids.map(id => ({ blob: { id } }));
+  fakeDiskAudio = async (engine, blob, options) => {
+    calls.push({ blob, options });
+    return { stream: true, preparedPitch: true, duration: 300, sourceChannels: 2, numberOfChannels: 1, memoryBytes: () => 384000 };
+  };
+  app.engine.loadVoices = async () => new Map();
+  app.engine.createPlayer = currentSong => ({
+    ...entry(currentSong).player, on() {}, peaks() {},
+    async setPitch() { assert.fail('App.prepare must not render a prepared stream twice'); },
+  });
+  try {
+    const prepared = await app.prepare(original);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].options.fileId, 'a-file');
+    assert.equal(calls[0].options.mono, true);
+    assert.equal(calls[0].options.pitchSemitones, -3);
+    assert.equal(calls[0].options.pitchEnabled, true);
+    assert.equal(prepared.player.pitchSemitones, -3);
+    assert.equal(app.audioInfo.get('a-file').channels, 2, 'Header metadata retains original channel count');
+    assert.equal(original.tracks[0].duration, 300);
+  } finally {
+    store.getMany = previousGetMany;
+    fakeDiskAudio = previousDiskAudio;
+  }
+});
+
+test('seven five-minute songs with ten stereo stems fit in 128 MiB and switch 1→7→1 without I/O', async () => {
+  const ids = Array.from({ length: 7 }, (_, index) => `mt${index + 1}`);
+  const app = fixture(ids, 128);
+  app.estimateBytes = App.prototype.estimateBytes;
+  app.prepare = App.prototype.prepare;
+  app.audioInfo = new Map();
+  for (const original of app.songs.values()) {
+    original.tracks = Array.from({ length: 10 }, (_, index) => ({
+      id: `${original.id}-track${index}`, fileId: `${original.id}-file${index}`,
+      name: `Pista ${index + 1}`, mono: false, pitchEnabled: false, duration: 300,
+    }));
+    for (const track of original.tracks) app.audioInfo.set(track.fileId, { channels: 2, duration: 300 });
+  }
+  const reads = [], heads = [];
+  const previousGetMany = store.getMany, previousDiskAudio = fakeDiskAudio;
+  let decodes = 0;
+  store.getMany = async (name, fileIds) => {
+    assert.equal(name, 'files');
+    reads.push(...fileIds);
+    return fileIds.map(id => ({ blob: { id } }));
+  };
+  // A previously downloaded/prepared disk source returns only its pinned head.
+  // Decoding a full five-minute stem would fail this integration test.
+  app.engine.decode = async () => { decodes++; throw new Error('Full-song decoding is forbidden'); };
+  fakeDiskAudio = async (engine, blob, options) => {
+    assert.equal(options.fileId, blob.id);
+    assert.equal(options.cancelled(), false);
+    const head = { duration: 2, length: 96000, sampleRate: 48000, numberOfChannels: 2 };
+    heads.push(blob.id);
+    return {
+      stream: true, preparedPitch: true, duration: 300, length: 14400000,
+      sampleRate: 48000, numberOfChannels: 2, chunkSeconds: 2,
+      memoryBytes: () => head.length * head.numberOfChannels * 4,
+      peekChunk: index => index === 0 ? head : null,
+      getChunk: async index => { assert.equal(index, 0); return head; },
+      ensure: async () => {}, dispose() {},
+    };
+  };
+  app.engine.loadVoices = async () => new Map();
+  app.engine.createPlayer = (original, buffers) => {
+    assert.equal(buffers.size, 10);
+    assert.ok([...buffers.values()].every(buffer => buffer.stream && buffer.peekChunk(0)));
+    const player = entry(original).player;
+    player.memoryBytes = () => [...buffers.values()].reduce((sum, buffer) => sum + buffer.memoryBytes(), 0)
+      + 2 * 48000 * 4 * 2; // Generated click and guide heads.
+    player.on = () => {};
+    player.peaks = () => {};
+    return player;
+  };
+  try {
+    const perSongBytes = 2 * 48000 * 4 * 22;
+    assert.equal(app.estimateBytes(app.songs.get('mt1')), perSongBytes);
+    assert.ok(perSongBytes * 7 < app.warmBudget());
+    // The former full-buffer plan required over 8 GiB for the same setlist.
+    assert.ok(300 * 48000 * 4 * 22 * 7 > 8 * 1024 ** 3);
+    app.warmUp();
+    await waitUntil(() => app.preparationStatus().complete && !app.jobs.size);
+    assert.equal(app.preparationStatus().ready, 7);
+    assert.equal(heads.length, 70);
+    assert.equal(reads.length, 70);
+    assert.equal(decodes, 0);
+    assert.equal(app.memoryUsed(), perSongBytes * 7);
+    const loadingEvents = [];
+    app.on('loading', value => loadingEvents.push(value));
+    for (const id of ['mt1', 'mt7', 'mt1']) {
+      const switching = app.loadSong(id);
+      assert.equal(app.current.song.id, id, 'A ready selection commits before the promise yields');
+      await switching;
+    }
+    assert.equal(reads.length, 70);
+    assert.equal(heads.length, 70);
+    assert.equal(decodes, 0);
+    assert.deepEqual(loadingEvents, []);
+    assert.equal(app.current.song.id, 'mt1');
+    assert.equal(app.preparationStatus().ready, 7);
+    assert.ok(app.memoryUsed() <= 128 * MB);
+  } finally {
+    store.getMany = previousGetMany;
+    fakeDiskAudio = previousDiskAudio;
+  }
+});
+
+test('switching a playing song starts its ready replacement without a new count-in', async () => {
+  const app = fixture(['a', 'b']);
+  app.current = entry(app.songs.get('a'));
+  app.current.player.state = 'playing';
+  const next = entry(app.songs.get('b'));
+  app.addWarm(next);
+  assert.equal(app.settings.autoCountIn, true);
+  await app.loadSong('b');
+  assert.equal(app.current, next);
+  assert.equal(next.player.state, 'playing');
+  assert.equal(next.player.playOptions.length, 1);
+  assert.equal(next.player.playOptions[0].countIn, false);
+});
+
+test('rapid ready selections preserve playback while an earlier replacement is still starting', async () => {
+  const app = fixture(['a', 'b', 'c']);
+  app.current = entry(app.songs.get('a'));
+  app.current.player.state = 'playing';
+  const starting = entry(app.songs.get('b')), latest = entry(app.songs.get('c'));
+  const resumed = deferred();
+  starting.player.play = async function (options) {
+    const request = ++this.playRequest;
+    this.playOptions.push(options);
+    await resumed.promise;
+    if (request === this.playRequest) this.state = 'playing';
+  };
+  app.addWarm(starting);
+  app.addWarm(latest);
+  const first = app.loadSong('b');
+  assert.equal(app.current, starting);
+  assert.equal(starting.player.state, 'stopped');
+  assert.equal(app.playbackIntent, true);
+  const second = app.loadSong('c');
+  assert.equal(app.current, latest);
+  await second;
+  resumed.resolve();
+  await first;
+  assert.equal(latest.player.state, 'playing');
+  assert.equal(latest.player.playOptions.length, 1);
+  assert.equal(latest.player.playOptions[0].countIn, false);
+  assert.equal(starting.player.rewinds, 1);
+  assert.equal(starting.player.state, 'stopped', 'A retired pending start cannot reactivate');
+});
+
+test('pausing during cold preparation prevents its replacement from restarting playback', async () => {
+  const app = fixture(['a', 'b']);
+  app.current = entry(app.songs.get('a'));
+  app.current.player.state = 'playing';
+  const pending = deferred();
+  app.prepare = () => pending.promise;
+  const loading = app.loadSong('b');
+  assert.equal(app.playbackIntent, true);
+  app.pause();
+  assert.equal(app.playbackIntent, false);
+  assert.equal(app.current.player.state, 'paused');
+  const ready = entry(app.songs.get('b'));
+  pending.resolve(ready);
+  await loading;
+  assert.equal(app.current, ready);
+  assert.equal(ready.player.state, 'stopped');
+  assert.equal(ready.player.playOptions.length, 0);
+});
+
+test('a deliberate stop cancels an unfinished start and clears playback intent for later selections', async () => {
+  const app = fixture(['a', 'b']);
+  const initial = entry(app.songs.get('a')), replacement = entry(app.songs.get('b'));
+  const resumed = deferred();
+  initial.player.play = async function (options) {
+    const request = ++this.playRequest;
+    this.playOptions.push(options);
+    await resumed.promise;
+    if (request === this.playRequest) this.state = 'playing';
+  };
+  app.current = initial;
+  app.addWarm(replacement);
+  const starting = app.play();
+  assert.equal(app.playbackIntent, true);
+  app.stop();
+  assert.equal(app.playbackIntent, false);
+  resumed.resolve();
+  await starting;
+  assert.equal(initial.player.state, 'stopped');
+  await app.loadSong('b');
+  assert.equal(app.current, replacement);
+  assert.equal(replacement.player.state, 'stopped');
+  assert.equal(replacement.player.playOptions.length, 0);
+  assert.equal(app.playbackIntent, false);
+});
+
+test('a deliberate first play still uses the configured count-in', async () => {
+  const app = fixture(['a']);
+  app.current = entry(app.songs.get('a'));
+  await app.play();
+  assert.equal(app.current.player.playOptions.length, 1);
+  assert.equal(app.current.player.playOptions[0].countIn, true);
+});
+
+test('a natural ending in stop mode clears playback intent before a later manual selection', async () => {
+  const app = fixture(['a', 'b']);
+  app.current = entry(app.songs.get('a'));
+  const later = entry(app.songs.get('b'));
+  app.addWarm(later);
+  await app.play();
+  assert.equal(app.playbackIntent, true);
+  app.current.player.state = 'stopped'; // SongPlayer.poll has reached the end.
+  app.handleEnded(app.current);
+  assert.equal(app.playbackIntent, false);
+  await app.loadSong('b');
+  assert.equal(app.current, later);
+  assert.equal(later.player.state, 'stopped');
+  assert.equal(later.player.playOptions.length, 0);
+});
+
+test('the last natural ending in next mode clears playback intent when no next song exists', async () => {
+  const app = fixture(['a', 'b']);
+  app.settings.afterSong = 'next';
+  app.current = entry(app.songs.get('b'));
+  await app.play();
+  app.current.player.state = 'stopped';
+  app.handleEnded(app.current);
+  assert.equal(app.current.song.id, 'b');
+  assert.equal(app.playbackIntent, false);
+  assert.equal(app.wantedId, null);
+});
+
+test('reloading a playing song restores its position before the first replacement start', async () => {
+  const app = fixture(['a']);
+  const original = app.songs.get('a');
+  app.current = entry(original);
+  app.current.player.position = () => 37.5;
+  app.current.player.state = 'playing';
+  const replacement = entry(original), starts = [], seeks = [];
+  replacement.player.pausedAt = 0;
+  replacement.player.seek = function (position, mode) { this.pausedAt = position; seeks.push({ position, mode }); };
+  replacement.player.play = async function (options) {
+    this.playOptions.push(options);
+    starts.push({ position: this.pausedAt, countIn: options.countIn });
+    this.state = 'playing';
+  };
+  app.prepare = async () => replacement;
+  await app.reloadIfCurrent('a');
+  assert.equal(app.current, replacement);
+  assert.deepEqual(seeks, [{ position: 37.5, mode: 'now' }]);
+  assert.deepEqual(starts, [{ position: 37.5, countIn: false }]);
+  assert.equal(app.playbackIntent, true);
 });
 
 test('the retained song ending does not override a pending manual selection', async () => {

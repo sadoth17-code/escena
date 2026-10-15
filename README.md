@@ -1,37 +1,56 @@
-# Escena · edición v6: tonalidad, precarga, portadas y pad
+# Escena · audio local por bloques
 
-## Actualización de cambio rápido entre multitracks · 15 de octubre de 2026
+## Motor local por bloques 1 · 15 de octubre de 2026
 
-Se corrige la estimación de memoria que contaba como estéreo archivos de origen
-mono, aunque el usuario no hubiera activado «Mono» en la mezcla. Antes de decidir
-qué canciones caben se leen solo cabeceras de WAV, FLAC y AIFF; no se modifica ni
-se convierte su audio. La transposición reserva memoria adicional para las pistas
-que sí se procesan. Los formatos desconocidos mantienen una estimación conservadora.
+Esta actualización sustituye la carga de canciones completas en RAM por una
+lectura local de bloques de dos segundos. Mantiene listo el primer bloque de
+cada pista del repertorio y programa los siguientes con el mismo reloj de
+AudioContext. Al cambiar de canción se reutiliza su inicio preparado; no se
+vuelve a leer ni decodificar toda la canción. Al abandonar un tema se liberan
+sus bloques adicionales y se conserva el inicio.
 
-La precarga prepara primero el setlist y después otras canciones descargadas con
-la memoria libre. Estas últimas no expulsan canciones listas para preparar otras
-opciones. La última canción visitada se protege frente a la preparación secundaria
-de otros temas del setlist. La siguiente conserva su prioridad cuando falta RAM.
+- WAV PCM/float mono y estéreo se leen directamente del archivo local, incluso
+  si su frecuencia difiere del motor; AudioBufferSource realiza el remuestreo.
+- MP3, FLAC, AIFF y audio transpuesto se decodifican/procesan una sola vez para
+  crear una caché PCM por bloques en IndexedDB. Las siguientes aperturas usan
+  esa caché. Esta adaptación inicial necesita tiempo y espacio local adicional;
+  no vuelve a descargar los originales. Solo una conversión completa se ejecuta
+  a la vez para limitar memoria. Cambiar el tono puede crear una nueva variante.
+- Click y guía se generan también por bloques. Las pruebas comparan sus muestras
+  con los renders completos, incluidas colas, conteos y cambios de tempo.
+- Seleccionar otra canción mientras suena conserva la reproducción, sin añadir
+  otro preconteo. Anterior, Siguiente y selección MIDI usan la misma intención.
+  Si estaba detenida, la selección queda detenida para el siguiente Play.
+- Las escenas siguen saltando al compás. Si falta el bloque de una escena, la
+  canción sigue sonando hasta que el destino esté listo y se programa el salto
+  en el siguiente límite musical. Pausa/Detener invalidan solicitudes pendientes.
+- Los stems cortos mantienen silencio virtual hasta el final de la canción para
+  conservar bucles sincronizados, también después de aplicar tonalidad.
+- La forma de onda de reproducción se completa conforme se leen los bloques.
+  El editor analiza un envelope de 0,5 ms, sin retener todos los stems completos.
+  Cerrar esa canción cancela el análisis pendiente.
 
-Se activa el lector PCM por bloques de WAV compatibles con la frecuencia del
-motor, evitando una copia completa del archivo para el decodificador nativo. PCM
-de 8/16/24/32 bits y float de 32/64 bits mantienen sus muestras. Los WAV que necesitan
-remuestreo y los demás formatos usan el motor nativo. Se validan los encabezados
-antes de entrar por esta ruta. También se liberan referencias del dibujo de onda
-al descartar un reproductor.
+En Ajustes debe aparecer **Motor local por bloques 1**. Consulta
+LEEME-MOTOR-POR-BLOQUES.txt para aplicar el ZIP sin borrar canciones ni claves.
+La actualización de audio no cambia el Worker ni el servicio de nube.
 
-«Lista para sonar» sigue indicando que el cambio reutiliza el audio ya preparado,
-sin volver a leer ni decodificar las pistas. Al abrir la app se necesita una
-preparación inicial, y si dos canciones completas superan la RAM disponible, el
-cambio todavía requiere carga. No se promete cambio instantáneo para un catálogo
-de tamaño ilimitado. Se conserva el cambio de escenas al compás, la mezcla, el
-acceso por usuarios y las operaciones de nube.
+Validación: **190 pruebas automatizadas aprobadas**. Se cubre un repertorio de
+siete canciones de cinco minutos y diez stems estéreo por canción bajo un
+presupuesto de 128 MiB, con cambio 1→7→1 sin nuevas lecturas completas,
+decodificación ni estado de carga. La prueba de App usa almacenamiento y motor
+simulados; otras pruebas integran el reproductor, el transporte, el tempo y los
+renders de click/guía reales con AudioContext y reloj simulados.
 
-Verificación de esta ronda: 97 pruebas de lógica, muestras PCM, cancelaciones,
-memoria, usuarios y nube aprobadas con `npm test`. Las pruebas de navegador se
-actualizaron pero no se ejecutaron en esta ronda; no se midió latencia ni sonido
-en equipos físicos y no se compilaron instaladores. La corrección de audio no
-requiere cambios nuevos en el Worker. Consulta LEEME-CAMBIO-RAPIDO.txt.
+No se ejecutó navegador ni se midió latencia acústica en hardware físico en esta
+ronda. No se garantiza un número de milisegundos en un dispositivo concreto.
+La salida usa un margen de programación de 70 a 300 ms según la latencia del
+contexto; no añade segundos de carga ni preconteo durante un cambio preparado.
+El disco debe mantener el ritmo de lectura; los bloques tardíos notifican el
+problema y recuperan el reloj común sin desplazar un stem respecto a los demás.
+Si el navegador suspende los temporizadores en segundo plano, la lectura puede
+interrumpirse al agotarse el margen preparado. EXE/APK/DMG deben reconstruirse.
+
+## Historial de funciones conservadas
 
 ## Corrección sobre v1.0.20: cambio de canciones y revisión de acceso
 

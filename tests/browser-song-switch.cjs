@@ -41,8 +41,13 @@ const server = http.createServer((request, response) => {
     if (error) { response.writeHead(404).end('not found'); return; }
     response.writeHead(200, { 'Content-Type': types[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-store' });
     if (file === path.join(root, 'js', 'engine.js')) {
-      // Count every stem decode, including the PCM WAV reader that bypasses decodeAudioData.
+      // WAV playback now bypasses Engine.decode: any full-stem decode is observable.
       response.end(bytes.toString('utf8') + '\nconst __fixtureDecode = Engine.prototype.decode;\nEngine.prototype.decode = function (...args) { window.__counts.decodes++; return __fixtureDecode.apply(this, args); };\n');
+      return;
+    }
+    if (file === path.join(root, 'js', 'disk-audio.js')) {
+      // Count local PCM reads rather than cached block access or out-of-range EOF requests.
+      response.end(bytes.toString('utf8') + '\nconst __fixtureDiskGetChunk = DiskAudio.prototype.getChunk;\nDiskAudio.prototype.getChunk = function (index) { if (Number.isInteger(index) && index >= 0 && index < this.chunkCount && !this.peekChunk(index)) window.__counts.diskReads++; return __fixtureDiskGetChunk.call(this, index); };\n');
       return;
     }
     response.end(bytes);
@@ -105,7 +110,7 @@ async function contextFor(viewport, origin) {
     else { blocked.push(target.href); await route.abort(); }
   });
   await context.addInitScript(() => {
-    window.__counts = { fileReads: 0, decodes: 0, nativeDecodes: 0 };
+    window.__counts = { fileReads: 0, decodes: 0, nativeDecodes: 0, diskReads: 0 };
     window.__errors = [];
     const get = IDBObjectStore.prototype.get;
     IDBObjectStore.prototype.get = function (...args) {
@@ -154,7 +159,8 @@ async function main() {
     assert(state.ready.every(Boolean));
     assert.equal(state.prepared.ready, 5);
     assert.equal(state.prepared.total, 5);
-    assert.equal(state.counts.decodes, 14);
+    assert.equal(state.counts.decodes, 0);
+    assert.equal(state.counts.diskReads, 14);
     assert(state.counts.fileReads >= 14);
   });
 
@@ -198,14 +204,17 @@ async function main() {
   });
 
   await check('Cold switch retains current title and controls under a compact progress indicator', async () => {
-    await page.evaluate(() => {
+    await page.evaluate(async () => {
       const app = window.__app;
+      const { DiskAudio } = await import('/js/disk-audio.js');
       app.setSetting('preloadNext', false);
       app.warmUp();
-      const decode = app.engine.decode.bind(app.engine);
-      window.__realDecode = decode;
+      window.__realDiskGetChunk = DiskAudio.prototype.getChunk;
       window.__decodeGates = [];
-      app.engine.decode = async blob => { await new Promise(resolve => window.__decodeGates.push(resolve)); return decode(blob); };
+      DiskAudio.prototype.getChunk = async function (index) {
+        if (index === 0 && !this.peekChunk(index)) await new Promise(resolve => window.__decodeGates.push(resolve));
+        return window.__realDiskGetChunk.call(this, index);
+      };
       window.__coldPromise = app.loadSong(window.__ids[5]);
     });
     await page.waitForFunction(() => window.__decodeGates.length > 0);
@@ -241,7 +250,7 @@ async function main() {
     assert.equal(await page.locator('.stage-title').textContent(), 'Prueba 7');
     assert(await page.locator('.stage').isVisible());
     assert.equal(await page.evaluate(() => window.__app.current.song.id === window.__ids[6]), true);
-    await page.evaluate(() => { window.__app.engine.decode = window.__realDecode; });
+    await page.evaluate(async () => { const { DiskAudio } = await import('/js/disk-audio.js'); DiskAudio.prototype.getChunk = window.__realDiskGetChunk; });
     await page.locator('[aria-label="Salir del modo escenario"]').click();
   });
 
@@ -264,7 +273,7 @@ async function main() {
     await mobilePage.screenshot({ path: path.join(qa, 'mobile-setlist-prepared.png'), fullPage: true });
   });
 
-  const summary = { results, failures, desktopErrors: await page.evaluate(() => window.__errors), externalRequestsBlocked: [...desktop.blocked, ...mobile.blocked], note: 'Synthetic local WAVs decoded by Chromium. This test does not evaluate physical audio hardware or subjective sound.' };
+  const summary = { results, failures, desktopErrors: await page.evaluate(() => window.__errors), externalRequestsBlocked: [...desktop.blocked, ...mobile.blocked], note: 'Synthetic local WAVs read as two-second PCM blocks in Chromium. This test does not evaluate physical audio hardware or subjective sound.' };
   fs.writeFileSync(path.join(qa, 'browser-song-switch-results.json'), JSON.stringify(summary, null, 2));
   console.log(JSON.stringify(summary, null, 2));
   if (failures.length || summary.desktopErrors.length) process.exitCode = 1;

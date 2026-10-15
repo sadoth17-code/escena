@@ -20,6 +20,7 @@ export function createTimeline() {
   let entry = null;
   let size = { w: 0, h: 0, dpr: 1 };
   let dirty = true;
+  let waveRevision = -1;
   let ghost = null;
   let dragging = false;
   let lastSnapshot = null;
@@ -118,6 +119,10 @@ export function createTimeline() {
 
   const draw = (snapshot) => {
     lastSnapshot = snapshot;
+    if (entry && waveRevision !== entry.player.waveRevision) {
+      waveRevision = entry.player.waveRevision;
+      dirty = true;
+    }
     if (!size.w) measure();
     if (!size.w) return;
     if (dirty) {

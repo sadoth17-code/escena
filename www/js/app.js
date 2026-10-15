@@ -9,6 +9,7 @@ import { normalizePitch, pitchLabel, keyPitchClass, defaultPitchEnabled } from '
 import { AmbientPad, normalizePadStyle } from './pad.js';
 import { access } from './access.js';
 import { readAudioInfo } from './audio-info.js';
+import { createDiskAudio } from './disk-audio.js';
 
 const MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || isIOS();
 
@@ -92,6 +93,7 @@ class App {
     this.loading = null;
     this.loadToken = 0;
     this.wantedId = null;
+    this.playbackIntent = false;
     this.loopMode = false;
     this.engine = null;
     this.ready = false;
@@ -438,7 +440,7 @@ class App {
     let buffer = null;
     if (this.current && this.current.song === song) {
       const node = this.current.player.fileTracks.find((item) => item.def.id === trackId);
-      if (node) buffer = node.buffer;
+      if (node && !node.buffer?.stream) buffer = node.buffer;
     }
     if (!buffer) {
       const track = song.tracks.find((item) => item.id === trackId);
@@ -657,10 +659,16 @@ class App {
         const item = queue.shift();
         try {
           if (!item.file) throw new Error('archivo no encontrado');
-          let buffer = await engine.decode(item.file.blob, { cancelled: stopped });
+          const buffer = await createDiskAudio(engine, item.file.blob, {
+            fileId: item.track.fileId,
+            mono: item.track.mono,
+            pitchSemitones: normalizePitch(song.pitchSemitones),
+            pitchEnabled: item.track.pitchEnabled ?? defaultPitchEnabled(item.track),
+            cancelled: stopped,
+            onProgress: fraction => job?.onProgress?.(done + fraction, total, item.track.name),
+          });
           if (stopped()) throw new Cancelled();
-          this.audioInfo.set(item.track.fileId, { channels: buffer.numberOfChannels, duration: buffer.duration });
-          if (item.track.mono && buffer.numberOfChannels > 1) buffer = engine.monoDownmix(buffer);
+          this.audioInfo.set(item.track.fileId, { channels: buffer.sourceChannels || buffer.numberOfChannels, duration: buffer.duration });
           buffers.set(item.track.id, buffer);
           item.track.duration = buffer.duration;
         } catch (error) {
@@ -691,22 +699,19 @@ class App {
     launch();
     while (pool.size) await Promise.all(Array.from(pool));
     if (job) job.boost = null;
-    if (stopped()) throw new Cancelled();
-    if (!buffers.size) throw new Error('No se pudo leer ninguna pista de esta canción. Revisa el formato de los archivos');
+    if (stopped() || failed.length || !buffers.size) {
+      for (const buffer of buffers.values()) buffer.dispose?.();
+      if (stopped()) throw new Cancelled();
+      throw new Error(failed.length ? `No se pudieron preparar estas pistas: ${failed.join(', ')}. Revisa los archivos y el espacio disponible.` : 'No se pudo leer ninguna pista de esta canción. Revisa el formato de los archivos');
+    }
     if (access.canEdit) this.saveSong(song, true).catch(() => {});
     for (const track of song.tracks) track.solo = false;
     song.click.solo = false;
     song.guide.solo = false;
     const player = engine.createPlayer(song, buffers, voices);
     try {
-      if (normalizePitch(song.pitchSemitones)) {
-        await player.setPitch(song.pitchSemitones, {
-          signal: job?.pitchAbort?.signal,
-          onProgress: state => {
-            if (job?.onProgress) job.onProgress(state.done, state.total, `Tonalidad · ${state.label}`);
-          },
-        });
-      }
+      // La caché local contiene el tono aplicado; no se vuelve a procesar al abrir la canción.
+      player.pitchSemitones = normalizePitch(song.pitchSemitones);
       if (stopped()) throw new Cancelled();
     } catch (error) {
       player.dispose();
@@ -717,6 +722,14 @@ class App {
     player.on('state', () => this.emit('transport', entry));
     player.on('loop', () => this.emit('transport', entry));
     player.on('ended', () => this.handleEnded(entry));
+    let lastReadWarning = 0;
+    player.on('buffering', detail => {
+      if (this.current !== entry) return;
+      if (Date.now() - lastReadWarning > 10000) {
+        lastReadWarning = Date.now();
+        this.toast(detail?.error ? 'No se pudo leer un bloque de audio local. Revisa el espacio disponible y vuelve a abrir la canción.' : 'El almacenamiento está respondiendo lento; se está recuperando la lectura de audio.', 'error');
+      }
+    });
     // El dibujo de la onda queda calculado aquí, en segundo plano, y no al cambiar de canción.
     try {
       player.peaks();
@@ -729,10 +742,12 @@ class App {
   // Cambia de canción. Si ya está decodificada en memoria (precargada o abierta antes en esta sesión)
   // el cambio es inmediato: no hay pantalla de carga, no se cierra el modo escenario y no se espera a nada.
   // Si no, se decodifica con el avance a la vista y con todos los núcleos disponibles.
-  async loadSong(id, { autoplay = false, force = false } = {}) {
+  async loadSong(id, { autoplay = this.player?.state === 'playing' || this.playbackIntent, force = false } = {}) {
     if (!this.sessionAllowed) return;
     const song = this.songs.get(id);
     if (!song) return;
+    const wasPlaying = this.player?.state === 'playing' || this.playbackIntent;
+    this.playbackIntent = Boolean(autoplay);
     const token = ++this.loadToken;
     this.wantedId = id;
     try {
@@ -770,7 +785,7 @@ class App {
       this.endLoading();
       if (entry.failed.length) this.toast(`No se pudieron leer: ${entry.failed.join(', ')}`, 'error');
       this.warmUp();
-      if (autoplay) await this.play();
+      if (autoplay && this.playbackIntent) await this.play({ countIn: !wasPlaying && this.settings.autoCountIn });
     } finally {
       if (token === this.loadToken) {
         this.wantedId = null;
@@ -786,7 +801,7 @@ class App {
     const old = this.current;
     // Si ambas caben, la canción actual y su pantalla siguen disponibles hasta que termine la carga.
     const need = this.estimateBytes(song) || (old ? old.bytes : 0);
-    const keep = Boolean(old) && old.song.id !== id && old.bytes + need <= this.warmBudget();
+    const keep = Boolean(old) && old.song.id !== id && old.player.memoryBytes() + need <= this.warmBudget();
     const switching = Boolean(old) || Boolean(this.loading?.switching);
     this.loading = { song, done: 0, total: song.tracks.length, label: '', switching };
     if (!keep) this.unloadCurrent({ loading: true });
@@ -864,6 +879,7 @@ class App {
   }
 
   unloadCurrent({ keep = false, loading = false } = {}) {
+    if (!loading) this.playbackIntent = false;
     const entry = this.current;
     if (!entry) return;
     this.current = null;
@@ -881,11 +897,11 @@ class App {
     }
     const before = this.current.player;
     const resume = { time: before.position(), playing: before.state === 'playing' };
-    await this.loadSong(id, { force: true });
+    await this.loadSong(id, { force: true, autoplay: false });
     const after = this.current && this.current.song.id === id ? this.current.player : null;
     if (!after) return;
     if (resume.time > 0.05) after.seek(resume.time, 'now');
-    if (resume.playing) await after.play({ countIn: false });
+    if (resume.playing) await this.play({ countIn: false });
   }
 
   // --- Canciones listas en memoria ---------------------------------------------------------------
@@ -907,18 +923,15 @@ class App {
     const measured = this.memoryCosts.get(song.id);
     if (measured?.signature === decodeSignature(song)) return measured.bytes;
     const rate = this.engine.ctx.sampleRate || 48000;
-    const duration = Math.max(0, ...song.tracks.map(track => this.audioInfo.get(track.fileId)?.duration || track.duration || 0));
-    const frames = Math.ceil(duration * rate);
-    // createPlayer pads each stem to the longest one. Include generated click/guide too.
+    // Solo el primer bloque de cada pista permanece preparado. El resto se lee del disco
+    // mientras suena; la duración total de la canción ya no limita la precarga del setlist.
+    const frames = Math.ceil(2 * rate);
     let total = frames * 8;
     for (const track of song.tracks) {
       const channels = track.mono ? 1 : this.audioInfo.get(track.fileId)?.channels || 2;
       const bytes = frames * channels * 4;
       total += bytes;
-      // La tonalidad conserva el original solo de las pistas que se procesan.
-      if (normalizePitch(song.pitchSemitones) && (track.pitchEnabled ?? defaultPitchEnabled(track))) total += bytes;
     }
-    if (!duration) total = Math.max(32 * 1048576, song.tracks.reduce((sum, track) => sum + (track.bytes || 0) * 12, 0)) * (normalizePitch(song.pitchSemitones) ? 2 : 1);
     return total;
   }
 
@@ -940,8 +953,8 @@ class App {
   }
 
   memoryUsed() {
-    let bytes = this.current ? this.current.bytes : 0;
-    for (const entry of this.warm.values()) bytes += entry.bytes;
+    let bytes = this.current ? this.current.player.memoryBytes() : 0;
+    for (const entry of this.warm.values()) bytes += entry.player.memoryBytes();
     return bytes;
   }
 
@@ -1001,7 +1014,7 @@ class App {
     const evictionOrder = [...ids.filter(id => !pinned.has(id)), ...ids.filter(id => pinned.has(id) && id !== this.wantedId)];
     for (const id of evictionOrder) {
       if (used + extra <= budget) break;
-      used -= this.warm.get(id).bytes;
+      used -= this.warm.get(id).player.memoryBytes();
       this.dropWarm(id);
     }
   }
@@ -1220,8 +1233,9 @@ class App {
     if (this.loading) return;
     if (this.settings.afterSong === 'next') {
       const id = this.nextSongId();
-      if (id) this.loadSong(id, { autoplay: true });
+      if (id) { this.loadSong(id, { autoplay: true }); return; }
     }
+    this.playbackIntent = false;
   }
 
   startTicker() {
@@ -1262,13 +1276,15 @@ class App {
     }
   }
 
-  async play() {
+  async play({ countIn = this.settings.autoCountIn && this.player?.state === 'stopped' } = {}) {
     if (!this.sessionAllowed) return;
     const player = this.player;
     if (!player) return;
+    this.playbackIntent = true;
     try {
-      await player.play({ countIn: this.settings.autoCountIn && player.state === 'stopped' });
+      await player.play({ countIn });
     } catch (error) {
+      if (this.player === player) this.playbackIntent = false;
       this.toast(error.message || 'No se pudo activar el audio. Toca Reproducir de nuevo.', 'error');
     }
   }
@@ -1286,7 +1302,7 @@ class App {
     const extra = normalizePitch(value) ? entry.player.fileTracks.reduce((bytes, track) => {
       const include = enabled[track.def.id] ?? track.def.pitchEnabled ?? defaultPitchEnabled(track.def);
       const buffer = track.originalBuffer;
-      return bytes + (include && buffer ? buffer.length * buffer.numberOfChannels * 4 : 0);
+      return bytes + (include && buffer && !buffer.stream ? buffer.length * buffer.numberOfChannels * 4 : 0);
     }, 0) : 0;
     this.makeRoom(extra);
     try {
@@ -1312,6 +1328,7 @@ class App {
   }
 
   pause() {
+    this.playbackIntent = false;
     this.cancelAdvance();
     if (this.player) this.player.pause();
   }
@@ -1319,13 +1336,13 @@ class App {
   async togglePlay() {
     const player = this.player;
     if (!player) return;
-    if (player.state === 'playing') {
-      this.cancelAdvance();
-      player.pause();
+    if (player.state === 'playing' || this.playbackIntent) {
+      this.pause();
     } else await this.play();
   }
 
   stop() {
+    this.playbackIntent = false;
     this.cancelAdvance();
     if (this.player) this.player.stop();
   }
@@ -1409,17 +1426,17 @@ class App {
 
   async nextSong() {
     const id = this.nextSongId() || (this.current ? null : this.activeSetlist().songIds.find((songId) => this.songs.has(songId)));
-    if (id) await this.loadSong(id, { autoplay: this.player ? this.player.state === 'playing' : false });
+    if (id) await this.loadSong(id);
   }
 
   async previousSong() {
     const id = this.previousSongId();
-    if (id) await this.loadSong(id, { autoplay: this.player ? this.player.state === 'playing' : false });
+    if (id) await this.loadSong(id);
   }
 
   async goToSetlistIndex(index) {
     const ids = this.activeSetlist().songIds.filter((id) => this.songs.has(id));
-    if (ids[index]) await this.loadSong(ids[index], { autoplay: false });
+    if (ids[index]) await this.loadSong(ids[index]);
   }
 
   snapshot() {

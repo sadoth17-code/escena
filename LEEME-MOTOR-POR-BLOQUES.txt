@@ -1,0 +1,55 @@
+ESCENA — MOTOR LOCAL POR BLOQUES 1
+15 de octubre de 2026
+
+ESTA ENTREGA CAMBIA EL MOTOR DE AUDIO
+El ajuste anterior todavía cargaba canciones completas en RAM y podía mostrar
+Preparando al pasar de la canción 1 a la 7. Esta versión mantiene el inicio de
+las pistas preparado y lee el resto del almacenamiento local mientras suena.
+Al cambiar entre canciones preparadas no vuelve a cargar el multitrack completo.
+
+CÓMO ACTUALIZAR
+1. Descomprime el ZIP.
+2. Copia EL CONTENIDO de actualizacion/ a la raíz del proyecto ESCENA,
+   respetando las rutas y sustituyendo los archivos existentes. Incluye todos
+   los módulos nuevos de www/js, además de app.js, engine.js, player.js,
+   store.js, synth.js, settings.js, timeline.js y sw.js.
+3. Publica los cambios en main como de costumbre. GitHub Actions genera la web
+   y los instaladores. Este ZIP no publicó el sitio ni contiene instaladores.
+4. Cuando termine la publicación, aplica el aviso de actualización, cierra las
+   pestañas de ESCENA y vuelve a abrir. La migración añade audioCache y conserva
+   canciones, claves y setlists. No borres datos del navegador ni canciones.
+5. Abre Ajustes: debe decir «Escena · Motor local por bloques 1». Ese texto
+   identifica el motor nuevo. Si dice «Versión 7», aún está abriendo el anterior.
+6. En una app EXE/APK/DMG instala la nueva compilación generada; publicar la web
+   no sustituye un instalador antiguo.
+
+PREPARACIÓN INICIAL
+Con Precarga inteligente activada se arman los inicios del repertorio. Para WAV
+PCM/float se lee únicamente la cabecera y los primeros dos segundos de cada
+pista. En MP3/FLAC/AIFF y con tonalidad aplicada se crea una caché local una sola
+vez: puede tardar la primera vez y ocupa espacio adicional, pero las siguientes
+aperturas leen sus bloques sin volver a decodificar canciones completas.
+Esta primera adaptación se hace en este dispositivo. Los originales, los
+usuarios y la nube se conservan; no se necesita actualizar el Worker.
+
+COMPROBAR TU CASO
+Espera a que las siete estén listas después de esa preparación inicial.
+Prueba 1 > 7 > 1 y baja/sube varias canciones seguidas. Entre temas listos no
+debe aparecer una carga de todas las pistas. Si estaba sonando, sigue sonando
+la nueva canción sin añadir otro preconteo; si estaba detenida, continúa detenida.
+Los cambios de escena dentro de una canción mantienen el salto al compás.
+
+VALIDACIÓN Y LÍMITES
+190 pruebas automatizadas aprobadas, incluido el caso de siete canciones de
+cinco minutos y diez stems estéreo, con cambios de ida/vuelta y RAM limitada.
+Se compararon muestras PCM y rangos de click/guía; se verificaron lectura
+adelantada, bucles, pausa, stop, cambios rápidos, tono y cancelaciones.
+Los controles de acceso y nube mantienen sus 56 regresiones aprobadas.
+
+No se midió sonido ni latencia real en tus equipos, no se ejecutó navegador
+ni se compilaron instaladores. El cambio de selección preparado se aplica
+sincrónicamente; el arranque de audio conserva un margen de 70 a 300 ms según
+la latencia del contexto. No hay una medición que garantice un valor menor.
+Si el almacenamiento responde tarde se notifica y se recupera el reloj común.
+Mantén ESCENA visible al tocar: un navegador que suspenda temporizadores en
+segundo plano puede agotar la lectura adelantada. Consulta README.md.

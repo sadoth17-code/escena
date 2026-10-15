@@ -1,8 +1,11 @@
 import { TempoMap } from './tempo.js';
-import { renderClickBuffer, renderGuideBuffer, renderCountIn } from './synth.js';
+import { renderClickBuffer, renderGuideBuffer, renderCountIn, renderClickRange, renderGuideRange } from './synth.js';
 import { faderToGain, clamp } from './util.js';
 import { normalizePitch, defaultPitchEnabled } from './pitch-utils.js';
 import { renderPitchBuffer } from './pitch-render.js';
+import { StreamSource } from './stream-source.js';
+import { createGeneratedAudio } from './generated-audio.js';
+import { computeStreamWaveform } from './stream-waveform.js';
 
 // Margen mínimo y máximo entre «ahora» y el instante en que arrancan todas las pistas a la vez.
 const START_LEAD_MIN = 0.07;
@@ -103,6 +106,7 @@ export class TrackNode {
   }
 
   dispose() {
+    const streams = new Set([this.buffer, this.originalBuffer, this.streamBuffer]);
     try {
       this.input.disconnect();
       this.level.disconnect();
@@ -112,6 +116,7 @@ export class TrackNode {
       void error;
     }
     this.buffer = null;
+    for (const buffer of streams) if (buffer?.stream) buffer.dispose();
     this.originalBuffer = null;
   }
 }
@@ -122,11 +127,14 @@ export class SongPlayer {
     this.ctx = engine.ctx;
     this.song = song;
     this.voices = voices;
+    this.streaming = Array.from(buffers.values()).some(buffer => buffer.stream);
     this.listeners = new Map();
     let longest = 0;
     for (const buffer of buffers.values()) longest = Math.max(longest, buffer.duration);
     this.duration = Math.max(longest, 1);
     this.fileTracks = song.tracks.filter((def) => buffers.has(def.id)).map((def) => new TrackNode(engine, def, buffers.get(def.id), 'file'));
+    this.waveRevision = 0;
+    for (const track of this.fileTracks) if (track.buffer.stream) track.buffer.onChunk = () => { this.waveRevision++; };
     this.click = new TrackNode(engine, song.click, null, 'click');
     this.guide = new TrackNode(engine, song.guide, null, 'guide');
     this.state = 'stopped';
@@ -139,6 +147,8 @@ export class SongPlayer {
     this.peakCache = null;
     this.disposed = false;
     this.playRequest = 0;
+    this.seekRequest = 0;
+    this.waveEpoch = 0;
     this.pitchSemitones = 0;
     this.pitchBusy = false;
     this.pitchController = null;
@@ -184,13 +194,14 @@ export class SongPlayer {
     };
     this.pitchController = controller;
     this.pitchBusy = true;
+    const rendered = [];
+    let committed = false;
     this.playRequest++; // Invalidate a pending engine.resume() before rendering.
     signal?.addEventListener('abort', cancel, { once: true });
     if (signal?.aborted) cancel();
     this.emit('pitch');
     try {
       check();
-      const rendered = [];
       for (let index = 0; index < this.fileTracks.length; index++) {
         const track = this.fileTracks[index];
         const previous = track.def.pitchEnabled ?? defaultPitchEnabled(track.def);
@@ -200,8 +211,12 @@ export class SongPlayer {
         report(0);
         if (semitones && include) {
           if (semitones === this.pitchSemitones && previous) buffer = track.buffer;
+          else if (track.originalBuffer.stream) buffer = await track.originalBuffer.reprocess(semitones, { pitchEnabled: include, signal: controller.signal, onProgress: report });
           else buffer = await renderPitchBuffer(this.ctx, track.originalBuffer, semitones, { signal: controller.signal, onProgress: report });
+        } else if (track.originalBuffer.stream && (this.pitchSemitones !== semitones || previous !== include)) {
+          buffer = await track.originalBuffer.reprocess(semitones, { pitchEnabled: include, signal: controller.signal, onProgress: report });
         }
+        if (buffer.stream) buffer.playbackDuration = this.duration;
         check();
         rendered.push({ track, buffer, include });
         report(1);
@@ -209,15 +224,21 @@ export class SongPlayer {
       check();
       // Commit together: cancellation/errors must never leave tracks in different keys.
       for (const { track, buffer, include } of rendered) {
+        if (track.buffer?.stream && track.buffer !== buffer) track.buffer.dispose();
         track.buffer = buffer;
+        if (buffer.stream) track.originalBuffer = buffer;
+        if (buffer.stream) buffer.onChunk = () => { this.waveRevision++; };
         track.def.pitchEnabled = include;
       }
+      committed = true;
       this.pitchSemitones = semitones;
       this.song.pitchSemitones = semitones;
       this.peakCache = null;
+      this.waveEpoch++;
       this.wavePromise = null;
       this.waveKey = '';
     } finally {
+      if (!committed) for (const { track, buffer } of rendered) if (buffer?.stream && buffer !== track.buffer) buffer.dispose();
       signal?.removeEventListener('abort', cancel);
       this.pitchController = null;
       this.pitchBusy = false;
@@ -250,13 +271,17 @@ export class SongPlayer {
   }
 
   refreshClick() {
-    this.click.buffer = renderClickBuffer(this.ctx, this.tempo, {
+    const options = {
       duration: this.duration,
       offset: this.offset,
       sound: this.song.click.sound,
       subdivision: this.song.click.subdivision,
       bank: this.engine.clickBank,
-    });
+    };
+    this.click.buffer = this.streaming
+      ? createGeneratedAudio(this.ctx, { duration: this.duration, renderRange: range => renderClickRange(this.ctx, this.tempo, { ...options, ...range }) })
+      : renderClickBuffer(this.ctx, this.tempo, options);
+    this.click.streamBuffer = this.click.buffer?.stream ? this.click.buffer : null;
     this.clickKey = this.clickSignature();
   }
 
@@ -269,12 +294,16 @@ export class SongPlayer {
 
   refreshGuide() {
     this.sectionCache = null;
-    this.guide.buffer = renderGuideBuffer(this.ctx, this.tempo, this.song.markers, this.voices, {
+    const options = {
       duration: this.duration,
       offset: this.offset,
       leadBars: this.song.guide.leadBars,
       counting: this.song.guide.counting,
-    });
+    };
+    this.guide.buffer = this.streaming
+      ? createGeneratedAudio(this.ctx, { duration: this.duration, renderRange: range => renderGuideRange(this.ctx, this.tempo, this.song.markers, this.voices, { ...options, ...range }) })
+      : renderGuideBuffer(this.ctx, this.tempo, this.song.markers, this.voices, options);
+    this.guide.streamBuffer = this.guide.buffer?.stream ? this.guide.buffer : null;
     this.guideKey = this.guideSignature();
   }
 
@@ -447,8 +476,9 @@ export class SongPlayer {
     for (const track of this.allTracks()) {
       if (!track.buffer) continue;
       if (!loop && position >= track.buffer.duration) continue;
-      const src = this.ctx.createBufferSource();
-      src.buffer = track.buffer;
+      const src = track.buffer.stream ? new StreamSource(this.ctx, track.buffer) : this.ctx.createBufferSource();
+      if (track.buffer.stream) track.buffer.onUnderrun = detail => this.emit('buffering', detail);
+      else src.buffer = track.buffer;
       if (loop) {
         src.loopStart = loop.a;
         src.loopEnd = loop.b;
@@ -546,6 +576,29 @@ export class SongPlayer {
     return this.tempo.isBarAligned(position - this.offset);
   }
 
+  audioReady(position) {
+    return this.allTracks().every(track => {
+      const buffer = track.buffer;
+      if (!buffer?.stream || position >= buffer.duration) return true;
+      return Boolean(buffer.peekChunk(Math.floor(position * buffer.sampleRate / buffer.framesPerChunk)));
+    });
+  }
+
+  async ensureAudio(position) {
+    const tasks = [];
+    for (const track of this.allTracks()) {
+      const buffer = track.buffer;
+      if (!buffer?.stream || position >= buffer.duration) continue;
+      const index = Math.floor(position * buffer.sampleRate / buffer.framesPerChunk);
+      if (!buffer.peekChunk(index)) tasks.push(buffer.ensure(position));
+    }
+    if (tasks.length) await Promise.all(tasks);
+  }
+
+  trimAudio() {
+    for (const track of this.allTracks()) if (track.buffer?.stream) track.buffer.trimToHead?.();
+  }
+
   async play({ countIn = false } = {}) {
     if (this.pitchBusy) throw new Error('Espera a que termine el cambio de tonalidad');
     const request = ++this.playRequest;
@@ -556,6 +609,9 @@ export class SongPlayer {
     if (position >= this.duration - 0.02) position = this.loop ? this.loop.a : 0;
     if (this.loop && position < this.loop.a) position = this.loop.a;
     const loop = this.loop && position < this.loop.b ? this.loop : null;
+    // El inicio ya está en RAM; reanudar en otro punto solo solicita ese bloque.
+    await this.ensureAudio(position);
+    if (request !== this.playRequest || this.disposed || this.state === 'playing') return;
     this.stopCountIn();
     const bars = Number(this.song.click.countIn) || 0;
     // Primero todo lo lento: render del pre-conteo y nodos de todas las pistas. El reloj se lee
@@ -615,6 +671,7 @@ export class SongPlayer {
   }
 
   halt(resetTo) {
+    this.seekRequest++;
     const now = this.ctx.currentTime;
     const position = this.position(now);
     this.releaseRun(this.run, now);
@@ -648,6 +705,7 @@ export class SongPlayer {
     this.cancelPitch();
     if (this.disposed) return;
     this.playRequest++;
+    this.seekRequest++;
     if (this.state === 'playing') this.halt(0);
     this.stopCountIn();
     this.run = null;
@@ -655,6 +713,10 @@ export class SongPlayer {
     this.pausedAt = 0;
     this.loop = null;
     this.state = 'stopped';
+    this.trimAudio();
+    this.waveEpoch++;
+    this.wavePromise = null;
+    this.waveKey = '';
   }
 
   // Salta a otro punto de la canción: ya mismo ('now'), en el siguiente tiempo ('beat') o compás ('bar').
@@ -662,6 +724,19 @@ export class SongPlayer {
   // cambian el click o la guía, y el punto de destino es donde estaría la música en ese instante.
   seek(target, mode = 'now', { follow = false } = {}) {
     let time = clamp(target, 0, Math.max(0, this.duration - 0.01));
+    const request = ++this.seekRequest;
+    if (this.streaming && !this.audioReady(time)) {
+      const playRequest = this.playRequest;
+      if (this.state !== 'playing') {
+        this.pausedAt = time;
+        this.emit('state');
+      }
+      this.ensureAudio(time).then(() => {
+        if (this.disposed || request !== this.seekRequest || playRequest !== this.playRequest) return;
+        this.seek(time, mode, { follow });
+      }).catch(error => { if (!this.disposed && request === this.seekRequest) this.emit('buffering', { error }); });
+      return;
+    }
     if (this.state !== 'playing') {
       this.pausedAt = time;
       this.emit('state');
@@ -794,6 +869,22 @@ export class SongPlayer {
   }
 
   peaks(buckets = 1600) {
+    if (this.streaming) {
+      const out = new Float32Array(buckets);
+      for (const track of this.waveSources()) {
+        const peaks = track.buffer.peaks;
+        if (!peaks) continue;
+        const scale = track.buffer.duration / this.duration;
+        for (let index = 0; index < peaks.length; index++) {
+          const at = Math.min(buckets - 1, Math.floor(index / peaks.length * scale * buckets));
+          out[at] = Math.max(out[at], peaks[index]);
+        }
+      }
+      let top = 0;
+      for (const value of out) top = Math.max(top, value);
+      if (top) for (let index = 0; index < out.length; index++) out[index] = Math.pow(out[index] / top, 0.7);
+      return out;
+    }
     if (this.peakCache && this.peakCache.length === buckets) return this.peakCache;
     const out = new Float32Array(buckets);
     let sources = this.fileTracks.filter((track) => track.def.dest !== 'cue' && track.buffer);
@@ -847,6 +938,10 @@ export class SongPlayer {
   }
 
   async computeWaveform(sources) {
+    if (this.streaming) {
+      const epoch = this.waveEpoch;
+      return computeStreamWaveform(sources, { duration: this.duration, cancelled: () => this.disposed || epoch !== this.waveEpoch, pause: yieldNow });
+    }
     const channels = [];
     let length = 0;
     let rate = this.ctx.sampleRate;
@@ -884,8 +979,8 @@ export class SongPlayer {
   memoryBytes() {
     let total = 0;
     for (const track of this.allTracks()) {
-      if (track.buffer) total += track.buffer.length * track.buffer.numberOfChannels * 4;
-      if (track.originalBuffer && track.originalBuffer !== track.buffer) total += track.originalBuffer.length * track.originalBuffer.numberOfChannels * 4;
+      if (track.buffer) total += track.buffer.stream ? track.buffer.memoryBytes() : track.buffer.length * track.buffer.numberOfChannels * 4;
+      if (track.originalBuffer && track.originalBuffer !== track.buffer) total += track.originalBuffer.stream ? track.originalBuffer.memoryBytes() : track.originalBuffer.length * track.originalBuffer.numberOfChannels * 4;
     }
     return total;
   }
@@ -893,6 +988,8 @@ export class SongPlayer {
   dispose() {
     if (this.disposed) return;
     this.cancelPitch();
+    this.seekRequest++;
+    this.waveEpoch++;
     this.disposed = true;
     for (const run of [this.run, this.pending]) {
       if (!run) continue;

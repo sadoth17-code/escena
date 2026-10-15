@@ -343,7 +343,7 @@ export function openSettings() {
     field('Al terminar la canción', after.el),
     gap,
     settingRow('Pre-conteo automático', 'Cuenta antes de empezar desde el inicio', autoCount.el),
-    settingRow('Precarga inteligente', 'Prepara el setlist y, con la memoria libre, las demás canciones descargadas. Conserva las canciones visitadas mientras quepan. Lista para sonar indica cambio inmediato; Descargada indica que aún necesita preparación.', preload.el),
+    settingRow('Precarga inteligente', 'Deja preparado el inicio de las canciones descargadas y lee el resto del dispositivo mientras suenan. Los archivos comprimidos y los cambios de tono crean una caché local una sola vez. Actívala antes de tocar.', preload.el),
     settingRow('Mantener pantalla encendida', 'Evita que el dispositivo se bloquee mientras tocas', awake.el)
   );
 
@@ -475,7 +475,7 @@ export function openSettings() {
     } catch (error) { offlineResult.textContent = error.message; }
     finally { offlineCheck.disabled = false; }
   } }, icon('check', 18), 'Comprobar uso sin internet');
-  const appSection = section('Aplicación y uso sin internet', null, installBox, usageText, persistButton, offlineCheck, offlineResult, h('p', { class: 'field-hint', text: 'Escena · Versión 7 · ingvelarde.com' }));
+  const appSection = section('Aplicación y uso sin internet', null, installBox, usageText, persistButton, offlineCheck, offlineResult, h('p', { class: 'field-hint', text: 'Escena · Motor local por bloques 1 · ingvelarde.com' }));
   const accessStatus = h('p', { class: 'field-hint' });
   const renderAccess = () => { accessStatus.textContent = access.cloudRole === 'player' ? 'Este equipo tiene acceso de reproducción a la nube. La edición está bloqueada incluso sin internet.' : access.configured ? `Clave local configurada. Modo ${access.canEdit ? 'maestro' : 'reproducción'}.` : 'La edición local aún no tiene clave. Configura el acceso maestro antes de compartir este equipo.'; };
   unsubscribe.push(access.on('change', renderAccess));

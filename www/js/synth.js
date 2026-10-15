@@ -195,10 +195,10 @@ function addSampleSub(data, set, divisions, k, index) {
   addVoice(data, set[kind] || set.beat, index, SAMPLE_SUB_GAIN[kind]);
 }
 
-function placeCue(data, rate, voices, key, time, segment, counting) {
+function placeCue(data, rate, voices, key, time, segment, counting, firstFrame = 0) {
   const word = voices.get(key);
   if (!word) return;
-  addVoice(data, word, Math.round(time * rate), 1);
+  addVoice(data, word, Math.round(time * rate) - firstFrame, 1);
   if (!counting || segment.beatDur < 0.3) return;
   const wordDuration = word.length / rate;
   const firstNumber = Math.max(2, Math.ceil(wordDuration / segment.beatDur - 0.15) + 1);
@@ -207,7 +207,7 @@ function placeCue(data, rate, voices, key, time, segment, counting) {
     if (!number) continue;
     const maxLength = Math.floor(segment.beatDur * rate * 0.98);
     const voice = number.length > maxLength ? fadeTail(number.subarray(0, maxLength), rate) : number;
-    addVoice(data, voice, Math.round((time + (beat - 1) * segment.beatDur) * rate), 0.95);
+    addVoice(data, voice, Math.round((time + (beat - 1) * segment.beatDur) * rate) - firstFrame, 0.95);
   }
 }
 
@@ -251,6 +251,80 @@ export function renderGuideBuffer(ctx, tempo, markers, voices, { duration, offse
     const time = tempo.barStart(bar) + offset;
     if (time < 0 || time >= duration) continue;
     placeCue(data, rate, voices, marker.voice, time, tempo.segmentAtBar(bar), counting);
+  }
+  return buffer;
+}
+
+// Los bloques conservan la rejilla absoluta de muestras del render completo. Restar el inicio
+// después de redondear es esencial: redondear (tiempo - inicio) desplaza algunos golpes 1 muestra.
+function audioRange(ctx, start, duration) {
+  const rate = ctx.sampleRate;
+  const firstFrame = Math.max(0, Math.round((Number(start) || 0) * rate));
+  const length = Math.max(1, Math.ceil(duration * rate));
+  const buffer = ctx.createBuffer(1, length, rate);
+  return { rate, firstFrame, end: (firstFrame + length) / rate, buffer, data: buffer.getChannelData(0) };
+}
+
+export function renderClickRange(ctx, tempo, { start = 0, duration, offset = 0, sound, subdivision, bank }) {
+  const { rate, firstFrame, end, buffer, data } = audioRange(ctx, start, duration);
+  const divisions = Math.max(1, Math.min(4, Math.round(subdivision || 1)));
+  const samples = sampleSet(bank, sound);
+  const longest = samples
+    ? Math.max(...Object.values(samples).map((voice) => voice.length))
+    : Math.max(...[...LEVEL_KIND, 'sub'].map((kind) => getVoice(sound, kind, rate).length));
+  // También se necesitan los golpes anteriores cuyo sonido aún cruza el inicio del bloque.
+  const earliest = firstFrame / rate - longest / rate - 1 / rate;
+  const visitBeat = (beat) => {
+    const at = beat.t + offset;
+    if (at >= end) return;
+    if (at >= -0.1) {
+      const index = Math.round(at * rate) - firstFrame;
+      if (samples) addSampleBeat(data, samples, beat.level, index);
+      else addVoice(data, getVoice(sound, LEVEL_KIND[beat.level], rate), index, LEVEL_GAIN[beat.level]);
+    }
+    for (let k = 1; k < divisions; k++) {
+      const sub = at + (beat.beatDur * k) / divisions;
+      if (sub < 0 || sub >= end) continue;
+      const index = Math.round(sub * rate) - firstFrame;
+      if (samples) addSampleSub(data, samples, divisions, k, index);
+      else addVoice(data, getVoice(sound, 'sub', rate), index, SUB_GAIN);
+    }
+  };
+  if (tempo.segments) {
+    // Buscar solo los tiempos vecinos mantiene constante el trabajo incluso al saltar al final
+    // de una canción larga. Un tiempo extra cubre sus subdivisiones anteriores al bloque.
+    const beatEnd = Math.max(0, end - offset + 0.5);
+    for (const segment of tempo.segments) {
+      const segmentEnd = segment.endBar === Infinity
+        ? beatEnd
+        : Math.min(beatEnd, segment.start + (segment.endBar - segment.startBar) * segment.barDur);
+      if (segment.start >= segmentEnd - 1e-9) continue;
+      const firstBeat = Math.max(0, Math.floor((earliest - offset - segment.start) / segment.beatDur) - 1);
+      for (let k = firstBeat; ; k++) {
+        const t = segment.start + k * segment.beatDur;
+        if (t >= segmentEnd - 1e-9) break;
+        visitBeat({ t, beatDur: segment.beatDur, level: accentLevel(segment, (k % segment.num) + 1) });
+      }
+    }
+  } else {
+    // Conserva la interfaz mínima usada por mapas externos y los previews.
+    for (const beat of tempo.beats(Math.max(0, end - offset + 0.5))) visitBeat(beat);
+  }
+  return buffer;
+}
+
+export function renderGuideRange(ctx, tempo, markers, voices, { start = 0, duration, offset = 0, leadBars, counting }) {
+  const { rate, firstFrame, end, buffer, data } = audioRange(ctx, start, duration);
+  const lead = Math.max(0, Math.round(leadBars));
+  for (const marker of markers) {
+    if (!marker.voice) continue;
+    const bar = marker.bar - lead;
+    if (bar < 1) continue;
+    const time = tempo.barStart(bar) + offset;
+    if (time < 0 || time >= end) continue;
+    // placeCue recorta tanto la palabra como el conteo que empiezan antes del bloque; no
+    // basta con seleccionar marcadores cuyo inicio caiga dentro de estos dos segundos.
+    placeCue(data, rate, voices, marker.voice, time, tempo.segmentAtBar(bar), counting, firstFrame);
   }
   return buffer;
 }

@@ -469,6 +469,11 @@ export class Engine {
   }
 
   createPlayer(song, buffers, voices) {
+    if (Array.from(buffers.values()).some(buffer => buffer.stream)) {
+      const duration = Math.max(1, ...Array.from(buffers.values(), buffer => buffer.duration));
+      for (const buffer of buffers.values()) if (buffer.stream) buffer.playbackDuration = duration;
+      return new SongPlayer(this, song, { buffers, voices });
+    }
     let longest = 0;
     for (const buffer of buffers.values()) longest = Math.max(longest, buffer.length);
     for (const [id, buffer] of buffers) buffers.set(id, this.padBuffer(buffer, longest));

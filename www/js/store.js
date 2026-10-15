@@ -1,6 +1,6 @@
 const DB_NAME = 'escena';
-const DB_VERSION = 2;
-const STORES = ['songs', 'setlists', 'files', 'meta', 'cloudTransfers', 'cloudChunks'];
+const DB_VERSION = 3;
+const STORES = ['songs', 'setlists', 'files', 'meta', 'cloudTransfers', 'cloudChunks', 'audioCache'];
 
 let dbPromise = null;
 
@@ -75,6 +75,9 @@ export const store = {
       tx.objectStore('cloudTransfers').delete(transferId);
       tx.oncomplete = () => resolve();
       tx.onerror = tx.onabort = () => reject(tx.error || new Error('No se pudo guardar la canción'));
+    }).then(async () => {
+      const keep = new Set(song.tracks.map(track => track.fileId));
+      for (const id of oldFileIds) if (!keep.has(id)) await this.clearPrefix('audioCache', `file:${id}:`).catch(() => {});
     });
   },
   all(name) {
@@ -98,11 +101,13 @@ export const store = {
       tx.onerror = tx.onabort = () => reject(tx.error || new Error('No se pudieron leer las pistas locales'));
     });
   },
-  put(name, value) {
-    return writeRequest(name, (s) => s.put(value));
+  async put(name, value) {
+    await writeRequest(name, (s) => s.put(value));
+    if (name === 'files') await this.clearPrefix('audioCache', `file:${value.id}:`);
   },
-  remove(name, key) {
-    return writeRequest(name, (s) => s.delete(key));
+  async remove(name, key) {
+    await writeRequest(name, (s) => s.delete(key));
+    if (name === 'files') await this.clearPrefix('audioCache', `file:${key}:`);
   },
   async getMeta(key, fallback) {
     const row = await this.get('meta', key);
