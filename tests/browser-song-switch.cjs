@@ -40,6 +40,11 @@ const server = http.createServer((request, response) => {
   fs.readFile(file, (error, bytes) => {
     if (error) { response.writeHead(404).end('not found'); return; }
     response.writeHead(200, { 'Content-Type': types[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-store' });
+    if (file === path.join(root, 'js', 'engine.js')) {
+      // Count every stem decode, including the PCM WAV reader that bypasses decodeAudioData.
+      response.end(bytes.toString('utf8') + '\nconst __fixtureDecode = Engine.prototype.decode;\nEngine.prototype.decode = function (...args) { window.__counts.decodes++; return __fixtureDecode.apply(this, args); };\n');
+      return;
+    }
     response.end(bytes);
   });
 });
@@ -100,7 +105,7 @@ async function contextFor(viewport, origin) {
     else { blocked.push(target.href); await route.abort(); }
   });
   await context.addInitScript(() => {
-    window.__counts = { fileReads: 0, decodes: 0 };
+    window.__counts = { fileReads: 0, decodes: 0, nativeDecodes: 0 };
     window.__errors = [];
     const get = IDBObjectStore.prototype.get;
     IDBObjectStore.prototype.get = function (...args) {
@@ -110,7 +115,7 @@ async function contextFor(viewport, origin) {
     const ctx = window.AudioContext || window.webkitAudioContext;
     if (ctx) {
       const decode = ctx.prototype.decodeAudioData;
-      ctx.prototype.decodeAudioData = function (...args) { window.__counts.decodes++; return decode.apply(this, args); };
+      ctx.prototype.decodeAudioData = function (...args) { window.__counts.nativeDecodes++; return decode.apply(this, args); };
     }
     window.addEventListener('error', event => window.__errors.push(String(event.error || event.message)));
     window.addEventListener('unhandledrejection', event => window.__errors.push(String(event.reason)));
@@ -129,7 +134,7 @@ async function contextFor(viewport, origin) {
     app.on('song:unloaded', () => window.__events.unloaded++);
     app.on('song:loaded', entry => window.__events.loaded.push(entry.song.id));
   });
-  await page.waitForFunction(() => window.__ids.slice(0, 5).every(id => window.__app.isReady(id)) && !window.__app.jobs.size);
+  await page.waitForFunction(() => window.__ids.every(id => window.__app.isReady(id)) && !window.__app.jobs.size && !window.__app.inspection);
   return { context, page, blocked };
 }
 
@@ -144,12 +149,13 @@ async function main() {
   const desktop = await contextFor({ width: 1440, height: 1000 }, origin);
   const { page } = desktop;
 
-  await check('Automatic preparation: all five local setlist songs ready', async () => {
-    const state = await page.evaluate(() => ({ prepared: window.__app.preparationStatus(), ready: window.__ids.slice(0, 5).map(id => window.__app.isReady(id)), counts: window.__counts }));
+  await check('Automatic preparation: setlist and other downloaded library songs are ready', async () => {
+    const state = await page.evaluate(() => ({ prepared: window.__app.preparationStatus(), ready: window.__ids.map(id => window.__app.isReady(id)), counts: window.__counts }));
     assert(state.ready.every(Boolean));
     assert.equal(state.prepared.ready, 5);
     assert.equal(state.prepared.total, 5);
-    assert.equal(state.counts.fileReads, 10);
+    assert.equal(state.counts.decodes, 14);
+    assert(state.counts.fileReads >= 14);
   });
 
   await check('Prepared arbitrary switches preserve player and stage with zero reads or decodes', async () => {
@@ -160,7 +166,8 @@ async function main() {
       const before = { ...window.__counts }, loadedBefore = window.__events.loaded.length;
       const title = document.querySelector('.pv-title'), transport = document.querySelector('.transport'), stage = document.querySelector('.stage');
       window.__events.loading = [];
-      for (const index of [4, 1, 3, 0, 2, 4, 0]) {
+      // Songs 6 and 7 are downloaded library songs outside the five-song setlist.
+      for (const index of [4, 1, 5, 3, 6, 0, 2, 5, 4, 6, 0]) {
         const promise = window.__app.loadSong(window.__ids[index]);
         if (window.__app.current.song.id !== window.__ids[index]) throw new Error('Prepared selection was not applied synchronously');
         await promise;
@@ -172,7 +179,7 @@ async function main() {
     assert.deepEqual(state.before, state.after);
     assert.equal(state.unloaded, 0);
     assert.equal(state.loading.length, 0);
-    assert.equal(state.loaded, 7);
+    assert.equal(state.loaded, 11);
     assert.equal(state.stageTitle, 'Prueba 1');
     await page.screenshot({ path: path.join(qa, 'desktop-stage-prepared.png'), fullPage: true });
     await page.locator('[aria-label="Salir del modo escenario"]').click();
@@ -183,10 +190,10 @@ async function main() {
     // Clear only the prepared cache to exercise each real enabled click handler.
     await page.evaluate(() => { window.__app.setSetting('preloadNext', false); window.__app.warmUp(); });
     await page.locator('.panel-lib button').filter({ hasText: 'Preparar setlist' }).click();
-    await page.waitForFunction(() => window.__ids.slice(0, 5).every(id => window.__app.isReady(id)) && !window.__app.jobs.size);
+    await page.waitForFunction(() => window.__ids.every(id => window.__app.isReady(id)) && !window.__app.jobs.size && !window.__app.inspection);
     await page.evaluate(() => { window.__app.setSetting('preloadNext', false); window.__app.warmUp(); });
     await page.locator('.panel-play button').filter({ hasText: 'Preparar setlist' }).click();
-    await page.waitForFunction(() => window.__ids.slice(0, 5).every(id => window.__app.isReady(id)) && !window.__app.jobs.size);
+    await page.waitForFunction(() => window.__ids.every(id => window.__app.isReady(id)) && !window.__app.jobs.size && !window.__app.inspection);
     assert.deepEqual(await page.evaluate(() => window.__errors), []);
   });
 

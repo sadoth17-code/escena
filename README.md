@@ -1,5 +1,38 @@
 # Escena · edición v6: tonalidad, precarga, portadas y pad
 
+## Actualización de cambio rápido entre multitracks · 15 de octubre de 2026
+
+Se corrige la estimación de memoria que contaba como estéreo archivos de origen
+mono, aunque el usuario no hubiera activado «Mono» en la mezcla. Antes de decidir
+qué canciones caben se leen solo cabeceras de WAV, FLAC y AIFF; no se modifica ni
+se convierte su audio. La transposición reserva memoria adicional para las pistas
+que sí se procesan. Los formatos desconocidos mantienen una estimación conservadora.
+
+La precarga prepara primero el setlist y después otras canciones descargadas con
+la memoria libre. Estas últimas no expulsan canciones listas para preparar otras
+opciones. La última canción visitada se protege frente a la preparación secundaria
+de otros temas del setlist. La siguiente conserva su prioridad cuando falta RAM.
+
+Se activa el lector PCM por bloques de WAV compatibles con la frecuencia del
+motor, evitando una copia completa del archivo para el decodificador nativo. PCM
+de 8/16/24/32 bits y float de 32/64 bits mantienen sus muestras. Los WAV que necesitan
+remuestreo y los demás formatos usan el motor nativo. Se validan los encabezados
+antes de entrar por esta ruta. También se liberan referencias del dibujo de onda
+al descartar un reproductor.
+
+«Lista para sonar» sigue indicando que el cambio reutiliza el audio ya preparado,
+sin volver a leer ni decodificar las pistas. Al abrir la app se necesita una
+preparación inicial, y si dos canciones completas superan la RAM disponible, el
+cambio todavía requiere carga. No se promete cambio instantáneo para un catálogo
+de tamaño ilimitado. Se conserva el cambio de escenas al compás, la mezcla, el
+acceso por usuarios y las operaciones de nube.
+
+Verificación de esta ronda: 97 pruebas de lógica, muestras PCM, cancelaciones,
+memoria, usuarios y nube aprobadas con `npm test`. Las pruebas de navegador se
+actualizaron pero no se ejecutaron en esta ronda; no se midió latencia ni sonido
+en equipos físicos y no se compilaron instaladores. La corrección de audio no
+requiere cambios nuevos en el Worker. Consulta LEEME-CAMBIO-RAPIDO.txt.
+
 ## Corrección sobre v1.0.20: cambio de canciones y revisión de acceso
 
 La versión v1.0.20 prepara automáticamente solo los temas cercanos; el resto del

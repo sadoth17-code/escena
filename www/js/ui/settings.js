@@ -343,7 +343,7 @@ export function openSettings() {
     field('Al terminar la canción', after.el),
     gap,
     settingRow('Pre-conteo automático', 'Cuenta antes de empezar desde el inicio', autoCount.el),
-    settingRow('Precarga inteligente', 'Prepara automáticamente el setlist y conserva las canciones visitadas mientras quepan en memoria. Espera a que aparezcan Lista para sonar antes de tocar. Descargada significa guardada en este dispositivo.', preload.el),
+    settingRow('Precarga inteligente', 'Prepara el setlist y, con la memoria libre, las demás canciones descargadas. Conserva las canciones visitadas mientras quepan. Lista para sonar indica cambio inmediato; Descargada indica que aún necesita preparación.', preload.el),
     settingRow('Mantener pantalla encendida', 'Evita que el dispositivo se bloquee mientras tocas', awake.el)
   );
 

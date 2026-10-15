@@ -910,5 +910,8 @@ export class SongPlayer {
     this.pending = null;
     this.state = 'stopped';
     this.listeners.clear();
+    this.wavePromise = null;
+    this.peakCache = null;
+    this.sectionCache = null;
   }
 }

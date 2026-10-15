@@ -8,6 +8,7 @@ import { DEFAULT_GUIDE_LANG, isGuideLanguage, guideLanguageName } from './voices
 import { normalizePitch, pitchLabel, keyPitchClass, defaultPitchEnabled } from './pitch-utils.js';
 import { AmbientPad, normalizePadStyle } from './pad.js';
 import { access } from './access.js';
+import { readAudioInfo } from './audio-info.js';
 
 const MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || isIOS();
 
@@ -79,6 +80,12 @@ class App {
     this.preparingSetlistId = null;
     // Tamaños medidos: evitan reintentar sin fin una canción que ocupa más que la estimación inicial.
     this.memoryCosts = new Map();
+    // Canales reales del archivo: «mono» en la mezcla no describe el formato de origen.
+    // Solo se leen cabeceras pequeñas antes de decidir qué canciones caben en RAM.
+    this.audioInfo = new Map();
+    this.audioInfoEpoch = 0;
+    this.inspection = null;
+    this.lastVisitedId = null;
     // Canciones que no se pudieron leer en segundo plano (id → firma): no se reintentan en bucle.
     this.failed = new Map();
     this.advancing = null;
@@ -150,7 +157,7 @@ class App {
   }
 
   isWarming(id) {
-    return this.jobs.has(id);
+    return this.jobs.has(id) || this.inspection?.song.id === id;
   }
 
   setSetting(key, value) {
@@ -650,7 +657,9 @@ class App {
         const item = queue.shift();
         try {
           if (!item.file) throw new Error('archivo no encontrado');
-          let buffer = await engine.decode(item.file.blob);
+          let buffer = await engine.decode(item.file.blob, { cancelled: stopped });
+          if (stopped()) throw new Cancelled();
+          this.audioInfo.set(item.track.fileId, { channels: buffer.numberOfChannels, duration: buffer.duration });
           if (item.track.mono && buffer.numberOfChannels > 1) buffer = engine.monoDownmix(buffer);
           buffers.set(item.track.id, buffer);
           item.track.duration = buffer.duration;
@@ -827,6 +836,7 @@ class App {
     const old = this.current;
     entry.switching = Boolean(old) || Boolean(this.loading?.switching);
     this.current = entry;
+    if (old && old !== entry) this.lastVisitedId = old.song.id;
     this.syncPadSong();
     this.loopMode = false;
     if (old && old !== entry) this.retire(old);
@@ -897,12 +907,36 @@ class App {
     const measured = this.memoryCosts.get(song.id);
     if (measured?.signature === decodeSignature(song)) return measured.bytes;
     const rate = this.engine.ctx.sampleRate || 48000;
-    const duration = Math.max(0, ...song.tracks.map(track => track.duration || 0));
+    const duration = Math.max(0, ...song.tracks.map(track => this.audioInfo.get(track.fileId)?.duration || track.duration || 0));
+    const frames = Math.ceil(duration * rate);
     // createPlayer pads each stem to the longest one. Include generated click/guide too.
-    let total = duration * rate * 8;
-    for (const track of song.tracks) total += duration * rate * (track.mono ? 1 : 2) * 4;
-    if (!duration) total = Math.max(32 * 1048576, song.tracks.reduce((sum, track) => sum + (track.bytes || 0) * 12, 0));
-    return total * (normalizePitch(song.pitchSemitones) ? 2 : 1);
+    let total = frames * 8;
+    for (const track of song.tracks) {
+      const channels = track.mono ? 1 : this.audioInfo.get(track.fileId)?.channels || 2;
+      const bytes = frames * channels * 4;
+      total += bytes;
+      // La tonalidad conserva el original solo de las pistas que se procesan.
+      if (normalizePitch(song.pitchSemitones) && (track.pitchEnabled ?? defaultPitchEnabled(track))) total += bytes;
+    }
+    if (!duration) total = Math.max(32 * 1048576, song.tracks.reduce((sum, track) => sum + (track.bytes || 0) * 12, 0)) * (normalizePitch(song.pitchSemitones) ? 2 : 1);
+    return total;
+  }
+
+  hasAudioInfo(song) {
+    return song.tracks.every(track => this.audioInfo.has(track.fileId));
+  }
+
+  async inspectSong(song) {
+    const epoch = this.audioInfoEpoch;
+    const ids = [...new Set(song.tracks.map(track => track.fileId))].filter(id => !this.audioInfo.has(id));
+    if (!ids.length) return;
+    const files = await store.getMany('files', ids);
+    // Ningún archivo se decodifica aquí. Los formatos desconocidos mantienen la estimación conservadora.
+    for (let index = 0; index < ids.length; index++) {
+      const info = await readAudioInfo(files[index]?.blob).catch(() => null);
+      if (epoch !== this.audioInfoEpoch) return;
+      if (!this.audioInfo.has(ids[index])) this.audioInfo.set(ids[index], info);
+    }
   }
 
   memoryUsed() {
@@ -962,7 +996,7 @@ class App {
     const pinned = this.pinnedIds();
     let used = this.memoryUsed();
     const activeIds = new Set(this.activeSetlist()?.songIds || []);
-    const ids = Array.from(this.warm.keys()).filter(id => !onlyOutsideSetlist || !activeIds.has(id));
+    const ids = Array.from(this.warm.keys()).filter(id => !onlyOutsideSetlist || (!activeIds.has(id) && id !== this.lastVisitedId));
     // La siguiente se descarta al final si tampoco cabe. Nunca se sacrifica el audio solicitado.
     const evictionOrder = [...ids.filter(id => !pinned.has(id)), ...ids.filter(id => pinned.has(id) && id !== this.wantedId)];
     for (const id of evictionOrder) {
@@ -1037,6 +1071,9 @@ class App {
   invalidateSong(id) {
     this.failed.delete(id);
     this.memoryCosts.delete(id);
+    this.audioInfoEpoch++;
+    // El mismo fileId puede haberse sustituido durante una actualización local.
+    for (const track of this.songs.get(id)?.tracks || []) this.audioInfo.delete(track.fileId);
     this.dropWarm(id);
     const job = this.jobs.get(id);
     if (job) this.cancelJob(job);
@@ -1051,6 +1088,9 @@ class App {
   preparationCandidates() {
     const ids = [this.nextSongId(), this.previousSongId()].filter(Boolean);
     ids.push(...(this.activeSetlist()?.songIds || []));
+    // También la biblioteca: seleccionar una canción descargada fuera del setlist debe
+    // aprovechar la memoria libre, sin expulsar canciones para preparar opciones especulativas.
+    ids.push(...this.songs.keys());
     return [...new Set(ids)].filter(id => this.songs.has(id) && id !== this.current?.song.id);
   }
 
@@ -1067,7 +1107,7 @@ class App {
       setlistId: this.activeSetlistId,
       ready, total: ids.length, preparing, failed,
       complete: ids.length > 0 && ready === ids.length,
-      limited: this.settings.preloadNext && limited && !preparing && !this.loading,
+      limited: this.settings.preloadNext && limited && !preparing && !this.loading && !this.inspection,
       usedBytes, budgetBytes,
     };
   }
@@ -1097,7 +1137,7 @@ class App {
     }
     if (!this.engine || !this.activeSetlist()) return;
     this.preparingSetlistId = this.activeSetlistId;
-    if (this.loading || this.player?.pitchBusy) return;
+    if (this.loading || this.player?.pitchBusy || this.inspection) return;
     const candidates = this.preparationCandidates();
     for (const job of Array.from(this.jobs.values())) if (!job.claimed && !candidates.includes(job.id)) this.cancelJob(job);
     this.enforceBudget();
@@ -1112,11 +1152,26 @@ class App {
         this.dropWarm(id);
       }
       if (this.failed.get(id) === decodeSignature(song)) continue;
+      if (!this.hasAudioInfo(song)) {
+        const inspection = { song, epoch: this.audioInfoEpoch };
+        this.inspection = inspection;
+        this.inspectSong(song).catch(() => {
+          // Un fallo de lectura no debe producir reintentos sin fin ni bloquear otras canciones.
+          if (inspection.epoch === this.audioInfoEpoch) {
+            for (const track of song.tracks) if (!this.audioInfo.has(track.fileId)) this.audioInfo.set(track.fileId, null);
+          }
+        }).finally(() => {
+          if (this.inspection === inspection) this.inspection = null;
+          this.warmUp();
+          this.emit('warm');
+        });
+        return;
+      }
       const need = this.estimateBytes(song);
       // No vaciar la caché para una siguiente que ni siquiera cabe junto a la actual.
       if ((this.current?.bytes || 0) + need > this.warmBudget()) continue;
       if (id === this.nextSongId()) this.makeRoom(need);
-      else this.makeRoom(need, { onlyOutsideSetlist: true });
+      else if (this.activeSetlist().songIds.includes(id)) this.makeRoom(need, { onlyOutsideSetlist: true });
       const used = this.memoryUsed();
       if (used + need > this.warmBudget()) continue;
       const job = this.startJob(song, { foreground: false });

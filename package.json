@@ -7,7 +7,7 @@
   "license": "UNLICENSED",
   "private": true,
   "scripts": {
-    "test": "node scripts/test-song-switch.mjs && node --test tests/worker-access.test.mjs tests/client-access.test.mjs tests/cloud-reuse.test.mjs tests/cloud-delete.test.mjs",
+    "test": "node scripts/test-audio-info.mjs && node scripts/test-song-switch.mjs && node scripts/test-audio-decode.mjs && node --test tests/worker-access.test.mjs tests/client-access.test.mjs tests/cloud-reuse.test.mjs tests/cloud-delete.test.mjs",
     "test:browser": "node tests/browser-song-switch.cjs && node tests/browser-users.cjs && node tests/browser-access.cjs && node tests/browser-cloud-view.cjs",
     "start": "electron .",
     "dist:win": "electron-builder --win --publish never"

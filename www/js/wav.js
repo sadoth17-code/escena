@@ -43,7 +43,7 @@ const tag = (view, offset) => String.fromCharCode(view.getUint8(offset), view.ge
 // Cabecera de un WAV: { code, channels, rate, bits, blockAlign, dataStart, dataLength } o null si no se entiende.
 export async function readWavHeader(blob) {
   try {
-    if (!blob || typeof blob.slice !== 'function' || blob.size < 44) return null;
+    if (!blob || typeof blob.slice !== 'function' || !Number.isSafeInteger(blob.size) || blob.size < 44) return null;
     const first = await blob.slice(0, Math.min(blob.size, HEADER_BYTES)).arrayBuffer();
     // `length` bytes desde `start`: del tramo ya leído si caben, y si no con otra lectura.
     const bytesAt = async (start, length) => {
@@ -53,31 +53,44 @@ export async function readWavHeader(blob) {
     const top = await bytesAt(0, 12);
     // RF64 (más de 4 GB) y cualquier otro contenedor se dejan a decodeAudioData.
     if (top.byteLength < 12 || tag(top, 0) !== 'RIFF' || tag(top, 8) !== 'WAVE') return null;
+    const riffEnd = top.getUint32(4, true) + 8;
+    // Las grabaciones incompletas o con tamaños provisionales quedan para el lector nativo.
+    if (riffEnd < 44 || riffEnd > blob.size) return null;
     let position = 12;
     let format = null;
-    for (let guard = 0; guard < MAX_CHUNKS_IN_HEADER && position + 8 <= blob.size; guard++) {
+    for (let guard = 0; guard < MAX_CHUNKS_IN_HEADER && position + 8 <= riffEnd; guard++) {
       const head = await bytesAt(position, 8);
       if (head.byteLength < 8) return null;
       const id = tag(head, 0);
       const size = head.getUint32(4, true);
       const body = position + 8;
+      if (body + size + (size & 1) > riffEnd) return null;
       if (id === 'fmt ') {
-        if (size < 16) return null;
+        if (format || size < 16) return null;
         const f = await bytesAt(body, Math.min(size, 40));
-        if (f.byteLength < 16) return null;
+        if (f.byteLength !== Math.min(size, 40)) return null;
         let code = f.getUint16(0, true);
-        // WAVE_FORMAT_EXTENSIBLE: el formato de verdad son los dos primeros bytes del identificador al final.
+        const channels = f.getUint16(2, true);
+        const rate = f.getUint32(4, true);
+        const byteRate = f.getUint32(8, true);
+        const blockAlign = f.getUint16(12, true);
+        const bits = f.getUint16(14, true);
+        // WAVE_FORMAT_EXTENSIBLE: comprobar el identificador completo, no solo su primer entero.
         if (code === 0xfffe) {
-          if (size < 40 || f.byteLength < 26) return null;
-          code = f.getUint16(24, true);
+          if (size < 40 || f.getUint16(16, true) < 22 || f.getUint16(16, true) + 18 > size) return null;
+          code = f.getUint32(24, true);
+          const guidTail = [0, 0, 16, 0, 128, 0, 0, 170, 0, 56, 155, 113];
+          if (guidTail.some((value, index) => f.getUint8(28 + index) !== value)) return null;
+          const validBits = f.getUint16(18, true);
+          if (!validBits || validBits > bits || (code === 3 && validBits !== bits)) return null;
         }
-        format = { code, channels: f.getUint16(2, true), rate: f.getUint32(4, true), blockAlign: f.getUint16(12, true), bits: f.getUint16(14, true) };
+        if (!channels || channels > 256 || !rate || rate > 1000000) return null;
+        if (code === 1 ? ![8, 16, 24, 32].includes(bits) : code === 3 ? ![32, 64].includes(bits) : true) return null;
+        if (blockAlign !== channels * (bits / 8) || byteRate !== rate * blockAlign) return null;
+        format = { code, channels, rate, blockAlign, bits };
       } else if (id === 'data') {
-        if (!format) return null;
-        const remaining = blob.size - body;
-        // Las cabeceras de grabaciones sin terminar traen 0 o 0xFFFFFFFF; un archivo cortado trae más de lo que hay.
-        const length = size === 0 || size === 0xffffffff || size > remaining ? remaining : size;
-        return { ...format, dataStart: body, dataLength: length };
+        if (!format || !size || size % format.blockAlign) return null;
+        return { ...format, dataStart: body, dataLength: size };
       }
       position = body + size + (size & 1);
     }

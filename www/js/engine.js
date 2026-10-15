@@ -3,6 +3,7 @@ import { loadVoiceBank, DEFAULT_GUIDE_LANG } from './voices.js';
 import { loadClickBank } from './synth.js';
 import { SongPlayer } from './player.js';
 import { configureAudioSession, resumeAudioContext } from './audio-session.js';
+import { decodeWav, WavAborted } from './wav.js';
 
 export const MAX_OUTPUTS = 32;
 
@@ -437,8 +438,14 @@ export class Engine {
     return this.clickBankLoading;
   }
 
-  async decode(blob) {
+  async decode(blob, { cancelled = null } = {}) {
+    // WAV PCM compatible: lectura por bloques, sin duplicar el archivo entero ni pasarlo
+    // por el decodificador de formatos comprimidos. Otros formatos conservan el motor nativo.
+    const wav = await decodeWav(blob, this.ctx, { cancelled });
+    if (wav) return wav;
+    if (cancelled?.()) throw new WavAborted();
     const data = await blob.arrayBuffer();
+    if (cancelled?.()) throw new WavAborted();
     return this.ctx.decodeAudioData(data);
   }
 

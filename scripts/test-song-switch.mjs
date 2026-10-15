@@ -31,6 +31,7 @@ const context = vm.createContext({
 const stubs = {
   './util.js': { createEmitter: emitter, debounce: fn => fn, isIOS: () => false, clamp: (n, lo, hi) => Math.min(hi, Math.max(lo, n)) },
   './store.js': { store },
+  './audio-info.js': { readAudioInfo: async () => null },
   './engine.js': { Engine: class {}, DEFAULT_OUTPUT: { routes: {} }, normalizeRoutes: routes => routes || {} },
   './library.js': { normalizeSong: song => song, serializableSong: song => song, createSong() {}, createTrackDef() {}, createSetlist() {} },
   './tempo.js': { normalizeTempoEntries() {}, detectTempoFromBuffer() {} },
@@ -94,6 +95,8 @@ function fixture(ids = ['a', 'b', 'c', 'd', 'e'], budgetMB = 100) {
   app.songs = new Map(ids.map(id => [id, song(id)]));
   app.engine = { ctx: { sampleRate: 48000 }, voiceBanks: new Map() };
   app.estimateBytes = song => song.testBytes;
+  app.hasAudioInfo = () => true;
+  app.inspectSong = async () => {};
   app.prepared = [];
   app.prepare = async song => { app.prepared.push(song.id); return entry(song); };
   return app;
@@ -108,8 +111,10 @@ function deferred() {
 test('a locked session cannot start audio, prepare songs or reactivate through MIDI actions', async () => {
   const app = fixture(['a', 'b']);
   app.current = entry(app.songs.get('a'));
-  let plays = 0;
+  let plays = 0, inspections = 0;
   app.current.player.play = async () => { plays++; };
+  app.hasAudioInfo = () => false;
+  app.inspectSong = async () => { inspections++; };
   app.sessionAllowed = false;
   app.warmUp();
   app.runAction('nextSong');
@@ -119,6 +124,7 @@ test('a locked session cannot start audio, prepare songs or reactivate through M
   assert.equal(app.current.song.id, 'a');
   assert.equal(app.jobs.size, 0);
   assert.equal(app.prepared.length, 0);
+  assert.equal(inspections, 0);
 });
 
 async function waitUntil(predicate) {
@@ -136,6 +142,129 @@ test('automatically prepares the whole fitting setlist before any song is opened
   assert.deepEqual(app.prepared, ['a', 'b', 'c', 'd', 'e']);
   assert.equal(app.current, null);
   assert.ok(app.memoryUsed() <= app.warmBudget());
+});
+
+test('automatic preparation includes local library songs after the active setlist', async () => {
+  const app = fixture(['a', 'b']);
+  app.songs.set('c', song('c'));
+  app.songs.set('d', song('d'));
+  app.warmUp();
+  await waitUntil(() => [...app.songs.keys()].every(id => app.isReady(id)) && !app.jobs.size);
+  assert.deepEqual(app.prepared, ['a', 'b', 'c', 'd']);
+  assert.equal(app.preparationStatus().ready, 2);
+  assert.equal(app.preparationStatus().total, 2);
+  assert.ok(app.memoryUsed() <= app.warmBudget());
+});
+
+test('library candidates cannot evict already prepared songs when memory is full', async () => {
+  const app = fixture(['a', 'b'], 30);
+  app.songs.set('c', song('c'));
+  app.warmUp();
+  await waitUntil(() => ['a', 'b', 'c'].every(id => app.isReady(id)) && !app.jobs.size);
+  const retained = [...app.warm.values()];
+  app.songs.set('d', song('d'));
+  for (let attempt = 0; attempt < 5; attempt++) {
+    app.warmUp();
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.deepEqual(app.prepared, ['a', 'b', 'c']);
+  assert.equal(app.jobs.size, 0);
+  assert.equal(app.isReady('d'), false);
+  assert.ok(retained.every(item => !item.player.disposed));
+  assert.ok(['a', 'b', 'c'].every(id => app.isReady(id)));
+});
+
+test('opportunistic setlist preparation preserves the last visited library song for immediate return', async () => {
+  const app = fixture(['a', 'b', 'd'], 30);
+  app.songs.set('c', song('c'));
+  app.current = entry(app.songs.get('a'));
+  const previous = entry(app.songs.get('c'));
+  app.addWarm(entry(app.songs.get('b')));
+  app.addWarm(previous);
+  app.lastVisitedId = 'c';
+  app.warmUp();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(previous.player.disposed, false);
+  assert.equal(app.isReady('c'), true);
+  assert.equal(app.isReady('d'), false);
+  const events = [];
+  app.on('loading', state => events.push(state));
+  const outward = app.loadSong('c');
+  assert.equal(app.current.song.id, 'c');
+  await outward;
+  const returning = app.loadSong('a');
+  assert.equal(app.current.song.id, 'a');
+  await returning;
+  assert.deepEqual(app.prepared, []);
+  assert.deepEqual(events, []);
+  assert.equal(previous.player.disposed, false);
+});
+
+test('RAM estimates use the original mono channels before any song is decoded', () => {
+  const app = fixture(['a']);
+  const original = app.songs.get('a');
+  original.tracks = Array.from({ length: 8 }, (_, index) => ({
+    id: `mono-${index}`, fileId: `mono-file-${index}`, mono: false,
+  }));
+  app.audioInfo = new Map(original.tracks.map(track => [track.fileId, { channels: 1, duration: 120 }]));
+  const expectedBytes = 120 * 48000 * 4 * (8 + 2);
+  assert.equal(App.prototype.estimateBytes.call(app, original), expectedBytes);
+  // Two two-minute, eight-stem mono songs fit in 512 MiB with their click and guide.
+  assert.ok(expectedBytes * 2 < 512 * MB);
+});
+
+test('RAM estimates still account for stereo stems and explicit downmixing', () => {
+  const app = fixture(['a']);
+  const original = app.songs.get('a');
+  original.tracks = Array.from({ length: 8 }, (_, index) => ({
+    id: `stereo-${index}`, fileId: `stereo-file-${index}`, mono: false, duration: 120,
+  }));
+  app.audioInfo = new Map(original.tracks.map(track => [track.fileId, { channels: 2, duration: 120 }]));
+  assert.equal(App.prototype.estimateBytes.call(app, original), 120 * 48000 * 4 * (16 + 2));
+  for (const track of original.tracks) track.mono = true;
+  assert.equal(App.prototype.estimateBytes.call(app, original), 120 * 48000 * 4 * (8 + 2));
+});
+
+test('pitch memory estimates duplicate only the stems selected for processing', () => {
+  const app = fixture(['a']);
+  const original = app.songs.get('a');
+  original.pitchSemitones = 2;
+  original.tracks = Array.from({ length: 8 }, (_, index) => ({
+    id: `pitch-${index}`, fileId: `pitch-file-${index}`, mono: false, pitchEnabled: index < 4,
+  }));
+  app.audioInfo = new Map(original.tracks.map(track => [track.fileId, { channels: 1, duration: 120 }]));
+  // Eight mono stems, two generated channels and originals for the four pitched stems.
+  assert.equal(App.prototype.estimateBytes.call(app, original), 120 * 48000 * 4 * (8 + 2 + 4));
+  for (const track of original.tracks) track.pitchEnabled = false;
+  assert.equal(App.prototype.estimateBytes.call(app, original), 120 * 48000 * 4 * (8 + 2));
+});
+
+test('audio header inspection reads each local file once even when its format is unknown', async () => {
+  const app = fixture(['a']);
+  const original = app.songs.get('a');
+  const reads = [];
+  const previousGetMany = store.getMany;
+  app.audioInfo = new Map();
+  app.inspectSong = App.prototype.inspectSong;
+  app.hasAudioInfo = App.prototype.hasAudioInfo;
+  store.getMany = async (name, ids) => {
+    assert.equal(name, 'files');
+    reads.push(...ids);
+    return ids.map(id => ({ blob: { id } }));
+  };
+  try {
+    assert.equal(app.hasAudioInfo(original), false);
+    await app.inspectSong(original);
+    assert.equal(app.hasAudioInfo(original), true);
+    assert.equal(app.audioInfo.get('a-file'), null);
+    await app.inspectSong(original);
+    assert.deepEqual(reads, ['a-file']);
+    original.tracks.push({ id: 'extra-track', fileId: 'extra-file' });
+    await app.inspectSong(original);
+    assert.deepEqual(reads, ['a-file', 'extra-file']);
+  } finally {
+    store.getMany = previousGetMany;
+  }
 });
 
 test('prioritizes neighbors and prepares arbitrary later selections without manual preparation', async () => {
@@ -308,6 +437,7 @@ test('a stale ready entry is discarded and regenerated from local audio', async 
 
 test('prepared arbitrary selections reuse decoded local stems without reading or decoding them again', async () => {
   const app = fixture(['a', 'b', 'c']);
+  app.setlists[0].songIds = ['a', 'b'];
   const reads = [], decodes = [];
   const previousGetMany = store.getMany;
   store.getMany = async (name, ids) => {
@@ -324,7 +454,7 @@ test('prepared arbitrary selections reuse decoded local stems without reading or
   app.prepare = App.prototype.prepare;
   try {
     app.warmUp();
-    await waitUntil(() => app.preparationStatus().complete);
+    await waitUntil(() => ['a', 'b', 'c'].every(id => app.isReady(id)) && !app.jobs.size);
     assert.deepEqual(reads, ['a-file', 'b-file', 'c-file']);
     assert.equal(decodes.length, 3);
     await app.loadSong('c');

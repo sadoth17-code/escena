@@ -1,0 +1,57 @@
+ESCENA — CAMBIO RÁPIDO ENTRE MULTITRACKS
+15 de octubre de 2026
+
+QUÉ CORRIGE
+1. Los WAV/FLAC/AIFF mono dejan de contarse como estéreo al calcular la precarga.
+   Se comprueban canales y duración leyendo cabeceras pequeñas.
+2. Se prepara primero el setlist y luego canciones descargadas de la biblioteca
+   con la memoria libre, sin expulsar canciones listas por opciones de biblioteca.
+3. La última canción visitada se conserva frente a precargas secundarias del
+   setlist. La siguiente canción sigue teniendo prioridad si falta memoria.
+4. Los WAV PCM compatibles se leen por bloques. No se cambia su calidad, tempo
+   ni sincronización; el resto conserva el decodificador nativo y su remuestreo.
+5. Cancelar una selección detiene el lector WAV por bloques. Se liberan también
+   las referencias del dibujo de onda al descartar un reproductor.
+
+APLICAR ESTA ENTREGA
+El ZIP es una actualización de código sobre tu paquete
+Escena_v1.0.20_Usuarios_y_Canciones_v2.zip. Incluye sus archivos de actualización
+y la corrección de audio. No es un EXE, APK ni DMG compilado.
+
+1. Descomprime el ZIP y abre actualizacion/.
+2. Copia SU CONTENIDO a la raíz del proyecto ESCENA, conservando las rutas y
+   sustituyendo los archivos existentes. www debe seguir en la raíz del proyecto;
+   no copies actualizacion como una subcarpeta adicional.
+3. Publica esos cambios en la rama main del repositorio. El flujo habitual de
+   GitHub Actions prepara la web y los instaladores. Esta entrega no publicó
+   cambios en tu sitio por sí sola.
+4. Cuando termine la publicación, aplica el aviso de actualización de Escena,
+   cierra sus pestañas y vuelve a abrir. No borres datos, biblioteca ni canciones.
+5. En Windows/Mac/Android instala la nueva compilación si usas la app instalada.
+   Publicar la web no sustituye los instaladores que ya tienes.
+
+La corrección de audio no cambia el Worker ni exige volver a subir canciones.
+server/worker.mjs conserva el contenido del paquete que enviaste. Si todavía
+no instalaste la actualización anterior de usuarios/nube, consulta también
+INSTRUCCIONES-USUARIOS-Y-NUBE.txt para el orden de publicación de esa parte.
+
+PRUEBA EN TU EQUIPO
+Deja activado Ajustes > Precarga inteligente. Espera Lista para sonar en dos
+canciones y alterna entre ellas; prueba también una canción de la Biblioteca.
+Una canción preparada debe cambiar sin Preparando audio ni repetir lectura o
+decodificación. Las escenas dentro de una canción conservan el salto al compás.
+
+LÍMITE REAL
+Descargada significa guardada en el dispositivo. Lista para sonar significa
+preparada en RAM. Al reiniciar hay una preparación inicial; si ambas canciones
+completas exceden la RAM, seguirá haciendo falta carga. Este cambio mejora la
+precarga y las cargas WAV, pero no convierte el motor en reproducción por streaming
+ni garantiza cambios instantáneos para cualquier tamaño de repertorio.
+
+VALIDACIÓN
+97 pruebas automatizadas aprobadas: 23 de cambio/memoria, 7 de metadatos,
+11 del lector de audio y 56 de usuarios/nube. Los ensayos PCM comparan muestras
+exactas mono/estéreo, formatos y lectura en bloques mayores a 8 MiB. Los cambios
+a canciones preparadas se prueban sin lecturas ni decodificaciones adicionales.
+Las pruebas gráficas se actualizaron pero no se ejecutaron en esta ronda.
+No se probó sonido en hardware físico ni se compilaron instaladores.
