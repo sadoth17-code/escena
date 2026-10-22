@@ -7,6 +7,7 @@ import { platform } from '../platform.js';
 import { access } from '../access.js';
 import { offline } from '../offline.js';
 import { openAccess } from './access.js';
+import { summarizeOutputs, nameAccessMessage, selectOutputMessage } from '../output-devices.js';
 import { icon, openModal, createSegmented, createSwitch, createRange, createGuideLanguageSelect, settingRow, field, dbLabel, confirmDialog } from './kit.js';
 
 const DIAGRAMS = {
@@ -213,6 +214,7 @@ export function openSettings() {
   const deviceSelect = h('select', { class: 'select', 'aria-label': 'Dispositivo de salida' });
   const deviceNote = h('span', { class: 'field-hint' });
   const deviceBox = h('div', { class: 'device-box' });
+  let systemName = '';
   const renderNote = () => {
     const max = app.engine.maxChannels;
     if (app.sinkState === 'missing') {
@@ -221,37 +223,68 @@ export function openSettings() {
       return;
     }
     deviceNote.className = 'field-hint';
-    deviceNote.textContent = max > 2 ? `Esta salida tiene ${max} canales (salidas 1 a ${max}).` : 'Esta salida tiene 2 canales (estéreo).';
+    const channels = max > 2 ? `${max} canales (salidas 1 a ${max})` : '2 canales (estéreo)';
+    const active = app.settings.sinkId && app.sinkState === 'ok' ? app.settings.sinkLabel : systemName;
+    deviceNote.textContent = active ? `${active} · ${channels}.` : `Esta salida tiene ${channels}.`;
   };
+
+  // Chrome y Edge no enseñan los nombres de las salidas de audio hasta que la página tiene el permiso del micrófono.
+  const namesStatus = h('span', { class: 'field-hint', role: 'status' });
+  const setNamesStatus = (text, warn = false) => {
+    namesStatus.className = warn ? 'field-hint warn' : 'field-hint';
+    namesStatus.textContent = text;
+  };
+  const askNames = async () => {
+    showNames.disabled = true;
+    setNamesStatus('Esperando la respuesta del navegador…');
+    const result = await app.unlockOutputNames();
+    showNames.disabled = false;
+    if (!result.ok) {
+      setNamesStatus(nameAccessMessage(result.error), true);
+      return;
+    }
+    setNamesStatus('');
+    await loadDevices();
+    if (namesBox.isConnected) setNamesStatus('El navegador dio el permiso, pero sigue sin entregar los nombres. Elige la salida por su número o prueba en Chrome o Edge.', true);
+  };
+  const askOutput = async () => {
+    pickOutput.disabled = true;
+    const result = await app.selectOutput();
+    pickOutput.disabled = false;
+    const text = result.ok ? '' : selectOutputMessage(result.error);
+    setNamesStatus(text, Boolean(text));
+  };
+  const showNames = h('button', { type: 'button', class: 'btn small', onClick: askNames }, 'Mostrar nombres de los dispositivos');
+  const pickOutput = app.canSelectOutput ? h('button', { type: 'button', class: 'btn small', onClick: askOutput }, 'Elegir salida…') : null;
+  const namesBox = h(
+    'div',
+    { class: 'names-box', style: { display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '8px', marginTop: '8px' } },
+    h('span', { class: 'field-hint', text: 'Tu navegador no enseña los nombres de las salidas de audio hasta que permitas el micrófono. Escena no graba nada: lo abre un instante y lo suelta.' }),
+    h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px' } }, showNames, pickOutput),
+    namesStatus
+  );
+
   const loadDevices = async () => {
     if (PHONE || !app.canPickDevice || !navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
       deviceBox.replaceChildren(h('p', { class: 'field-hint', text: 'Este dispositivo usa la salida de audio que elijas en el sistema (Bluetooth, auriculares, interfaz USB).' }));
       return;
     }
-    const found = await app.outputDevices();
-    const devices = found.filter((device) => device.deviceId !== 'default' && device.deviceId !== 'communications');
-    const labelled = found.some((device) => device.label);
+    const report = summarizeOutputs(await app.outputList());
+    const devices = report.devices.filter((device) => device.deviceId !== 'default' && device.deviceId !== 'communications');
+    systemName = report.defaultName;
     const saved = app.settings.sinkId;
-    const options = [h('option', { value: '', text: 'Predeterminado del sistema' })];
+    const options = [h('option', { value: '', text: systemName ? `Predeterminado del sistema (${systemName})` : 'Predeterminado del sistema' })];
     devices.forEach((device, index) => options.push(h('option', { value: device.deviceId, text: device.label || `Salida ${index + 1}` })));
-    if (saved && !devices.some((device) => device.deviceId === saved)) options.push(h('option', { value: saved, text: `${app.settings.sinkLabel || 'Salida guardada'} (no conectada)` }));
+    if (saved && !devices.some((device) => device.deviceId === saved)) {
+      const name = app.settings.sinkLabel || 'Salida guardada';
+      options.push(h('option', { value: saved, text: app.sinkState === 'ok' ? name : `${name} (no conectada)` }));
+    }
     deviceSelect.replaceChildren(...options);
     deviceSelect.value = saved || '';
     renderNote();
-    const showNames = h('button', {
-      type: 'button',
-      class: 'btn small',
-      onClick: async () => {
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          stream.getTracks().forEach((track) => track.stop());
-        } catch (error) {
-          app.toast('No se concedió el permiso para ver los nombres', 'error');
-        }
-        loadDevices();
-      },
-    }, 'Mostrar nombres de los dispositivos');
-    deviceBox.replaceChildren(...[deviceSelect, deviceNote, devices.length && !labelled ? showNames : null].filter(Boolean));
+    // Sin nombres (falta el permiso del micrófono) siempre se ofrece la forma de verlos, aunque el navegador
+    // no haya enseñado todavía ninguna salida.
+    deviceBox.replaceChildren(...[deviceSelect, deviceNote, report.named ? null : namesBox].filter(Boolean));
   };
   deviceSelect.addEventListener('change', () => {
     const label = deviceSelect.selectedOptions.length ? deviceSelect.selectedOptions[0].textContent : '';
@@ -475,7 +508,7 @@ export function openSettings() {
     } catch (error) { offlineResult.textContent = error.message; }
     finally { offlineCheck.disabled = false; }
   } }, icon('check', 18), 'Comprobar uso sin internet');
-  const appSection = section('Aplicación y uso sin internet', null, installBox, usageText, persistButton, offlineCheck, offlineResult, h('p', { class: 'field-hint', text: 'Escena · Motor local por bloques 1 · ingvelarde.com' }));
+  const appSection = section('Aplicación y uso sin internet', null, installBox, usageText, persistButton, offlineCheck, offlineResult, h('p', { class: 'field-hint', text: 'Escena · Motor local por bloques 1 · nombres de salida · ingvelarde.com' }));
   const accessStatus = h('p', { class: 'field-hint' });
   const renderAccess = () => { accessStatus.textContent = access.cloudRole === 'player' ? 'Este equipo tiene acceso de reproducción a la nube. La edición está bloqueada incluso sin internet.' : access.configured ? `Clave local configurada. Modo ${access.canEdit ? 'maestro' : 'reproducción'}.` : 'La edición local aún no tiene clave. Configura el acceso maestro antes de compartir este equipo.'; };
   unsubscribe.push(access.on('change', renderAccess));

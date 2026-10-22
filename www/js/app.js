@@ -245,13 +245,53 @@ class App {
     return Boolean(this.engine) && typeof this.engine.ctx.setSinkId === 'function';
   }
 
-  async outputDevices() {
+  // Todas las salidas de audio que devuelve el navegador, incluida la entrada vacía (sin identificador ni nombre)
+  // que Chrome y Edge entregan mientras la página no tiene el permiso del micrófono. Ajustes la interpreta con
+  // summarizeOutputs() para ofrecer ese permiso.
+  async outputList() {
     const media = navigator.mediaDevices;
     if (!media || typeof media.enumerateDevices !== 'function') return [];
     try {
-      return (await media.enumerateDevices()).filter((device) => device.kind === 'audiooutput' && device.deviceId);
+      return (await media.enumerateDevices()).filter((device) => device.kind === 'audiooutput');
     } catch (error) {
       return [];
+    }
+  }
+
+  async outputDevices() {
+    return (await this.outputList()).filter((device) => device.deviceId);
+  }
+
+  // Pide el micrófono un instante, solo para que el navegador muestre los nombres de las salidas, y lo suelta.
+  // Sin filtros de voz, para no alterar el audio del equipo mientras el micrófono está abierto.
+  async unlockOutputNames() {
+    const media = navigator.mediaDevices;
+    if (!media || typeof media.getUserMedia !== 'function') return { ok: false, error: { name: 'NotSupportedError' } };
+    let stream = null;
+    try {
+      stream = await media.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error };
+    } finally {
+      if (stream) for (const track of stream.getTracks()) track.stop();
+    }
+  }
+
+  // Selector de salida del propio navegador (Firefox y los Chrome que lo traen): no necesita el micrófono.
+  get canSelectOutput() {
+    const media = navigator.mediaDevices;
+    return this.canPickDevice && Boolean(media) && typeof media.selectAudioOutput === 'function';
+  }
+
+  async selectOutput() {
+    try {
+      const device = await navigator.mediaDevices.selectAudioOutput();
+      const id = device && device.deviceId && device.deviceId !== 'default' ? device.deviceId : '';
+      await this.chooseSink(id, id ? device.label || '' : '');
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error };
     }
   }
 
