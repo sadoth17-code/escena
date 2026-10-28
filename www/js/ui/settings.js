@@ -508,7 +508,7 @@ export function openSettings() {
     } catch (error) { offlineResult.textContent = error.message; }
     finally { offlineCheck.disabled = false; }
   } }, icon('check', 18), 'Comprobar uso sin internet');
-  const appSection = section('Aplicación y uso sin internet', null, installBox, usageText, persistButton, offlineCheck, offlineResult, h('p', { class: 'field-hint', text: 'Escena · Motor local por bloques 1 · nombres de salida · ingvelarde.com' }));
+  const appSection = section('Aplicación y uso sin internet', null, installBox, usageText, persistButton, offlineCheck, offlineResult, h('p', { class: 'field-hint', text: 'Escena · Motor local por bloques 1 · nombres de salida · final sin golpe · ingvelarde.com' }));
   const accessStatus = h('p', { class: 'field-hint' });
   const renderAccess = () => { accessStatus.textContent = access.cloudRole === 'player' ? 'Este equipo tiene acceso de reproducción a la nube. La edición está bloqueada incluso sin internet.' : access.configured ? `Clave local configurada. Modo ${access.canEdit ? 'maestro' : 'reproducción'}.` : 'La edición local aún no tiene clave. Configura el acceso maestro antes de compartir este equipo.'; };
   unsubscribe.push(access.on('change', renderAccess));

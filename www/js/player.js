@@ -12,6 +12,10 @@ const START_LEAD_MIN = 0.07;
 const START_LEAD_MAX = 0.3;
 const SPLICE = 0.003;
 const END_EPSILON = 0.004;
+// Fade-out del final natural de cada pista. Muchos stems terminan cortados en seco (la última muestra
+// no es cero) y ese salto de golpe a silencio se oye como un golpe seco. 50 ms bastan para que no se
+// oiga y no tocan la música.
+const END_FADE = 0.05;
 const WAVE_BLOCK = 256;
 const WAVE_SLICE = 3000000;
 
@@ -488,7 +492,7 @@ export class SongPlayer {
       if (fadeIn > 0) fade.gain.value = 0;
       src.connect(fade);
       fade.connect(track.input);
-      entries.push({ src, fade, track });
+      entries.push({ src, fade, track, duration: track.buffer.duration, endFadeAt: null });
     }
     return entries;
   }
@@ -518,9 +522,35 @@ export class SongPlayer {
         }
       };
     }
+    // El final natural de cada pista cae a cero con un fade corto. Se programa después de arrancar
+    // todas las fuentes, para que nada pueda retrasar a las últimas.
+    const begin = Math.max(startAt, this.ctx.currentTime);
+    for (const entry of entries) this.scheduleEndFade(entry, begin + (entry.duration - offset), begin + fadeIn);
     // Para diagnóstico y pruebas: cuánto margen quedó entre terminar de programar y el arranque.
     this.lastStart = { when: startAt, slack: startAt - this.ctx.currentTime, tracks: entries.length };
     return entries;
+  }
+
+  // Programa el fade-out del final natural de una fuente. `endAt` es el instante del reloj del audio en
+  // que se acaba su búfer; `notBefore`, el primer instante en que el fade puede empezar (así no se pisa
+  // un fade-in ni se programa sobre algo que ya sonó). Una fuente en repetición no tiene final natural.
+  scheduleEndFade(source, endAt, notBefore = 0) {
+    if (source.endFadeAt != null || source.src.loop || !Number.isFinite(endAt)) return;
+    const fadeAt = endAt - END_FADE;
+    if (!(fadeAt > notBefore)) return;
+    const gain = source.fade.gain;
+    gain.setValueAtTime(1, fadeAt);
+    gain.linearRampToValueAtTime(0, endAt);
+    source.endFadeAt = fadeAt;
+  }
+
+  // Quita el fade-out del final: se usa al activar una repetición, que no debe quedar en silencio.
+  cancelEndFade(source) {
+    if (source.endFadeAt == null) return;
+    const at = source.endFadeAt;
+    source.endFadeAt = null;
+    // Solo desde el inicio del fade: el fade-in de arranque, si lo hay, queda intacto.
+    source.fade.gain.cancelScheduledValues(at);
   }
 
   spawnSources(when, position, loop, options = {}) {
@@ -549,6 +579,7 @@ export class SongPlayer {
       const gain = source.fade.gain;
       // Replace an earlier queued jump without leaving its old fade behind.
       gain.cancelScheduledValues(this.ctx.currentTime);
+      source.endFadeAt = null;
       gain.setValueAtTime(1, this.ctx.currentTime);
       gain.setValueAtTime(1, when);
       gain.linearRampToValueAtTime(0, when + fade);
@@ -813,13 +844,18 @@ export class SongPlayer {
   }
 
   applyLoopFlags(run) {
+    const now = this.ctx.currentTime;
     for (const source of run.sources) {
       if (run.loop) {
         source.src.loopStart = run.loop.a;
         source.src.loopEnd = run.loop.b;
         source.src.loop = true;
+        // Dentro de una repetición no hay final natural: el fade-out del final no puede caer en ella.
+        this.cancelEndFade(source);
       } else {
         source.src.loop = false;
+        // Sin repetición la pista vuelve a terminar sola, así que recupera su fade-out del final.
+        this.scheduleEndFade(source, run.ctxStart + (source.duration - run.songStart), now);
       }
     }
   }

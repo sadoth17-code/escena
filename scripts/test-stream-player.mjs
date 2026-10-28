@@ -50,6 +50,21 @@ const deferred = () => {
   return { promise, resolve, reject };
 };
 async function flush() { for (let i = 0; i < 15; i++) await Promise.resolve(); }
+// El doble de AudioParam del fixture solo guarda el último valor. Para comprobar fades hace falta ver las
+// llamadas de automatización de cada ganancia nueva, con su orden y sus instantes.
+function recordGainEvents(f) {
+  const create = f.ctx.createGain;
+  f.ctx.createGain = function () {
+    const node = create.call(this);
+    const gain = node.gain;
+    gain.events = [];
+    for (const name of ['setValueAtTime', 'linearRampToValueAtTime', 'cancelScheduledValues']) {
+      const original = gain[name];
+      gain[name] = function (...args) { this.events.push({ name, args }); return original.apply(this, args); };
+    }
+    return node;
+  };
+}
 
 function fixture() {
   installTimers();
@@ -363,6 +378,86 @@ test('changing pitch preserves the short stem virtual duration and its silence i
   assert.equal(shortNodes.length, 2);
   close(shortNodes[0].duration, 1);
   close(shortNodes[1].when - shortNodes[0].when, 8);
+});
+
+test('every source, click and guide included, fades out over the last 50 ms of its own buffer', async () => {
+  const f = fixture();
+  recordGainEvents(f);
+  const player = f.player('tail', [20, 12]);
+  await player.play();
+  const start = player.run.ctxStart;
+  assert.equal(player.run.sources.length, 4);
+  for (const entry of player.run.sources) {
+    const end = start + entry.duration;
+    const events = entry.fade.gain.events;
+    assert.equal(events.length, 2, `${entry.track.def.id} must get exactly one end fade and nothing else`);
+    assert.equal(events[0].name, 'setValueAtTime');
+    assert.equal(events[0].args[0], 1);
+    close(events[0].args[1], end - 0.05);
+    assert.equal(events[1].name, 'linearRampToValueAtTime');
+    assert.equal(events[1].args[0], 0);
+    close(events[1].args[1], end);
+  }
+  // The short stem fades at its own end, not at the end of the song.
+  assert.deepEqual(player.run.sources.map(entry => entry.duration).sort((a, b) => a - b), [12, 20, 20, 20]);
+});
+
+test('a loop has no end fade: arming it cancels the fade and turning it off schedules it again', async () => {
+  const f = fixture();
+  recordGainEvents(f);
+  const player = f.player('loop-tail', [20, 20]);
+  await player.play();
+  const sources = player.run.sources;
+  const end = player.run.ctxStart + 20;
+  assert(sources.every(entry => entry.endFadeAt != null));
+  f.advance(1);
+  player.setLoop({ a: 2, b: 8 });
+  for (const entry of sources) {
+    assert.equal(entry.endFadeAt, null);
+    // Only the fade itself is removed, never anything scheduled before it.
+    const cancel = entry.fade.gain.events.filter(event => event.name === 'cancelScheduledValues').at(-1);
+    close(cancel.args[0], end - 0.05);
+  }
+  player.setLoop(null);
+  for (const entry of sources) {
+    close(entry.endFadeAt, end - 0.05);
+    const events = entry.fade.gain.events;
+    assert.equal(events.at(-2).name, 'setValueAtTime');
+    close(events.at(-2).args[1], end - 0.05);
+    assert.equal(events.at(-1).name, 'linearRampToValueAtTime');
+    assert.equal(events.at(-1).args[0], 0);
+    close(events.at(-1).args[1], end);
+  }
+});
+
+test('a source that starts in a loop gets no end fade, and pause or a jump to the last milliseconds never leave a stale one', async () => {
+  const f = fixture();
+  recordGainEvents(f);
+  const looping = f.player('looping', [20, 20]);
+  looping.setLoop({ a: 0, b: 8 });
+  await looping.play();
+  assert(looping.run.sources.every(entry => entry.endFadeAt === null && entry.fade.gain.events.length === 0));
+
+  const player = f.player('release', [20, 20]);
+  await player.play();
+  await flush();
+  const run = player.run;
+  assert(run.sources.every(entry => entry.endFadeAt != null));
+  f.advance(0.5);
+  player.pause();
+  for (const entry of run.sources) {
+    assert.equal(entry.endFadeAt, null);
+    const cancel = entry.fade.gain.events.filter(event => event.name === 'cancelScheduledValues').at(-1);
+    close(cancel.args[0], 0.5);
+  }
+  await player.play();
+  await flush();
+  f.advance(1);
+  player.seek(19.98, 'now');
+  await flush();
+  assert(player.pending, 'the jump must be queued');
+  // Less than 50 ms left: there is no room for the fade and nothing may be scheduled in the past.
+  assert(player.pending.sources.every(entry => entry.endFadeAt === null));
 });
 
 test('rewind cancels deferred waveform reading without further chunks or restoring its stale promise', async () => {
