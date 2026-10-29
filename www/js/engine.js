@@ -127,6 +127,8 @@ export class Engine {
     this.ctx = ctx || new AudioContextClass({ latencyHint: 'playback' });
     this.offline = typeof OfflineAudioContext !== 'undefined' && this.ctx instanceof OfflineAudioContext;
     this.output = { ...DEFAULT_OUTPUT };
+    // Ajuste «Final de la canción» (corto, suave o largo): lo lee el reproductor al programar el fade del final.
+    this.endFade = 'soft';
     this.voiceBank = null;
     this.voiceBanks = new Map();
     this.voiceLoading = new Map();

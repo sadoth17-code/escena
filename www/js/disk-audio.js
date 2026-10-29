@@ -8,6 +8,9 @@ import { normalizePitch } from './pitch-utils.js';
 export const DISK_CHUNK_SECONDS = 2;
 const CACHE_VERSION = 1;
 const PEAK_COUNT = 1600;
+// Cuánto del final de cada pista se mide para decidir el fade de salida (ver measureTail): lo que suena justo
+// antes de que el archivo se corte es lo que se oye como un golpe o un zumbido que se apaga.
+export const TAIL_SECONDS = 0.25;
 const abortIf = cancelled => { if (cancelled?.()) throw new WavAborted(); };
 // Decoders and pitch workers need a complete stem temporarily. Keep at most one
 // such conversion alive, independently of the many cheap WAV/header readers.
@@ -16,7 +19,7 @@ let conversionQueue = Promise.resolve();
 /** readChunk(index, firstFrame, frameCount) must return an AudioBuffer. */
 export class DiskAudio {
   constructor({ ctx, length, sampleRate, numberOfChannels, sourceChannels = numberOfChannels, readChunk, peaks = null,
-    chunkSeconds = DISK_CHUNK_SECONDS, maxChunks = 8 }) {
+    peaksComplete = false, chunkSeconds = DISK_CHUNK_SECONDS, maxChunks = 8 }) {
     if (!Number.isSafeInteger(length) || length < 1 || !Number.isFinite(sampleRate) || sampleRate <= 0 ||
       !Number.isInteger(numberOfChannels) || numberOfChannels < 1 || typeof readChunk !== 'function') {
       throw new Error('No se pudo preparar la pista local');
@@ -32,6 +35,10 @@ export class DiskAudio {
     this.framesPerChunk = Math.max(1, Math.round(chunkSeconds * sampleRate));
     this.chunkCount = Math.ceil(length / this.framesPerChunk);
     this.peaks = peaks;
+    // Con la caché local los picos de toda la pista se calculan al prepararla. Con un WAV leído directamente se
+    // van llenando a medida que se lee cada bloque; hasRead() dice cuáles faltan por leer.
+    this.peaksComplete = Boolean(peaksComplete);
+    this._read = new Set();
     this._readChunk = readChunk;
     this._maxChunks = Math.max(2, maxChunks);
     this._buffers = new Map();
@@ -90,6 +97,8 @@ export class DiskAudio {
         this._buffers.set(index, buffer);
         this._trim();
       }
+      this._read.add(index);
+      if (this._read.size >= this.chunkCount) this.peaksComplete = true;
       try { this.onChunk?.(index); } catch (error) { void error; }
       return buffer;
     }).finally(() => { if (this._pending.get(index) === pending) this._pending.delete(index); });
@@ -100,6 +109,58 @@ export class DiskAudio {
   async ensure(seconds) {
     const index = this._index(seconds);
     await Promise.all([this.getChunk(index), this.getChunk(index + 1)]);
+  }
+
+  // ¿Ya se leyó este bloque alguna vez (aunque ahora no esté en memoria)?
+  hasRead(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= this.chunkCount) return false;
+    return this.peaksComplete || this._read.has(index);
+  }
+
+  // Lee un bloque que nunca se ha leído solo para que se complete su parte de `peaks` (un WAV leído directamente
+  // la va llenando al leer cada bloque) y lo suelta: no lo guarda en memoria, así que no desplaza de la caché lo
+  // que necesita la reproducción. Devuelve true si leyó algo y false si no hacía falta.
+  async scanChunk(index) {
+    if (this._disposed || this.peaksComplete || !Number.isInteger(index) || index < 0 || index >= this.chunkCount) return false;
+    if (this._read.has(index)) return false;
+    // Si ya se está leyendo por otro lado, se espera a esa lectura en vez de repetirla.
+    if (this._pending.has(index)) {
+      try { await this._pending.get(index); } catch (error) { void error; }
+      return false;
+    }
+    const read = this._readChunk;
+    if (!read) return false;
+    const first = index * this.framesPerChunk;
+    const frames = Math.min(this.framesPerChunk, this.length - first);
+    await read(index, first, frames);
+    if (this._disposed) return false;
+    this._read.add(index);
+    if (this._read.size >= this.chunkCount) this.peaksComplete = true;
+    return true;
+  }
+
+  // Pico (valor absoluto, todos los canales) de los últimos `seconds` de la pista. El reproductor lo usa para
+  // decidir cuánto dura el fade del final: una pista que ya acaba en silencio no lo necesita, y una que sigue
+  // sonando cuando se acaba el archivo sí. Lee solo el último bloque (o los dos últimos, si la ventana cae a
+  // caballo entre ambos) y guarda el resultado en `tailPeak`.
+  async measureTail(seconds = TAIL_SECONDS) {
+    const frames = Math.min(this.length, Math.max(1, Math.round(seconds * this.sampleRate)));
+    const first = this.length - frames;
+    let peak = 0;
+    for (let index = Math.floor(first / this.framesPerChunk); index < this.chunkCount; index++) {
+      const chunk = await this.getChunk(index);
+      if (!chunk) continue;
+      const from = Math.max(0, first - index * this.framesPerChunk);
+      for (let c = 0; c < chunk.numberOfChannels; c++) {
+        const data = chunk.getChannelData(c);
+        for (let i = from; i < data.length; i++) {
+          const value = data[i] < 0 ? -data[i] : data[i];
+          if (value > peak) peak = value;
+        }
+      }
+    }
+    this.tailPeak = peak;
+    return peak;
   }
 
   memoryBytes() {
@@ -193,7 +254,7 @@ function validCache(index, key, blob) {
 function cachedDescriptor(ctx, index) {
   return new DiskAudio({
     ctx, length: index.frames, sampleRate: index.rate, numberOfChannels: index.channels,
-    sourceChannels: index.sourceChannels || index.channels, peaks: index.peaks || null,
+    sourceChannels: index.sourceChannels || index.channels, peaks: index.peaks || null, peaksComplete: Boolean(index.peaks),
     async readChunk(chunk, first, frames) {
       const row = await store.get('audioCache', `${index.id}:${chunk}`);
       if (!row?.blob || row.blob.size !== frames * index.channels * 4) throw new Error('Falta un bloque de audio preparado. Vuelve a preparar esta canción.');

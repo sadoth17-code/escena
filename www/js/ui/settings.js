@@ -356,6 +356,16 @@ export function openSettings() {
       gap.hidden = value !== 'next';
     },
   });
+  const endFade = createSegmented({
+    options: [
+      { value: 'short', label: 'Corto' },
+      { value: 'soft', label: 'Suave' },
+      { value: 'long', label: 'Largo' },
+    ],
+    value: app.settings.endFade,
+    label: 'Final de la canción',
+    onChange: (value) => app.setSetting('endFade', value),
+  });
   const gapRange = createRange({ min: 0, max: 15, step: 1, value: app.settings.gapSeconds, label: 'Pausa entre canciones', format: (value) => `${value} s`, onInput: (value) => app.setSetting('gapSeconds', value) });
   const gap = field('Pausa entre canciones', gapRange.el);
   gap.hidden = app.settings.afterSong !== 'next';
@@ -375,6 +385,7 @@ export function openSettings() {
     field('Saltos entre secciones', jump.el, 'Compás: sigue tocando y cambia al terminar el compás actual. Se aplica a pantalla, teclado y MIDI; se guarda en este dispositivo.'),
     field('Al terminar la canción', after.el),
     gap,
+    field('Final de la canción', endFade.el, 'Cómo se apaga el sonido al llegar al final del archivo. «Corto» solo evita el golpe del corte (50 ms). «Suave» y «Largo» bajan el volumen durante unos 3 o 6 segundos si la pista sigue sonando al terminar; las que ya acaban en silencio quedan como están. Se aplica al momento.'),
     settingRow('Pre-conteo automático', 'Cuenta antes de empezar desde el inicio', autoCount.el),
     settingRow('Precarga inteligente', 'Deja preparado el inicio de las canciones descargadas y lee el resto del dispositivo mientras suenan. Los archivos comprimidos y los cambios de tono crean una caché local una sola vez. Actívala antes de tocar.', preload.el),
     settingRow('Mantener pantalla encendida', 'Evita que el dispositivo se bloquee mientras tocas', awake.el)
@@ -508,7 +519,7 @@ export function openSettings() {
     } catch (error) { offlineResult.textContent = error.message; }
     finally { offlineCheck.disabled = false; }
   } }, icon('check', 18), 'Comprobar uso sin internet');
-  const appSection = section('Aplicación y uso sin internet', null, installBox, usageText, persistButton, offlineCheck, offlineResult, h('p', { class: 'field-hint', text: 'Escena · Motor local por bloques 1 · nombres de salida · final sin golpe · ingvelarde.com' }));
+  const appSection = section('Aplicación y uso sin internet', null, installBox, usageText, persistButton, offlineCheck, offlineResult, h('p', { class: 'field-hint', text: 'Escena · Motor local por bloques 1 · nombres de salida · final suave · ingvelarde.com' }));
   const accessStatus = h('p', { class: 'field-hint' });
   const renderAccess = () => { accessStatus.textContent = access.cloudRole === 'player' ? 'Este equipo tiene acceso de reproducción a la nube. La edición está bloqueada incluso sin internet.' : access.configured ? `Clave local configurada. Modo ${access.canEdit ? 'maestro' : 'reproducción'}.` : 'La edición local aún no tiene clave. Configura el acceso maestro antes de compartir este equipo.'; };
   unsubscribe.push(access.on('change', renderAccess));

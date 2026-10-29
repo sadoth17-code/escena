@@ -34,6 +34,8 @@ export const DEFAULT_SETTINGS = {
   jumpMode: 'bar',
   liveControlsVersion: 1,
   afterSong: 'stop',
+  // Cómo se apaga cada pista al llegar al final del archivo: 'short' (50 ms), 'soft' (hasta 3 s) o 'long' (hasta 6 s).
+  endFade: 'soft',
   gapSeconds: 0,
   preloadNext: true,
   autoCountIn: true,
@@ -56,6 +58,7 @@ function mergeSettings(saved) {
   merged.pad.style = normalizePadStyle(merged.pad.style);
   merged.pad.fade = [1, 2, 4].includes(Number(merged.pad.fade)) ? Number(merged.pad.fade) : 2;
   if (!isGuideLanguage(merged.guideLang)) merged.guideLang = DEFAULT_GUIDE_LANG;
+  if (!['short', 'soft', 'long'].includes(merged.endFade)) merged.endFade = DEFAULT_SETTINGS.endFade;
   // This live-performance update starts every device in bar mode once.
   // Later, deliberate changes in Ajustes are retained.
   if (!saved || saved.liveControlsVersion !== 1 || !['bar', 'beat', 'now'].includes(merged.jumpMode)) merged.jumpMode = 'bar';
@@ -133,6 +136,7 @@ class App {
     this.activeSetlistId = this.setlists.some((setlist) => setlist.id === active) ? active : this.setlists[0].id;
     this.engine = new Engine();
     this.engine.output = this.settings.output;
+    this.engine.endFade = this.settings.endFade;
     this.engine.applyOutput(true);
     this.pad = new AmbientPad(this.engine, () => this.emit('pad'));
     this.setPad(this.settings.pad, false);
@@ -164,8 +168,16 @@ class App {
 
   setSetting(key, value) {
     this.settings[key] = value;
+    if (key === 'endFade') this.applyEndFade();
     this.saveSettings();
     this.emit('settings', key);
+  }
+
+  // El motor lee el ajuste al programar cada fade; la canción que ya está sonando rehace los suyos.
+  applyEndFade() {
+    if (!this.engine) return;
+    this.engine.endFade = this.settings.endFade;
+    this.player?.refreshEndFades();
   }
 
   setPad(patch, persist = true) {
@@ -226,6 +238,7 @@ class App {
     if (guideBefore !== this.settings.guideLang) this.setGuideLanguage(this.settings.guideLang).catch(() => {});
     this.engine.output = this.settings.output;
     this.engine.applyOutput(false);
+    this.applyEndFade();
     this.saveSettings();
     this.sinkState = 'default';
     this.engine.setSinkId('').catch(() => {});
@@ -708,6 +721,17 @@ class App {
             onProgress: fraction => job?.onProgress?.(done + fraction, total, item.track.name),
           });
           if (stopped()) throw new Cancelled();
+          // Cómo suena el final de la pista decide cuánto dura su fade de salida (ver SongPlayer.endFadeLength). Es
+          // una lectura corta del último bloque; si falla, la pista se queda con el fade corto de siempre.
+          if (typeof buffer.measureTail === 'function') {
+            try {
+              await buffer.measureTail();
+              buffer.trimToHead?.();
+            } catch (error) {
+              void error;
+            }
+          }
+          if (stopped()) throw new Cancelled();
           this.audioInfo.set(item.track.fileId, { channels: buffer.sourceChannels || buffer.numberOfChannels, duration: buffer.duration });
           buffers.set(item.track.id, buffer);
           item.track.duration = buffer.duration;
@@ -770,7 +794,8 @@ class App {
         this.toast(detail?.error ? 'No se pudo leer un bloque de audio local. Revisa el espacio disponible y vuelve a abrir la canción.' : 'El almacenamiento está respondiendo lento; se está recuperando la lectura de audio.', 'error');
       }
     });
-    // El dibujo de la onda queda calculado aquí, en segundo plano, y no al cambiar de canción.
+    // El dibujo de la onda se calcula aquí, no al cambiar de canción. En las pistas WAV por bloques
+    // solo cubre lo ya leído; el resto lo completa warmWaveform cuando la canción pasa a ser la actual.
     try {
       player.peaks();
     } catch (error) {
@@ -897,6 +922,8 @@ class App {
     if (old && old !== entry) this.retire(old);
     store.setMeta('last', { songId: entry.song.id }).catch(() => {});
     this.emit('song:loaded', entry);
+    // La onda de la línea de tiempo se completa en segundo plano, solo para la canción que está en escena.
+    entry.player.warmWaveform?.();
   }
 
   // Pone al día una canción que esperaba lista en memoria: empieza sin solos y recoge lo que se haya

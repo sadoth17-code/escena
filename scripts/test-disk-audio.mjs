@@ -83,7 +83,7 @@ function engineFixture({ channels = 2, length = 56000, rate = 8000 } = {}) {
 }
 const values = [-1, -0.5, 0, 0.25, 0.75];
 const valueAt = (frame, channel) => values[(frame + channel * 2) % values.length];
-function wav({ code = 1, bits = 16, channels = 2, rate = 8000, frames = 40001 } = {}) {
+function wav({ code = 1, bits = 16, channels = 2, rate = 8000, frames = 40001, sample = valueAt } = {}) {
   const align = channels * bits / 8;
   const body = frames * align;
   const bytes = Buffer.alloc(44 + body + (body & 1));
@@ -92,7 +92,7 @@ function wav({ code = 1, bits = 16, channels = 2, rate = 8000, frames = 40001 } 
   bytes.writeUInt16LE(channels, 22); bytes.writeUInt32LE(rate, 24); bytes.writeUInt32LE(rate * align, 28);
   bytes.writeUInt16LE(align, 32); bytes.writeUInt16LE(bits, 34); bytes.write('data', 36); bytes.writeUInt32LE(body, 40);
   for (let frame = 0; frame < frames; frame++) for (let c = 0; c < channels; c++) {
-    const value = valueAt(frame, c), offset = 44 + (frame * channels + c) * bits / 8;
+    const value = sample(frame, c), offset = 44 + (frame * channels + c) * bits / 8;
     if (code === 3 && bits === 32) bytes.writeFloatLE(value, offset);
     else if (code === 3) bytes.writeDoubleLE(value, offset);
     else if (bits === 8) bytes.writeUInt8(value * 128 + 128, offset);
@@ -155,6 +155,133 @@ test('preparation reads only a header and 2 seconds at the original sample rate'
   assert.equal(tracked.slices[1][1] - tracked.slices[1][0], 88200 * 4);
   assert.ok(tracked.slices.reduce((total, [start, end]) => total + end - start, 0) < tracked.blob.size / 5);
   assert.equal(fixture.decodes, 0);
+});
+
+test('measureTail reads only the last block and reports the peak of the last quarter second', async () => {
+  // 8000 Hz, 40001 frames: blocks of 16000 frames, so the last one is index 2. Loud music before the window.
+  const frames = 40001;
+  const sample = frame => (frame === 40000 ? 0.03125 : frame >= frames - 2000 ? 0.015625 : 0.5);
+  const tracked = trackedBlob(wav({ channels: 1, frames, sample }));
+  const stream = await createDiskAudio(engineFixture().engine, tracked.blob);
+  assert.equal(tracked.slices.length, 2);
+  assert.equal(stream.tailPeak, undefined);
+  assert.equal(stream.hasRead(0), true);
+  assert.equal(stream.hasRead(1), false);
+  assert.equal(stream.hasRead(2), false);
+  assert.equal(await stream.measureTail(), 0.03125);
+  assert.equal(stream.tailPeak, 0.03125);
+  assert.equal(tracked.slices.length, 3, 'exactly one more read');
+  assert.equal(tracked.slices[2][0], 44 + 2 * 16000 * 2);
+  assert.equal(stream.hasRead(2), true);
+  assert.equal(stream.hasRead(1), false);
+  // A wider window (the last 2 s) also reaches block 1 and the loud music; block 2 is not read again.
+  assert.equal(await stream.measureTail(2), 0.5);
+  assert.equal(stream.tailPeak, 0.5);
+  assert.equal(tracked.slices.length, 4, 'the earlier block is the only new read');
+  assert.equal(stream.hasRead(1), true);
+  assert.equal(stream.hasRead(3), false);
+});
+
+test('measureTail looks at every channel and at a window that falls across two blocks', async () => {
+  // 16500 frames: block 1 has only 500 frames, so the last 2000 frames start in block 0.
+  const frames = 16500;
+  const sample = (frame, channel) => (channel === 1 && frame === 15000 ? 0.25 : channel === 0 && frame > 16400 ? 0.125 : 0);
+  const tracked = trackedBlob(wav({ channels: 2, frames, sample }));
+  const stream = await createDiskAudio(engineFixture().engine, tracked.blob);
+  assert.equal(tracked.slices.length, 2);
+  assert.equal(await stream.measureTail(), 0.25);
+  assert.equal(tracked.slices.length, 3, 'block 0 was already in memory; only block 1 is read');
+  assert.equal(stream.hasRead(1), true);
+});
+
+test('measureTail copes with a file shorter than the window and with silence', async () => {
+  const short = await createDiskAudio(engineFixture().engine, wav({ channels: 2, frames: 1000, sample: () => 0.125 }));
+  assert.equal(await short.measureTail(), 0.125);
+  const silent = await createDiskAudio(engineFixture().engine, wav({ channels: 2, frames: 30000, sample: () => 0 }));
+  assert.equal(await silent.measureTail(), 0);
+  assert.equal(silent.tailPeak, 0);
+});
+
+test('measureTail on a prepared compressed file reads the local cache and its peaks are already complete', async () => {
+  reset();
+  const fixture = engineFixture();
+  const stream = await createDiskAudio(fixture.engine, new Blob(['compressed again'], { type: 'audio/mpeg' }), { fileId: 'tail-mp3' });
+  assert.equal(stream.peaksComplete, true);
+  assert.equal(stream.hasRead(3), true);
+  assert.equal(await stream.measureTail(), 1);
+  stream.dispose();
+  await assert.rejects(stream.measureTail(), { name: 'WavAborted' });
+  // Reopened from the persistent chunks it is complete too.
+  const reopened = await createDiskAudio(engineFixture().engine, new Blob(['compressed again'], { type: 'audio/mpeg' }), { fileId: 'tail-mp3' });
+  assert.equal(reopened.peaksComplete, true);
+  assert.equal(await reopened.measureTail(), 1);
+});
+
+test('scanChunk completes the peaks without keeping any block in memory, and gives the same peaks as reading them all', async () => {
+  const frames = 8000 * 30; // 15 blocks of 2 s
+  const tracked = trackedBlob(wav({ frames }));
+  const stream = await createDiskAudio(engineFixture().engine, tracked.blob);
+  const reference = await createDiskAudio(engineFixture().engine, wav({ frames }));
+  for (let index = 0; index < reference.chunkCount; index++) await reference.getChunk(index);
+  assert.equal(reference.peaksComplete, true, 'reading every block once also completes the peaks');
+  const head = stream.peekChunk(0);
+  const bytes = stream.memoryBytes();
+  const slices = tracked.slices.length;
+  assert.equal(stream.peaksComplete, false);
+  assert.equal(stream.peaks.filter(peak => peak > 0).length < 1600, true, 'only the head has peaks at first');
+  assert.equal(await stream.scanChunk(0), false, 'the head was read when the song was prepared');
+  for (let index = 1; index < stream.chunkCount; index++) assert.equal(await stream.scanChunk(index), true);
+  assert.equal(tracked.slices.length, slices + 14, 'one read per missing block');
+  assert.equal(stream.memoryBytes(), bytes, 'nothing but the head stays in memory');
+  assert.equal(stream.peekChunk(0), head);
+  for (let index = 1; index < stream.chunkCount; index++) assert.equal(stream.peekChunk(index), null);
+  assert.equal(stream.peaksComplete, true);
+  assert.deepEqual(Array.from(stream.peaks), Array.from(reference.peaks));
+  // Nothing left to do, and indexes that do not exist are ignored.
+  for (const index of [1, 7, 14, -1, 15, 1.5, NaN]) assert.equal(await stream.scanChunk(index), false);
+  assert.equal(tracked.slices.length, slices + 14);
+});
+
+test('scanChunk does not repeat a read already in flight, skips blocks played before, and reports a damaged file', async () => {
+  const frames = 8000 * 20;
+  const bytes = wav({ frames });
+  const full = bytes;
+  let damaged = false;
+  const slices = [];
+  const blob = {
+    size: full.size, type: full.type,
+    arrayBuffer() { throw new Error('Whole-file reading is forbidden'); },
+    slice(start, end) {
+      slices.push([start, end]);
+      return { async arrayBuffer() { const raw = await full.slice(start, end).arrayBuffer(); return damaged && start > 1000 ? raw.slice(0, raw.byteLength - 4) : raw; } };
+    },
+  };
+  const stream = await createDiskAudio(engineFixture().engine, blob);
+  const base = slices.length;
+  const playing = stream.getChunk(3);
+  assert.equal(await stream.scanChunk(3), false, 'it waits for the read in flight');
+  await playing;
+  assert.equal(slices.length, base + 1);
+  assert.equal(stream.hasRead(3), true);
+  assert.equal(await stream.scanChunk(3), false, 'a block played before is not read again');
+  assert.equal(slices.length, base + 1);
+  damaged = true;
+  await assert.rejects(stream.scanChunk(5), /incompleta/);
+  assert.equal(stream.hasRead(5), false, 'a block that failed is not marked as read');
+  assert.equal(stream.peaksComplete, false);
+  damaged = false;
+  assert.equal(await stream.scanChunk(5), true, 'and it can be retried');
+  stream.dispose();
+  assert.equal(await stream.scanChunk(6), false);
+});
+
+test('scanChunk has nothing to do for a prepared compressed file: its peaks are complete from the start', async () => {
+  reset();
+  const stream = await createDiskAudio(engineFixture().engine, new Blob(['compressed scan'], { type: 'audio/mpeg' }), { fileId: 'scan-mp3' });
+  const reads = io.reads.length;
+  assert.equal(stream.peaksComplete, true);
+  assert.equal(await stream.scanChunk(2), false);
+  assert.equal(io.reads.length, reads);
 });
 
 test('stereo downmix is opt-in and sourceChannels survives it', async () => {

@@ -160,7 +160,9 @@ async function main() {
     assert.equal(state.prepared.ready, 5);
     assert.equal(state.prepared.total, 5);
     assert.equal(state.counts.decodes, 0);
-    assert.equal(state.counts.diskReads, 14);
+    // Siete canciones con dos pistas: por cada pista se lee el primer bloque (para arrancar al instante)
+    // y el último (para medir cómo termina y decidir lo larga que será la bajada del final). Nada más.
+    assert.equal(state.counts.diskReads, 14 * 2);
     assert(state.counts.fileReads >= 14);
   });
 

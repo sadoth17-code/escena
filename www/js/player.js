@@ -16,8 +16,28 @@ const END_EPSILON = 0.004;
 // no es cero) y ese salto de golpe a silencio se oye como un golpe seco. 50 ms bastan para que no se
 // oiga y no tocan la música.
 const END_FADE = 0.05;
+// Pero si la pista sigue sonando cuando se acaba el archivo (un acorde sostenido, un pad, el zumbido de una
+// amplificación), 50 ms no lo arreglan: ya no hay clic, pero el sonido sigue y se apaga de golpe. Entonces el fade
+// dura lo que diga el ajuste «Final de la canción» (Engine.endFade), y algo menos si la pista suena bajito al final.
+export const END_FADES = { short: END_FADE, soft: 3, long: 6 };
+// Qué tan fuerte suena el final (pico de su último cuarto de segundo, ver DiskAudio.measureTail): por debajo de
+// TAIL_QUIET el corte ya no se oye y basta el fade corto; desde TAIL_LOUD se usa la duración completa del ajuste;
+// entre medias crece con el nivel en dB.
+const TAIL_QUIET = 0.002; // −54 dBFS
+const TAIL_LOUD = 0.1; // −20 dBFS
+// El fade largo baja con curva exponencial (la que el oído oye como un descenso parejo) hasta −60 dB y de ahí cae
+// a cero en un instante. Ninguna pista dedica más de esta parte de su duración al fade, para que un stem corto no
+// se convierta entero en un fade.
+const END_FLOOR = 0.001;
+const END_DROP = 0.02;
+const END_MAX_SHARE = 0.25;
 const WAVE_BLOCK = 256;
 const WAVE_SLICE = 3000000;
+// Lectura de fondo de la onda de la línea de tiempo (ver warmWaveform): espera inicial, y cuánto se espera entre
+// bloques mientras suena la canción (como mínimo, y el doble de lo que tardó la lectura anterior).
+const WARM_DELAY = 400;
+const WARM_PLAYING_PAUSE = 14;
+const WARM_REDRAW = 400;
 
 function yieldNow() {
   return new Promise((resolve) => {
@@ -28,6 +48,19 @@ function yieldNow() {
     };
     channel.port2.postMessage(0);
   });
+}
+
+// Volumen del fade del final de una pista en el instante t del reloj del audio: 1 antes de que empiece, 0 cuando
+// acaba. `plan` es el que dejó scheduleEndFade: { start, end, expEnd }, donde expEnd es null en el fade corto
+// (rampa lineal de start a end) y, en el largo, el instante en que la curva exponencial llega a END_FLOOR.
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export function endFadeLevel(plan, t) {
+  if (!plan || t <= plan.start) return 1;
+  if (t >= plan.end) return 0;
+  if (plan.expEnd === null) return (plan.end - t) / (plan.end - plan.start);
+  if (t < plan.expEnd) return Math.pow(END_FLOOR, (t - plan.start) / (plan.expEnd - plan.start));
+  return (END_FLOOR * (plan.end - t)) / (plan.end - plan.expEnd);
 }
 
 export class TrackNode {
@@ -153,6 +186,7 @@ export class SongPlayer {
     this.playRequest = 0;
     this.seekRequest = 0;
     this.waveEpoch = 0;
+    this.warmPromise = null;
     this.pitchSemitones = 0;
     this.pitchBusy = false;
     this.pitchController = null;
@@ -221,6 +255,13 @@ export class SongPlayer {
           buffer = await track.originalBuffer.reprocess(semitones, { pitchEnabled: include, signal: controller.signal, onProgress: report });
         }
         if (buffer.stream) buffer.playbackDuration = this.duration;
+        // El final de la pista transpuesta suena distinto al original: se vuelve a medir para su fade.
+        if (typeof buffer.measureTail === 'function' && buffer.tailPeak === undefined) {
+          try {
+            await buffer.measureTail();
+            buffer.trimToHead?.();
+          } catch (error) { void error; }
+        }
         check();
         rendered.push({ track, buffer, include });
         report(1);
@@ -241,6 +282,8 @@ export class SongPlayer {
       this.waveEpoch++;
       this.wavePromise = null;
       this.waveKey = '';
+      this.warmPromise = null;
+      this.warmWaveform();
     } finally {
       if (!committed) for (const { track, buffer } of rendered) if (buffer?.stream && buffer !== track.buffer) buffer.dispose();
       signal?.removeEventListener('abort', cancel);
@@ -490,11 +533,27 @@ export class SongPlayer {
       }
       const fade = this.ctx.createGain();
       if (fadeIn > 0) fade.gain.value = 0;
+      // El fade del final va en su propio nodo: así pausar, saltar o repetir en esos últimos segundos solo
+      // toca el fade de entrada y salida de siempre, y los dos volúmenes se multiplican sin saltos.
+      const end = this.ctx.createGain();
       src.connect(fade);
-      fade.connect(track.input);
-      entries.push({ src, fade, track, duration: track.buffer.duration, endFadeAt: null });
+      fade.connect(end);
+      end.connect(track.input);
+      entries.push({ src, fade, end, track, duration: track.buffer.duration, endLength: this.endFadeLength(track.buffer), endPlan: null });
     }
     return entries;
+  }
+
+  // Cuánto dura el fade del final de una pista: lo que pide el ajuste «Final de la canción» si la pista sigue
+  // sonando cuando se acaba el archivo (se mide al prepararla), y el fade corto de siempre si ya acaba en silencio,
+  // si no se pudo medir (el click y la guía) o si el ajuste es «Corto».
+  endFadeLength(buffer) {
+    const base = END_FADES[this.engine.endFade] ?? END_FADES.soft;
+    const peak = buffer?.tailPeak;
+    if (!(base > END_FADE) || !(peak > TAIL_QUIET)) return END_FADE;
+    const share = Math.min(1, Math.log(peak / TAIL_QUIET) / Math.log(TAIL_LOUD / TAIL_QUIET));
+    const length = END_FADE + (base - END_FADE) * share;
+    return Math.max(END_FADE, Math.min(length, (buffer.duration || 0) * END_MAX_SHARE));
   }
 
   // Arranca todos los nodos preparados en el mismo instante y en el mismo punto de la canción. Solo
@@ -507,7 +566,7 @@ export class SongPlayer {
       offset = position - preroll;
     }
     for (const entry of entries) {
-      const { src, fade } = entry;
+      const { src, fade, end } = entry;
       if (fadeIn > 0) {
         fade.gain.setValueAtTime(0, startAt);
         fade.gain.linearRampToValueAtTime(1, startAt + fadeIn);
@@ -517,40 +576,73 @@ export class SongPlayer {
         try {
           src.disconnect();
           fade.disconnect();
+          end.disconnect();
         } catch (error) {
           void error;
         }
       };
     }
-    // El final natural de cada pista cae a cero con un fade corto. Se programa después de arrancar
-    // todas las fuentes, para que nada pueda retrasar a las últimas.
+    // El final natural de cada pista cae a cero con un fade. Se programa después de arrancar todas las
+    // fuentes, para que nada pueda retrasar a las últimas.
     const begin = Math.max(startAt, this.ctx.currentTime);
-    for (const entry of entries) this.scheduleEndFade(entry, begin + (entry.duration - offset), begin + fadeIn);
+    for (const entry of entries) this.scheduleEndFade(entry, begin + (entry.duration - offset), begin);
     // Para diagnóstico y pruebas: cuánto margen quedó entre terminar de programar y el arranque.
     this.lastStart = { when: startAt, slack: startAt - this.ctx.currentTime, tracks: entries.length };
     return entries;
   }
 
-  // Programa el fade-out del final natural de una fuente. `endAt` es el instante del reloj del audio en
-  // que se acaba su búfer; `notBefore`, el primer instante en que el fade puede empezar (así no se pisa
-  // un fade-in ni se programa sobre algo que ya sonó). Una fuente en repetición no tiene final natural.
+  // Programa el fade-out del final natural de una fuente. `endAt` es el instante del reloj del audio en que se
+  // acaba su búfer; `notBefore`, el primer instante en que el fade puede empezar (no se programa sobre algo que
+  // ya sonó). Una fuente en repetición no tiene final natural.
+  //
+  // Si el fade completo no cabe porque se arrancó (o se quitó la repetición) cuando ya queda menos de lo que dura,
+  // empieza en ese momento desde el volumen normal y baja igual hasta cero en lo que falta, solo que más deprisa:
+  // nunca sube de golpe ni se salta el final. Con menos de 50 ms por delante no se programa nada.
   scheduleEndFade(source, endAt, notBefore = 0) {
-    if (source.endFadeAt != null || source.src.loop || !Number.isFinite(endAt)) return;
-    const fadeAt = endAt - END_FADE;
-    if (!(fadeAt > notBefore)) return;
-    const gain = source.fade.gain;
-    gain.setValueAtTime(1, fadeAt);
+    if (source.endPlan || source.src.loop || !Number.isFinite(endAt)) return;
+    const start = Math.max(endAt - source.endLength, notBefore);
+    const span = endAt - start;
+    if (!(span >= END_FADE - 1e-6)) return;
+    const long = source.endLength > END_FADE + 1e-9 && span > END_FADE + 1e-6;
+    const plan = { start, end: endAt, expEnd: long ? endAt - Math.min(END_DROP, span / 4) : null };
+    const gain = source.end.gain;
+    gain.setValueAtTime(1, start);
+    if (long) gain.exponentialRampToValueAtTime(END_FLOOR, plan.expEnd);
     gain.linearRampToValueAtTime(0, endAt);
-    source.endFadeAt = fadeAt;
+    source.endPlan = plan;
   }
 
-  // Quita el fade-out del final: se usa al activar una repetición, que no debe quedar en silencio.
+  // Quita el fade-out del final: se usa al activar una repetición, que no debe quedar en silencio. Si el fade ya
+  // había empezado, el volumen vuelve al normal en unos milisegundos en lugar de saltar.
   cancelEndFade(source) {
-    if (source.endFadeAt == null) return;
-    const at = source.endFadeAt;
-    source.endFadeAt = null;
-    // Solo desde el inicio del fade: el fade-in de arranque, si lo hay, queda intacto.
-    source.fade.gain.cancelScheduledValues(at);
+    const plan = source.endPlan;
+    if (!plan) return;
+    source.endPlan = null;
+    const gain = source.end.gain;
+    const now = this.ctx.currentTime;
+    const level = endFadeLevel(plan, now);
+    // Este nodo solo lleva el fade del final: no hay nada más que conservar en él.
+    gain.cancelScheduledValues(0);
+    if (level < 1) {
+      gain.setValueAtTime(level, now);
+      gain.linearRampToValueAtTime(1, now + END_DROP);
+    }
+  }
+
+  // El ajuste «Final de la canción» cambió con la canción ya sonando: rehace los fades que estaban programados.
+  refreshEndFades() {
+    if (this.disposed) return;
+    const now = this.ctx.currentTime;
+    for (const run of [this.run, this.pending]) {
+      if (!run) continue;
+      for (const source of run.sources) {
+        source.endLength = this.endFadeLength(source.track.buffer);
+        if (run.loop) continue;
+        this.cancelEndFade(source);
+        // Tras la rampa que devuelve el volumen normal, si el fade ya había empezado.
+        this.scheduleEndFade(source, run.ctxStart + (source.duration - run.songStart), Math.max(now + 2 * END_DROP, run.ctxStart));
+      }
+    }
   }
 
   spawnSources(when, position, loop, options = {}) {
@@ -579,7 +671,6 @@ export class SongPlayer {
       const gain = source.fade.gain;
       // Replace an earlier queued jump without leaving its old fade behind.
       gain.cancelScheduledValues(this.ctx.currentTime);
-      source.endFadeAt = null;
       gain.setValueAtTime(1, this.ctx.currentTime);
       gain.setValueAtTime(1, when);
       gain.linearRampToValueAtTime(0, when + fade);
@@ -748,6 +839,7 @@ export class SongPlayer {
     this.waveEpoch++;
     this.wavePromise = null;
     this.waveKey = '';
+    this.warmPromise = null;
   }
 
   // Salta a otro punto de la canción: ya mismo ('now'), en el siguiente tiempo ('beat') o compás ('bar').
@@ -844,7 +936,8 @@ export class SongPlayer {
   }
 
   applyLoopFlags(run) {
-    const now = this.ctx.currentTime;
+    // Una tanda que aún no ha empezado (un salto en cola) no puede tener el fade antes de su arranque.
+    const notBefore = Math.max(this.ctx.currentTime, run.ctxStart);
     for (const source of run.sources) {
       if (run.loop) {
         source.src.loopStart = run.loop.a;
@@ -855,7 +948,7 @@ export class SongPlayer {
       } else {
         source.src.loop = false;
         // Sin repetición la pista vuelve a terminar sola, así que recupera su fade-out del final.
-        this.scheduleEndFade(source, run.ctxStart + (source.duration - run.songStart), now);
+        this.scheduleEndFade(source, run.ctxStart + (source.duration - run.songStart), notBefore);
       }
     }
   }
@@ -971,6 +1064,40 @@ export class SongPlayer {
       this.wavePromise = this.computeWaveform(sources);
     }
     return this.wavePromise;
+  }
+
+  // Deja listos, en segundo plano, los picos de toda la pista para la línea de tiempo. Con un WAV leído directamente
+  // solo existen los de las partes que ya sonaron, y la onda se veía casi vacía hasta haber tocado la canción entera.
+  // Cada bloque que falta se lee una sola vez y se suelta (no desplaza de la caché lo que necesita la reproducción),
+  // de a uno y cediendo el hilo entre medias; mientras suena la canción se espera más entre bloques. Se detiene si la
+  // canción deja la escena (rewind), cambia de tonalidad o se descarga, y al volver retoma donde se quedó. Nunca falla:
+  // si un bloque no se puede leer, la onda se queda como estaba.
+  warmWaveform({ delay = WARM_DELAY } = {}) {
+    if (this.warmPromise) return this.warmPromise;
+    if (!this.streaming || this.disposed) return Promise.resolve();
+    const epoch = this.waveEpoch;
+    const stopped = () => this.disposed || epoch !== this.waveEpoch;
+    const promise = (async () => {
+      if (delay > 0) await sleep(delay);
+      const buffers = this.waveSources().map((track) => track.buffer).filter((buffer) => typeof buffer?.scanChunk === 'function' && !buffer.peaksComplete);
+      const rounds = buffers.reduce((most, buffer) => Math.max(most, buffer.chunkCount), 0);
+      let redrawn = performance.now();
+      for (let index = 0; index < rounds && !stopped(); index++) {
+        for (const buffer of buffers) {
+          if (stopped()) break;
+          const started = performance.now();
+          if (!(await buffer.scanChunk(index))) continue;
+          await (this.state === 'playing' ? sleep(Math.max(WARM_PLAYING_PAUSE, 2 * (performance.now() - started))) : yieldNow());
+        }
+        if (performance.now() - redrawn > WARM_REDRAW) {
+          redrawn = performance.now();
+          this.waveRevision++;
+        }
+      }
+      if (!this.disposed) this.waveRevision++;
+    })().catch((error) => { void error; }).finally(() => { if (this.warmPromise === promise) this.warmPromise = null; });
+    this.warmPromise = promise;
+    return promise;
   }
 
   async computeWaveform(sources) {
