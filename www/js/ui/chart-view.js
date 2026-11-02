@@ -41,6 +41,7 @@ const CSS = `
 .cf-meta{margin-top:7px;color:var(--mute);font-size:.82rem;display:flex;gap:6px 14px;flex-wrap:wrap}
 .cf-list{padding:6px 14px 48px;font-size:calc(16px * var(--cf-scale,1))}
 .cf-note{color:var(--mute);margin:10px 0;font-size:.92em;white-space:pre-wrap}
+.cf-empty-action{margin:0 0 12px}
 .cf-item{margin:14px 0;padding-left:12px;border-left:4px solid var(--line);scroll-margin-top:var(--cf-sticky,170px)}
 .cf-item.on{border-left-color:var(--c)}
 .cf-item h3{margin:0 0 8px;font-size:1.02em;display:flex;align-items:baseline;gap:.6em}
@@ -70,7 +71,7 @@ function scrollParent(node) {
 }
 
 // `getPrefs()` devuelve { notation: 'abc' | 'latino', shift, size, follow, theme } y se lee en cada cambio.
-export function createChartView(root, getPrefs = () => ({}), { headTop = null, emptyText = 'Esperando al director…' } = {}) {
+export function createChartView(root, getPrefs = () => ({}), { headTop = null, emptyText = 'Esperando al director…', emptyAction = null } = {}) {
   ensureStyles();
   root.classList.add('cf-root', 'cf-view');
   const chip = el('span', { class: 'cf-chip' });
@@ -126,7 +127,11 @@ export function createChartView(root, getPrefs = () => ({}), { headTop = null, e
 
     const layout = S.layout;
     const nodes = [];
-    if (!layout.hasChords) nodes.push(el('p', { class: 'cf-note', text: 'Esta canción todavía no tiene cifrado: aquí se ve la estructura y el avance.' }));
+    if (!layout.hasChords) {
+      nodes.push(el('p', { class: 'cf-note', text: 'Esta canción todavía no tiene cifrado: aquí se ve la estructura y el avance.' }));
+      // Solo en el panel de la laptop: un atajo para que Escena lo escriba sola.
+      if (emptyAction) nodes.push(el('div', { class: 'cf-empty-action' }, el('button', { class: 'cf-tb primary', type: 'button', onClick: emptyAction.onClick }, emptyAction.label)));
+    }
     for (const text of layout.notes) nodes.push(el('p', { class: 'cf-note', text }));
     layout.items.forEach(item => {
       const body = [];

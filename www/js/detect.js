@@ -123,11 +123,9 @@ export function fft(re, im) {
   }
 }
 
-// Reduce la frecuencia de muestreo a ~22 kHz con un filtro paso bajo (ventana de Blackman).
-// `cancelled` se consulta de vez en cuando; en ese caso devuelve null.
-export async function decimate(samples, rate, target = 22050, { cancelled } = {}) {
-  const factor = Math.max(1, Math.round(rate / target));
-  if (factor === 1) return { data: samples, rate };
+// Filtro paso bajo (ventana de Blackman) con el que se reduce la frecuencia de muestreo; lo comparten
+// decimate() y StreamDecimator.
+function decimationKernel(factor) {
   const taps = factor * 16 + 1;
   const mid = (taps - 1) / 2;
   const cutoff = 0.45 / factor;
@@ -141,6 +139,15 @@ export async function decimate(samples, rate, target = 22050, { cancelled } = {}
     sum += h[i];
   }
   for (let i = 0; i < taps; i++) h[i] /= sum;
+  return { h, taps, mid };
+}
+
+// Reduce la frecuencia de muestreo a ~22 kHz con un filtro paso bajo (ventana de Blackman).
+// `cancelled` se consulta de vez en cuando; en ese caso devuelve null.
+export async function decimate(samples, rate, target = 22050, { cancelled } = {}) {
+  const factor = Math.max(1, Math.round(rate / target));
+  if (factor === 1) return { data: samples, rate };
+  const { h, taps, mid } = decimationKernel(factor);
   const length = Math.floor(samples.length / factor);
   const out = new Float32Array(length);
   const chunk = 1 << 18;
@@ -175,6 +182,108 @@ export async function bufferToMono(buffer, options) {
     }
   }
   return decimate(mono, buffer.sampleRate, 22050, options);
+}
+
+// Lo mismo que decimate(), pero recibe el audio por tandas (los bloques de una pista «por bloques») y va
+// entregando lo que ya puede calcular. Juntando todo lo que devuelven push() y finish() sale exactamente lo
+// que daría decimate() con la señal entera.
+export class StreamDecimator {
+  constructor(rate, target = 22050) {
+    this.factor = Math.max(1, Math.round(rate / target));
+    this.rate = rate / this.factor;
+    this.kernel = this.factor > 1 ? decimationKernel(this.factor) : null;
+    this.buf = new Float32Array(0);
+    this.start = 0; // posición, en la señal completa, de la primera muestra de buf
+    this.total = 0; // muestras recibidas hasta ahora
+    this.next = 0; // próxima muestra de salida por calcular
+  }
+
+  push(samples) {
+    if (!this.kernel) { this.total += samples.length; return Float32Array.from(samples); }
+    const joined = new Float32Array(this.buf.length + samples.length);
+    joined.set(this.buf);
+    joined.set(samples, this.buf.length);
+    this.buf = joined;
+    this.total += samples.length;
+    // La salida i usa las muestras hasta i·factor + mid: solo se calcula lo que ya tiene todo su entorno.
+    const last = this.total - 1 - this.kernel.mid;
+    return this.emit(last < 0 ? 0 : Math.floor(last / this.factor) + 1);
+  }
+
+  finish() {
+    if (!this.kernel) return new Float32Array(0);
+    return this.emit(Math.floor(this.total / this.factor));
+  }
+
+  // Calcula las salidas desde `next` hasta `upTo` (sin incluirla). Fuera de la señal, el audio vale 0.
+  emit(upTo) {
+    const { h, taps, mid } = this.kernel;
+    const factor = this.factor;
+    const from = this.next;
+    const count = Math.max(0, upTo - from);
+    const out = new Float32Array(count);
+    const buf = this.buf;
+    const start = this.start;
+    const end = start + buf.length;
+    for (let n = 0; n < count; n++) {
+      const centre = (from + n) * factor - mid;
+      let acc = 0;
+      if (centre >= start && centre + taps <= end) {
+        const base = centre - start;
+        for (let k = 0; k < taps; k++) acc += h[k] * buf[base + k];
+      } else {
+        for (let k = 0; k < taps; k++) { const at = centre + k; if (at >= start && at < end) acc += h[k] * buf[at - start]; }
+      }
+      out[n] = acc;
+    }
+    this.next = from + count;
+    const keep = Math.max(start, this.next * factor - mid); // lo anterior ya no lo usa ninguna salida
+    if (keep > start) { this.buf = buf.slice(Math.min(buf.length, keep - start)); this.start = keep; }
+    return out;
+  }
+}
+
+// Una pista «por bloques» de Escena (buffer.stream): se lee bloque a bloque con getChunk(i), se pasa a un solo
+// canal y se baja a ~22 kHz sin tenerla entera en memoria. Con `cancelled()` devuelve null.
+// Hay que llamarla con la canción parada o en pausa: para no acumular memoria libera los bloques ya leídos
+// con trimToHead(), lo mismo que hace el reproductor al detenerse.
+export async function streamToMono(buffer, { cancelled, onProgress } = {}) {
+  const rate = buffer.sampleRate;
+  const perChunk = buffer.framesPerChunk || Math.round((buffer.chunkSeconds || 2) * rate);
+  const frames = buffer.length || Math.round((buffer.duration || 0) * rate);
+  const expected = Math.max(1, Math.ceil(frames / perChunk));
+  const decimator = new StreamDecimator(rate, 22050);
+  const pieces = [];
+  let length = 0;
+  const keep = part => { if (part.length) { pieces.push(part); length += part.length; } };
+  try {
+    for (let index = 0; index < (frames ? expected : 100000); index++) {
+      if (cancelled?.()) return null;
+      let chunk;
+      try { chunk = await buffer.getChunk(index); } catch (error) { throw new Error(`no se pudo leer el bloque ${index + 1} de ${expected}${error?.message ? ` (${error.message})` : ''}`); }
+      if (!chunk) break;
+      const channels = Math.max(1, chunk.numberOfChannels || 1);
+      const first = chunk.getChannelData(0);
+      let mono = first;
+      if (channels > 1) {
+        mono = new Float32Array(first.length);
+        for (let c = 0; c < channels; c++) {
+          const data = chunk.getChannelData(c);
+          for (let i = 0; i < mono.length; i++) mono[i] += data[i] / channels;
+        }
+      }
+      keep(decimator.push(mono));
+      onProgress?.(Math.min(1, (index + 1) / expected));
+      if (index % 4 === 3) { buffer.trimToHead?.(); await yieldNow(); }
+    }
+    keep(decimator.finish());
+  } finally {
+    try { buffer.trimToHead?.(); } catch { /* ya liberada */ }
+  }
+  const data = new Float32Array(length);
+  let at = 0;
+  for (const piece of pieces) { data.set(piece, at); at += piece.length; }
+  return { data, rate: decimator.rate };
 }
 
 // ───────── Espectro → cromagrama fino ─────────
@@ -310,9 +419,26 @@ export function mergeFrames(trebleFrames, bassFrames) {
   return out;
 }
 
+// Si las pistas están transportadas (tono subido o bajado en Escena), suenan `semitones` más arriba que el audio
+// original: se rotan los cuadros para dejar el cifrado en el tono original de la canción.
+export function unshiftFrames(frames, semitones) {
+  const shift = ((Math.round(semitones) % 12) + 12) % 12;
+  if (!frames || !shift) return frames;
+  const moved = new Float32Array(NFINE);
+  for (const array of [frames.treble, frames.bass]) {
+    for (let f = 0; f < frames.count; f++) {
+      const base = f * NFINE;
+      for (let i = 0; i < NFINE; i++) moved[(i - shift * FINE + NFINE) % NFINE] = array[base + i];
+      array.set(moved, base);
+    }
+  }
+  return frames;
+}
+
 // Suma de pistas de un mismo tipo (armónicas, o bajo) ya en mono y a la misma frecuencia de muestreo.
+// `unshift`: semitonos que suenan por encima del original (0 si están en su tono).
 export class PCMGroup {
-  constructor() { this.data = null; this.rate = 0; this.count = 0; }
+  constructor() { this.data = null; this.rate = 0; this.count = 0; this.unshift = 0; }
 
   add(samples, rate) {
     if (!this.data) { this.data = new Float32Array(samples.length); this.rate = rate; }
@@ -330,6 +456,8 @@ export async function framesFromGroups({ harm, bass }, options = {}) {
   if (harm?.data && !treble) return null;
   const low = bass?.data ? await analyzePCM(bass.data, bass.rate, part(both ? 0.5 : 0, 1)) : null;
   if (bass?.data && !low) return null;
+  if (treble) unshiftFrames(treble, harm.unshift);
+  if (low) unshiftFrames(low, bass.unshift);
   if (treble && low) return mergeFrames(treble, low);
   return treble || low;
 }

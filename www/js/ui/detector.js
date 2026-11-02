@@ -2,7 +2,7 @@
 // audio, o mientras suena), correr el detector de ../detect.js y entregar el resultado al editor del cifrado,
 // donde se revisa y se guarda. No toca el audio de Escena: lee los datos, o añade un analizador que no suena.
 import { el } from './chart-view.js';
-import { classifyTrack, bufferToMono, decodeToMono, PCMGroup, framesFromGroups, detectChart, LiveListener, meterSlots } from '../detect.js';
+import { classifyTrack, bufferToMono, streamToMono, decodeToMono, PCMGroup, framesFromGroups, detectChart, LiveListener, meterSlots } from '../detect.js';
 
 const STYLE_ID = 'cf-detect-style';
 const CSS = `
@@ -38,7 +38,7 @@ const SOURCES = [
   ['live', 'Mientras suena'],
 ];
 const HELP = {
-  tracks: 'Lee el audio que ya está cargado en Escena. Es lo más rápido y no hace falta que suene.',
+  tracks: 'Lee el audio de las pistas de la canción, tal como las tiene Escena. No hace falta que suene, pero la canción debe estar parada o en pausa. Tarda de unos segundos a un minuto, según lo larga que sea.',
   files: 'Elige los archivos de audio de la canción: cada pista suelta, o la mezcla completa. Tienen que empezar en el mismo punto que la secuencia.',
   live: 'Pulsa «Empezar a escuchar» y luego ▶ en Escena. Deja correr la canción (entera, si puedes) y no cambies de pestaña: Escena va anotando los acordes mientras suena. Lo que esté silenciado o sin volumen no se oye. No cambia el audio.',
 };
@@ -48,14 +48,22 @@ function injectStyles() {
   document.head.append(el('style', { id: STYLE_ID, text: CSS }));
 }
 
-const readable = track => Boolean(track.buffer && !track.buffer.stream && typeof track.buffer.getChannelData === 'function');
+// ¿Se puede leer el audio de esta pista? Las normales (AudioBuffer) sí. Las «por bloques» (el motor local de Escena)
+// se leen bloque a bloque con getChunk().
+const readable = track => {
+  const buffer = track.buffer;
+  if (!buffer) return false;
+  if (buffer.stream) return typeof buffer.getChunk === 'function' && buffer.sampleRate > 0;
+  return typeof buffer.getChannelData === 'function';
+};
 
-function trackRows(player) {
+// Para «Mientras suena» no hace falta leer el audio: se escucha lo que sale de cada pista, sea del tipo que sea.
+function trackRows(player, { listening = false } = {}) {
   return (player.fileTracks || []).map((track, index) => {
     const name = String(track.def?.name || `Pista ${index + 1}`);
     const kind = classifyTrack(name);
     const cue = track.def?.dest === 'cue'; // las pistas que solo van a los audífonos (guía, click) no llevan armonía
-    return { id: `t${index}`, name, track, role: kind === 'bass' ? 'bass' : 'harm', include: kind !== 'skip' && !cue, readable: readable(track) };
+    return { id: `t${index}`, name, track, role: kind === 'bass' ? 'bass' : 'harm', include: kind !== 'skip' && !cue, readable: listening ? true : readable(track) };
   });
 }
 
@@ -85,9 +93,11 @@ export function openDetector(cf, onClose = () => {}) {
   injectStyles();
   const player = cf.player;
   const root = el('div', { class: 'cf-detect', role: 'dialog', 'aria-label': 'Detectar acordes' });
+  const first = trackRows(player);
   const state = {
-    source: 'tracks',
-    rows: { tracks: trackRows(player), files: [], live: trackRows(player) },
+    // Si ninguna pista se puede leer (formato desconocido), se empieza por «Mientras suena», que siempre sirve.
+    source: first.length && !first.some(row => row.readable && row.include) ? 'live' : 'tracks',
+    rows: { tracks: first, files: [], live: trackRows(player, { listening: true }) },
     busy: false,
     cancel: false,
     listening: false,
@@ -154,34 +164,69 @@ export function openDetector(cf, onClose = () => {}) {
     const notes = [];
     if (result.uncertain.length) notes.push(`Revisa los compases ${result.uncertain.slice(0, 24).join(', ')}${result.uncertain.length > 24 ? '…' : ''}: salieron menos claros.`);
     if (result.covered < 0.9) notes.push(`Solo se escuchó el ${Math.round(result.covered * 100)} % de la canción; el resto quedó vacío.`);
+    const replacing = Boolean(cf.chartText?.().trim());
     return el('div', { class: 'cf-d-result' },
       el('p', { text: lines.join('\n'), style: 'white-space:pre-line' }),
       ...notes.map(text => el('p', { class: 'cf-d-warn', text })),
-      el('p', { text: 'Es un borrador automático: se abre en el editor para que lo revises. Tu cifrado actual no cambia hasta que pulses Guardar.' }),
+      el('p', { text: `Es un borrador automático. «${replacing ? 'Reemplazar' : 'Guardar'} y usar» lo pone ya en el panel y en los celulares; «Revisar en el editor» te deja corregirlo antes de guardarlo.${replacing ? ' Esta canción ya tiene un cifrado guardado: se reemplazaría.' : ''}` }),
       el('div', { class: 'cf-actions' },
         el('button', { class: 'cf-tb', type: 'button', onClick: () => { state.result = null; render(); } }, 'Volver'),
-        el('button', { class: 'cf-tb primary', type: 'button', onClick: () => { const text = result.text; close(); cf.edit(text, { detected: true }); } }, 'Abrir en el editor')));
+        el('button', { class: 'cf-tb', type: 'button', onClick: () => { const text = result.text; close(); cf.edit(text, { detected: true }); } }, 'Revisar en el editor'),
+        el('button', { class: 'cf-tb primary', type: 'button', onClick: () => { const text = result.text; close(); cf.saveChart(text); cf.tell('Cifrado guardado: ya se ve en el panel', 'info'); } }, `${replacing ? 'Reemplazar' : 'Guardar'} y usar`)));
   }
 
   // ───────── Desde datos que ya están en memoria (pistas cargadas o archivos) ─────────
   async function runOffline() {
     const rows = state.rows[state.source].filter(row => row.include && row.readable !== false);
     if (!rows.length) { setProgress(0, 'Elige al menos una pista.'); return; }
+    // Las pistas por bloques se leen del almacén local de Escena: con la canción sonando se pelearían con el reproductor.
+    if (rows.some(row => row.track?.buffer?.stream) && player.state === 'playing') {
+      setProgress(0, 'Pon la canción en pausa para leer sus pistas (o usa «Mientras suena»).');
+      return;
+    }
     state.busy = true;
     state.cancel = false;
     state.result = null;
     render();
     const cancelled = () => state.cancel;
+    const moved = Math.round(player.pitchSemitones || 0);
     try {
       const groups = { harm: new PCMGroup(), bass: new PCMGroup() };
+      const members = { harm: 0, bass: 0 };
+      const transposed = { harm: 0, bass: 0 }; // pistas de cada grupo que suenan con el tono cambiado
       for (let i = 0; i < rows.length; i++) {
         const row = rows[i];
-        setProgress((i / rows.length) * 0.45, `Leyendo «${row.name}»…`);
+        const role = row.role === 'bass' ? 'bass' : 'harm';
+        const from = (i / rows.length) * 0.45;
+        const span = 0.45 / rows.length;
+        setProgress(from, `Leyendo «${row.name}»…`);
         await pause();
-        const mono = row.track ? await bufferToMono(row.track.buffer, { cancelled }) : await decodeToMono(row.file, { cancelled });
+        let mono;
+        try {
+          if (!row.track) mono = await decodeToMono(row.file, { cancelled });
+          else if (row.track.buffer.stream) {
+            mono = await streamToMono(row.track.buffer, {
+              cancelled: () => state.cancel || player.state === 'playing',
+              onProgress: p => setProgress(from + p * span, `Leyendo «${row.name}»… ${Math.round(p * 100)} %`),
+            });
+            if (!mono && !state.cancel) throw new Error('la canción se puso a sonar mientras se leían las pistas; vuelve a intentarlo con la canción en pausa');
+            if (row.track.def?.pitchEnabled !== false) transposed[role]++;
+          } else {
+            // Con el tono cambiado, el AudioBuffer de la pista ya viene transportado; el original está en originalBuffer.
+            const original = row.track.originalBuffer;
+            const source = original && !original.stream && typeof original.getChannelData === 'function' ? original : row.track.buffer;
+            mono = await bufferToMono(source, { cancelled });
+          }
+        } catch (error) {
+          if (error !== CANCEL && error && typeof error === 'object') error.message = `«${row.name}»: ${error.message}`;
+          throw error;
+        }
         if (!mono) throw CANCEL;
-        groups[row.role === 'bass' ? 'bass' : 'harm'].add(mono.data, mono.rate);
+        groups[role].add(mono.data, mono.rate);
+        members[role]++;
       }
+      // Las pistas por bloques están ya preparadas en el tono actual: se deshace para que el cifrado quede en el original.
+      for (const role of ['harm', 'bass']) groups[role].unshift = moved && transposed[role] * 2 > members[role] ? moved : 0;
       setProgress(0.45, 'Escuchando las notas…');
       const frames = await framesFromGroups(groups, { onProgress: p => setProgress(0.45 + p * 0.5), cancelled });
       if (!frames) throw CANCEL;
@@ -267,7 +312,7 @@ export function openDetector(cf, onClose = () => {}) {
     role.value = row.role;
     return el('div', { class: 'cf-d-row', 'data-off': String(!row.include || row.readable === false) },
       el('label', {}, check, el('span', { text: row.name, title: row.name })),
-      row.readable === false ? el('small', { text: 'se lee por bloques' }) : role);
+      row.readable === false ? el('small', { text: 'no se puede leer' }) : role);
   }
 
   function render() {
@@ -283,7 +328,7 @@ export function openDetector(cf, onClose = () => {}) {
     kids.push(el('p', { text: HELP[state.source] }));
 
     if (state.source === 'tracks' && rows.length && !readableRows.length) {
-      kids.push(el('p', { class: 'cf-d-warn', text: 'Estas pistas se leen por bloques y no se pueden analizar de golpe. Usa «Mientras suena» o «Archivos de audio».' }));
+      kids.push(el('p', { class: 'cf-d-warn', text: 'No se pudo leer el audio de estas pistas desde aquí. Usa «Mientras suena» o «Archivos de audio».' }));
     }
     if (state.source === 'tracks' && !rows.length) kids.push(el('p', { class: 'cf-d-warn', text: 'Esta canción no tiene pistas de archivo cargadas.' }));
     if (state.source === 'files') {

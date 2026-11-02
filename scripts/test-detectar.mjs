@@ -389,3 +389,157 @@ test('en compases de 3 tiempos se usan 3 partes y se acierta igual', async () =>
   const bar = layout.items[0].bars[2];
   assert.deepEqual(bar.slots.map(slot => chart.formatChord(slot.chord, {})), ['G', 'G', 'D']);
 });
+
+// ───────────── Pistas «por bloques» (el motor local de Escena) ─────────────
+
+// Doble de una pista por bloques con la forma que usa el reproductor de Escena (ver test-stream-player.mjs): se lee
+// con getChunk(i), cada bloque es un AudioBuffer de `framesPerChunk` muestras (el último, más corto), y
+// trimToHead() libera todos los bloques menos el primero.
+function fakeStream(channelData, rate, { framesPerChunk = rate * 2 } = {}) {
+  const length = channelData[0].length;
+  const cache = new Map();
+  const stats = { reads: 0, trims: 0, maxCached: 0 };
+  const chunk = index => {
+    const start = index * framesPerChunk;
+    if (start >= length) return null;
+    const end = Math.min(length, start + framesPerChunk);
+    const parts = channelData.map(data => data.subarray(start, end));
+    return { length: end - start, sampleRate: rate, numberOfChannels: parts.length, duration: (end - start) / rate, getChannelData: channel => parts[channel] };
+  };
+  return {
+    stream: true, preparedPitch: true, sampleRate: rate, numberOfChannels: channelData.length, length, duration: length / rate,
+    playbackDuration: length / rate, framesPerChunk, chunkSeconds: framesPerChunk / rate, stats, cache,
+    peekChunk: index => cache.get(index) || null,
+    async getChunk(index) {
+      await Promise.resolve(); // el almacenamiento real es asíncrono
+      if (!cache.has(index)) {
+        const made = chunk(index);
+        if (!made) return null;
+        stats.reads++;
+        cache.set(index, made);
+        stats.maxCached = Math.max(stats.maxCached, cache.size);
+      }
+      return cache.get(index);
+    },
+    async ensure(position) { await this.getChunk(Math.floor((position * rate) / framesPerChunk)); },
+    trimToHead() { stats.trims++; for (const index of [...cache.keys()]) if (index !== 0) cache.delete(index); },
+    memoryBytes: () => cache.size * framesPerChunk * channelData.length * 4,
+    dispose() { cache.clear(); },
+  };
+}
+
+const concat = parts => {
+  const out = new Float32Array(parts.reduce((total, part) => total + part.length, 0));
+  let at = 0;
+  for (const part of parts) { out.set(part, at); at += part.length; }
+  return out;
+};
+
+test('el decimador por tandas da lo mismo que decimate() con cualquier reparto en bloques', async () => {
+  let seed = 7;
+  const random = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296;
+  for (const [rate, length] of [[44100, 60001], [48000, 33333], [22050, 4000], [96000, 40001], [44100, 40]]) {
+    const x = Float32Array.from({ length }, (_, i) => Math.sin(i * 0.031) * 0.5 + (random() - 0.5) * 0.2);
+    const want = await detect.decimate(x, rate);
+    for (const piece of [1, 7, 513, 2000, 44100, length]) {
+      const decimator = new detect.StreamDecimator(rate);
+      const parts = [];
+      for (let at = 0; at < length; at += piece) parts.push(decimator.push(x.subarray(at, Math.min(length, at + piece))));
+      parts.push(decimator.finish());
+      const got = concat(parts);
+      assert.equal(got.length, want.data.length, `${rate} Hz, bloques de ${piece}: largo`);
+      assert.equal(decimator.rate, want.rate);
+      let worst = 0;
+      for (let i = 0; i < got.length; i++) worst = Math.max(worst, Math.abs(got[i] - want.data[i]));
+      assert.ok(worst < 1e-6, `${rate} Hz, bloques de ${piece}: diferencia ${worst}`);
+    }
+  }
+});
+
+test('una pista por bloques se lee igual que si estuviera entera, sin acumular memoria', async () => {
+  const rate = 44100;
+  const length = rate * 30 + 123;
+  const left = Float32Array.from({ length }, (_, i) => Math.sin(i * 0.02) * 0.4);
+  const right = Float32Array.from(left, (value, i) => value * 0.5 + Math.sin(i * 0.011) * 0.1);
+  const stream = fakeStream([left, right], rate);
+  const seen = [];
+  const got = await detect.streamToMono(stream, { onProgress: p => seen.push(p) });
+  const whole = await detect.bufferToMono({ numberOfChannels: 2, sampleRate: rate, length, getChannelData: channel => [left, right][channel] });
+  assert.equal(got.rate, whole.rate);
+  assert.equal(got.data.length, whole.data.length);
+  let worst = 0;
+  for (let i = 0; i < got.data.length; i++) worst = Math.max(worst, Math.abs(got.data[i] - whole.data[i]));
+  assert.ok(worst < 1e-6, `diferencia ${worst}`);
+  assert.equal(stream.stats.reads, 16, 'lee cada bloque una vez (15 enteros y un último con las muestras que sobran)');
+  assert.ok(stream.stats.maxCached <= 5, `nunca tiene más de unos pocos bloques en memoria (${stream.stats.maxCached})`);
+  assert.ok(stream.cache.size <= 1, 'al terminar solo queda la cabeza, como cuando el reproductor se detiene');
+  assert.ok(seen.length === 16 && seen.every((p, i) => i === 0 || p >= seen[i - 1]) && seen[seen.length - 1] === 1, 'el progreso avanza hasta 1');
+});
+
+test('leer una pista por bloques se puede cancelar y deja la memoria como estaba', async () => {
+  const rate = 22050;
+  const stream = fakeStream([new Float32Array(rate * 20)], rate);
+  let calls = 0;
+  const result = await detect.streamToMono(stream, { cancelled: () => ++calls > 4 });
+  assert.ok(result === null);
+  assert.ok(stream.stats.reads <= 4);
+  assert.ok(stream.cache.size <= 1 && stream.stats.trims >= 1);
+});
+
+test('canciones por bloques: se lee el audio de cada pista y se acierta igual', async () => {
+  for (const [name, rate, key] of [['sol', 22050, 'G'], ['ritmo', 44100, 'E']]) {
+    const song = makeSong({ ...SONGS[name], rate, seed: 11 });
+    const harm = new detect.PCMGroup();
+    const bass = new detect.PCMGroup();
+    for (const stem of [song.stems.keys, song.stems.guitar]) {
+      const mono = await detect.streamToMono(fakeStream([stem, stem], rate));
+      harm.add(mono.data, mono.rate);
+    }
+    const low = await detect.streamToMono(fakeStream([song.stems.bass, song.stems.bass], rate));
+    bass.add(low.data, low.rate);
+    const result = detect.detectChart(await detect.framesFromGroups({ harm, bass }), songInfo(song));
+    const accuracy = score(song, result);
+    assert.ok(accuracy >= 0.97, `${name} por bloques: ${(accuracy * 100).toFixed(1)} %`);
+    assert.equal(result.key.text, key);
+  }
+});
+
+const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+const raise = (symbol, semitones) => {
+  const [, root, rest] = /^([A-G][#b]?)(.*)$/.exec(symbol);
+  return NOTE_NAMES[(chordInfo(root).root + semitones + 12) % 12] + rest;
+};
+
+test('con el tono de la canción cambiado en Escena, el cifrado sale en el tono original', async () => {
+  const original = makeSong({ ...SONGS.sol, rate: 22050, seed: 11 });
+  const plan = SONGS.sol.plan.map(section => ({ ...section, bars: section.bars.map(chord => raise(chord, 2)) }));
+  const raised = makeSong({ ...SONGS.sol, plan, rate: 22050, seed: 11 }); // lo que suena con el tono subido 2 semitonos
+  const run = async unshift => {
+    const harm = new detect.PCMGroup();
+    const bass = new detect.PCMGroup();
+    harm.add(raised.stems.keys, 22050);
+    harm.add(raised.stems.guitar, 22050);
+    bass.add(raised.stems.bass, 22050);
+    harm.unshift = unshift;
+    bass.unshift = unshift;
+    return detect.detectChart(await detect.framesFromGroups({ harm, bass }), songInfo(raised));
+  };
+  const fixed = await run(2);
+  assert.ok(score(original, fixed) >= 0.95, `${(score(original, fixed) * 100).toFixed(1)} %`);
+  assert.equal(fixed.key.text, 'G');
+  const raw = await run(0);
+  assert.equal(raw.key.text, 'A', 'sin deshacerlo, el cifrado saldría 2 semitonos arriba');
+});
+
+test('unshiftFrames rota los cuadros y no hace nada con 0 o 12 semitonos', () => {
+  const frames = { count: 2, treble: new Float32Array(120), bass: new Float32Array(120) };
+  frames.treble[5 * 7] = 1; // Sol, en el primer cuadro
+  frames.bass[60 + 5 * 2] = 1; // Re, en el segundo
+  detect.unshiftFrames(frames, 2);
+  assert.equal(frames.treble.indexOf(1), 5 * 5, 'Sol 2 semitonos arriba era Fa');
+  assert.equal(frames.bass.indexOf(1), 60 + 5 * 0, 'Re 2 semitonos arriba era Do');
+  detect.unshiftFrames(frames, 12);
+  detect.unshiftFrames(frames, 0);
+  assert.equal(frames.treble.indexOf(1), 5 * 5);
+  assert.equal(detect.unshiftFrames(null, 3), null);
+});

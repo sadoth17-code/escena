@@ -298,7 +298,7 @@ class Cifrado {
     this.liveBox = el('section', { class: 'cf-live', hidden: true, 'aria-label': 'Transmisión en vivo' });
     this.message = el('p', { role: 'status' });
     this.holder = el('div');
-    this.view = createChartView(this.holder, () => this.prefs, { emptyText: 'Carga una canción para ver su cifrado.' });
+    this.view = createChartView(this.holder, () => this.prefs, { emptyText: 'Carga una canción para ver su cifrado.', emptyAction: { label: 'Detectar acordes ahora', onClick: () => this.detect() } });
     this.scroll = el('div', { class: 'cf-scroll' }, this.holder);
     this.panel = el('aside', { class: 'cf-root cf-panel', 'data-open': 'false', 'aria-label': 'Cifrado' }, tools, this.liveBox, this.scroll);
     this.panel.dataset.theme = this.prefs.theme === 'light' ? 'light' : 'dark';
@@ -357,6 +357,14 @@ class Cifrado {
     this.liveBox.replaceChildren(...nodes);
   }
 
+  // Guarda el cifrado de la canción actual en este equipo (si está vacío, lo borra) y lo manda al panel y a los músicos.
+  saveChart(text) {
+    const key = this.songKey();
+    if (String(text || '').trim()) this.charts[key] = { text: String(text), updated: Date.now() }; else delete this.charts[key];
+    if (!kv.write(CHARTS_KEY, this.charts)) this.tell('No se pudo guardar el cifrado en este dispositivo', 'error');
+    this.refreshSong(true);
+  }
+
   // ───────── Editor del cifrado ─────────
   // `initial`: texto con que abrir el editor (por ejemplo, el que salió de la detección); si el editor ya está
   // abierto, lo reemplaza. `detected` avisa de que es un borrador automático.
@@ -384,13 +392,7 @@ class Cifrado {
         el('button', { class: 'cf-tb', type: 'button', onClick: () => this.detect() }, 'Detectar acordes'),
         el('button', { class: 'cf-tb', type: 'button', onClick: () => { area.value = `${area.value.trim() ? `${area.value.replace(/\s+$/, '')}\n\n` : ''}${templateFor(this.snapshot)}`; validate(); area.focus(); } }, 'Plantilla de las secciones'),
         el('button', { class: 'cf-tb', type: 'button', onClick: close }, 'Cancelar'),
-        el('button', { class: 'cf-tb primary', type: 'button', onClick: () => {
-          const key = this.songKey();
-          if (area.value.trim()) this.charts[key] = { text: area.value, updated: Date.now() }; else delete this.charts[key];
-          if (!kv.write(CHARTS_KEY, this.charts)) this.tell('No se pudo guardar el cifrado en este dispositivo', 'error');
-          close();
-          this.refreshSong(true);
-        } }, 'Guardar')));
+        el('button', { class: 'cf-tb primary', type: 'button', onClick: () => { close(); this.saveChart(area.value); } }, 'Guardar')));
     this.scroll.parentElement.append(this.editor);
     validate();
     if (detected) check.textContent = `Detectado automáticamente (borrador): revísalo y corrige lo que haga falta. ${check.textContent}`;
@@ -413,7 +415,7 @@ class Cifrado {
       this.detector = openDetector(this, () => { this.detector = null; });
     } catch (error) {
       console.error('Cifrado: no se pudo abrir la detección de acordes', error);
-      this.tell('No se pudo abrir la detección de acordes', 'error');
+      this.tell('No se pudo abrir la detección de acordes. Revisa que estén publicados www/js/detect.js y www/js/ui/detector.js; si ya lo están, cierra las pestañas de Escena y vuelve a abrir.', 'error');
     }
   }
 
