@@ -12,12 +12,12 @@ export function rng(seed = 1) {
   return () => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296;
 }
 
-// «F#m7» → { root: 6, tones: [6, 9, 1, 4], name }
+// «F#m7» → { root: 6, tones: [6, 9, 1, 4], bass: 6, name }. «Db/F» es Db con el bajo en Fa (primera inversión).
 export function chordInfo(symbol) {
-  const m = /^([A-G][#b]?)(m7|maj7|m|7|sus4)?$/.exec(symbol);
+  const m = /^([A-G][#b]?)(m7|maj7|m|7|sus4)?(?:\/([A-G][#b]?))?$/.exec(symbol);
   if (!m) throw new Error(`Acorde de prueba no válido: ${symbol}`);
   const root = PC[m[1]];
-  return { root, tones: SHAPES[m[2] || ''].map(i => (root + i) % 12), name: symbol };
+  return { root, tones: SHAPES[m[2] || ''].map(i => (root + i) % 12), bass: m[3] ? PC[m[3]] : root, name: symbol };
 }
 
 // Acorde de la forma [60, 72) más cercana a `centre` para cada nota del acorde.
@@ -31,6 +31,7 @@ function voice(tones, low, high) {
 }
 
 let DETUNE = 0; // desafinación global en semitonos, la fija makeSong
+let TILT = 0; // se suma a la caída de los armónicos de todas las notas: negativo = timbre brillante, positivo = apagado
 function note(out, rate, start, dur, midi, amp, rand, { harmonics = 8, attack = 0.012, decay = 2, tilt = 1.1 } = {}) {
   const f0 = 440 * 2 ** ((midi - 69 + DETUNE + (rand() - 0.5) * 0.08) / 12);
   const n0 = Math.floor(start * rate);
@@ -40,7 +41,7 @@ function note(out, rate, start, dur, midi, amp, rand, { harmonics = 8, attack = 
   for (let h = 1; h <= harmonics; h++) {
     const f = f0 * h;
     if (f > rate * 0.45) break;
-    const a = amp / h ** tilt;
+    const a = amp / h ** Math.max(0.2, tilt + TILT);
     const w = (2 * Math.PI * f) / rate;
     const phase = rand() * 2 * Math.PI;
     for (let i = 0; i < n; i++) {
@@ -63,9 +64,10 @@ function noiseBurst(out, rate, start, dur, amp, rand, { low = false } = {}) {
 }
 
 // plan: [{ name, bars: ['G', 'D', ['Em', 'C'], …] }]. Cada compás es un acorde o una lista de 2 o 4 acordes.
-export function makeSong({ plan, bpm = 100, beats = 4, rate = 22050, seed = 7, silentBars = 0, melody = true, tail = 1.2, detune = 0, power = false } = {}) {
+export function makeSong({ plan, bpm = 100, beats = 4, rate = 22050, seed = 7, silentBars = 0, melody = true, tail = 1.2, detune = 0, power = false, brightness = 0 } = {}) {
   const rand = rng(seed);
   DETUNE = detune / 100;
+  TILT = -brightness;
   const barSec = (60 / bpm) * beats;
   const bars = [];
   const truth = []; // por compás, 4 cuartos
@@ -89,11 +91,12 @@ export function makeSong({ plan, bpm = 100, beats = 4, rate = 22050, seed = 7, s
     list.forEach((symbol, j) => {
       const info = chordInfo(symbol);
       const start = t0 + j * span;
-      // Bajo: raíz en la octava grave, a cada pulso, con la quinta de paso en el último.
-      const rootMidi = 33 + ((info.root - 33) % 12 + 12) % 12;
+      // Bajo: la nota más grave del acorde (la raíz, o la del bajo en una inversión), a cada pulso, con la quinta de
+      // paso en el último cuando el acorde está en estado fundamental.
+      const rootMidi = 33 + ((info.bass - 33) % 12 + 12) % 12;
       const hits = Math.max(1, Math.round((span / barSec) * beats));
       for (let b = 0; b < hits; b++) {
-        const fifth = hits > 2 && b === hits - 1 && rand() < 0.4;
+        const fifth = hits > 2 && b === hits - 1 && info.bass === info.root && rand() < 0.4;
         note(stems.bass, rate, start + b * (span / hits), (span / hits) * 0.9, fifth ? rootMidi + 7 : rootMidi, 0.5, rand, { harmonics: 5, decay: 2.5, tilt: 1.3 });
       }
       // Teclado: acorde sostenido.
@@ -164,8 +167,26 @@ export function wavBytes(samples, rate, channels = 1) {
   return bytes;
 }
 
+// Cada acorde de la lista dura dos compases.
+const twice = list => list.flatMap(chord => [chord, chord]);
+const PAIR = ['Db/F', 'Cm/Eb'];
+const LOOP = ['Db/F', 'Cm/Eb', 'Bb', 'Bbm/Db'];
+
 // Progresiones de prueba.
 export const SONGS = {
+  // Como «Somos» (Majo y Dan) según su cifrado: inversiones con el bajo en la tercera y acordes que no son del tono.
+  somos: {
+    bpm: 100,
+    plan: [
+      { name: 'Intro', bars: twice(PAIR) },
+      { name: 'Verso', bars: twice([...PAIR, ...PAIR]) },
+      { name: 'Coro', bars: twice([...LOOP, ...LOOP]) },
+      { name: 'Verso', bars: twice([...PAIR, ...PAIR]) },
+      { name: 'Coro', bars: twice([...LOOP, ...LOOP]) },
+      { name: 'Puente', bars: twice(['Bb', 'Bbm/Db', 'Bb', 'Bbm/Db']) },
+      { name: 'Final', bars: twice(['Db/F']) },
+    ],
+  },
   sol: {
     bpm: 96,
     plan: [

@@ -20,6 +20,7 @@ async function moduleURL(name) {
 const chart = await import(await moduleURL('chart.js'));
 const mqtt = await import(await moduleURL('mqtt-lite.js'));
 const live = await import(await moduleURL('live.js'));
+const sync = await import(await moduleURL('sync.js'));
 
 const wait = (ms = 15) => new Promise(resolve => setTimeout(resolve, ms));
 const hex = bytes => [...bytes];
@@ -399,6 +400,277 @@ test('el director solo escucha saludos de visores: no hay canal para mandarle ó
   intruder.send(mqtt.publishPacket(hello, '{"v":1,"id":"Y1","ts":1}'));
   await wait();
   assert.equal(host.viewers(), 1);
+});
+
+// ───────────── Cifrados entre computadoras ─────────────
+
+const entry = (fp, text, updated, title = fp) => ({ fp, title, text, updated });
+const CODE = 'K7P29QXM4HTD';
+const chartTopic = fp => `escena/cifrados/v1/${CODE}/${fp}`;
+const DAY = 24 * 3600 * 1000;
+
+test('la huella de una canción ignora mayúsculas, acentos y signos, y distingue canciones distintas', () => {
+  const fp = sync.fingerprint;
+  assert.equal(fp('Somos - Majo & Dan'), fp('  SOMOS (Majo & Dan) '));
+  assert.equal(fp('Canción de Él'), fp('cancion de el'));
+  assert.equal(fp('Eres Fiel'), fp('eres   fiel!'));
+  assert.notEqual(fp('Somos - Majo & Dan'), fp('Somos - Majo y Dan'), 'una palabra distinta es otra canción');
+  assert.notEqual(fp('Eres Fiel'), fp('Eres Fiel 2'));
+  assert.equal(fp(''), '');
+  assert.equal(fp(null), '');
+  assert.equal(fp(undefined), '');
+  assert.equal(fp('¡¡!! ...'), '', 'sin letras ni números no hay nombre');
+  const seen = new Set();
+  for (let i = 0; i < 3000; i++) seen.add(fp(`Canción número ${i}`));
+  assert.equal(seen.size, 3000, 'sin choques entre nombres parecidos');
+  for (const value of seen) assert.match(value, /^[a-z0-9]{1,16}$/);
+});
+
+test('al unir cifrados gana el más reciente de cada canción y no se toca lo demás', () => {
+  const local = { 'fp:aaa': entry('aaa', 'G D', 100), 'fp:bbb': entry('bbb', 'C F', 100), 'viejo-7': { text: 'antiguo', updated: 5 } };
+  const frozen = JSON.stringify(local);
+  const result = sync.mergeCharts(local, [
+    entry('aaa', 'G D Em', 200), // más nuevo: reemplaza
+    entry('bbb', 'otro', 50), // más viejo: se queda el de aquí
+    entry('ccc', 'A E', 10), // canción nueva
+    entry('aaa', 'G D Em', 200), // el mismo otra vez: ya está al día
+  ], 1e6);
+  assert.deepEqual([result.added, result.updated, result.kept, result.skipped], [1, 1, 2, 0]);
+  assert.equal(result.next['fp:aaa'].text, 'G D Em');
+  assert.equal(result.next['fp:bbb'].text, 'C F');
+  assert.equal(result.next['fp:ccc'].text, 'A E');
+  assert.equal(result.next['viejo-7'].text, 'antiguo', 'lo de versiones anteriores queda igual');
+  assert.equal(JSON.stringify(local), frozen, 'no modifica el original');
+  assert.deepEqual(sync.mergeCharts(local, undefined).next, local);
+});
+
+test('una baja más reciente quita el cifrado y una versión anterior no lo revive', () => {
+  const song = entry('aaa', 'G D', 100);
+  let charts = sync.mergeCharts({ 'fp:aaa': song }, [entry('aaa', '', 200)], 1e6).next;
+  assert.equal(charts['fp:aaa'].text, '');
+  charts = sync.mergeCharts(charts, [song], 1e6).next;
+  assert.equal(charts['fp:aaa'].text, '', 'la versión vieja no revive lo borrado');
+  charts = sync.mergeCharts(charts, [entry('aaa', 'nuevo', 300)], 1e6).next;
+  assert.equal(charts['fp:aaa'].text, 'nuevo', 'escribirlo de nuevo sí lo trae de vuelta');
+  // Una baja de una canción que aquí no existe se anota, para que una copia vieja que llegue después no la traiga de vuelta.
+  const unknown = sync.mergeCharts({}, [entry('zzz', '', 50)], 1e6);
+  assert.deepEqual([unknown.added, unknown.kept], [0, 1]);
+  assert.equal(sync.mergeCharts(unknown.next, [entry('zzz', 'viejo', 10)], 1e6).next['fp:zzz'].text, '');
+});
+
+test('descarta entradas inválidas y no se fía de relojes adelantados', () => {
+  const now = 1_700_000_000_000;
+  const bad = [null, 'texto', 7, {}, entry('', 'x', 1), entry('MAYUS', 'x', 1), entry('a b', 'x', 1), entry('x'.repeat(17), 'x', 1),
+    { fp: 'ok', text: 5, updated: 1 }, entry('ok', 'x', 0), entry('ok', 'x', -3), entry('ok', 'x', NaN), { fp: 'ok', text: 'x', updated: 'nunca' },
+    entry('ok', 'z'.repeat(sync.MAX_TEXT + 1), 1)];
+  const result = sync.mergeCharts({}, bad, now);
+  assert.equal(result.skipped, bad.length);
+  assert.deepEqual(result.next, {});
+  const future = sync.mergeCharts({}, [entry('ok', 'G', now + 10 * DAY)], now);
+  assert.equal(future.next['fp:ok'].updated, now + DAY, 'un reloj adelantado se limita a un día');
+  assert.equal(sync.mergeCharts({}, [entry('ok', 'z'.repeat(sync.MAX_TEXT), 1)], now).added, 1, 'el largo máximo sí entra');
+  assert.equal(sync.cleanEntry({ fp: 'ok', text: 'x', updated: 5, extra: 'se descarta', title: 'T'.repeat(500) }).title.length, 200);
+  assert.deepEqual(Object.keys(sync.cleanEntry({ fp: 'ok', text: 'x', updated: 5, extra: 1 })).sort(), ['fp', 'text', 'title', 'updated']);
+});
+
+test('el archivo de cifrados va y viene sin perder nada, y rechaza lo que no es suyo', () => {
+  const charts = {
+    'fp:aaa': entry('aaa', '[Coro]\n| G | D |', 100, 'Zeta'),
+    'fp:bbb': entry('bbb', 'C F\nñandú áéíóú «ü» 🎵', 200, 'Alfa'),
+    'fp:ccc': entry('ccc', '', 300, 'Borrado'),
+    'viejo-7': { text: 'de una versión anterior', updated: 5 },
+  };
+  const file = sync.chartsToFile(charts, 1_700_000_000_000);
+  const list = sync.chartsFromFile(file);
+  assert.deepEqual(list.map(c => c.title), ['Alfa', 'Zeta'], 'solo los cifrados con texto, por orden alfabético');
+  assert.equal(list[0].text, 'C F\nñandú áéíóú «ü» 🎵');
+  assert.deepEqual(sync.mergeCharts({}, list).next, { 'fp:aaa': charts['fp:aaa'], 'fp:bbb': charts['fp:bbb'] });
+  assert.equal(sync.chartsFromFile(`\n  ${file}  \n`).length, 2, 'tolera espacios y saltos al pegar');
+  for (const bad of ['', 'hola', '{}', '[]', '{"escena":"otra cosa","charts":[]}', '{"escena":"cifrados"}', '{"escena":"cifrados","charts":{}}', '<html>']) {
+    assert.throws(() => sync.chartsFromFile(bad), /no es un archivo de cifrados/, bad);
+  }
+  assert.equal(sync.chartsFromFile('{"escena":"cifrados","v":1,"charts":[]}').length, 0, 'un archivo sin cifrados es válido');
+});
+
+test('el código de sincronización no usa letras que se confunden, tolera guiones y minúsculas, y rechaza lo incompleto', () => {
+  for (let i = 0; i < 50; i++) assert.match(sync.newCode(), /^[ABCDEFGHJKMNPQRSTUVWXYZ2-9]{12}$/);
+  assert.notEqual(sync.newCode(), sync.newCode());
+  assert.equal(sync.cleanCode('k7p2-9qxm-4htd'), CODE);
+  assert.equal(sync.cleanCode(' K7P2 9QXM 4HTD '), CODE);
+  assert.equal(sync.prettyCode(CODE), 'K7P2-9QXM-4HTD');
+  assert.equal(sync.prettyCode(''), '');
+  for (const bad of ['', 'K7P2-9QXM', 'K7P29QXM4HTDX', 'K7P29QXM4HT0', 'K7P29QXM4HTI', 'K7P29QXM4HT!', null, undefined]) assert.equal(sync.cleanCode(bad), '', String(bad));
+  assert.throws(() => new sync.ChartSync({ code: 'corto' }), /código/);
+});
+
+// Una «computadora»: guarda sus cifrados y anota lo que le llega, como hace la interfaz.
+function pc(net, charts, { code = CODE, ...extra } = {}) {
+  const device = { charts, got: [] };
+  device.sync = new sync.ChartSync({
+    code, brokers: URLS, connect: net.connect, grace: 40,
+    getCharts: () => device.charts,
+    onChart: item => { device.got.push(item); device.charts = sync.mergeCharts(device.charts, [item]).next; },
+    ...extra,
+  });
+  device.save = item => { device.charts = sync.mergeCharts(device.charts, [item]).next; device.sync.push(item); };
+  return device;
+}
+const stored = (net, url, fp) => {
+  const raw = net.brokers.get(url).retained.get(chartTopic(fp));
+  return raw ? JSON.parse(new TextDecoder().decode(raw)) : null;
+};
+const finish = (...devices) => async () => { for (const device of devices) device.sync.stop(); await wait(300); };
+
+test('un cifrado guardado en una computadora aparece en la otra, aunque la otra se abra después', async t => {
+  const net = network(URLS);
+  const a = pc(net, {});
+  const b = pc(net, {});
+  t.after(finish(a, b));
+  a.sync.start();
+  await wait();
+  const somos = entry('abc123', '[Coro]\n| Db/F | Cm/Eb |', 1000, 'Somos - Majo & Dan');
+  a.save(somos);
+  await wait();
+  for (const url of URLS) assert.equal(net.brokers.get(url).retained.size, 1, 'queda guardado en cada servidor');
+  b.sync.start(); // se abre después: el servidor se lo entrega
+  await wait();
+  assert.equal(b.got.length, 1, 'llega una sola vez aunque lo entreguen dos servidores');
+  assert.deepEqual(b.charts['fp:abc123'], somos);
+  assert.equal(b.sync.status.received, 1);
+  assert.equal(b.sync.status.connected, 2);
+  // Un cambio con las dos abiertas llega en vivo.
+  const better = { ...somos, text: '[Coro]\n| Db/F | Cm/Eb | Bb | Bbm/Db |', updated: 2000 };
+  b.save(better);
+  await wait();
+  assert.equal(a.charts['fp:abc123'].text, better.text);
+  assert.equal(a.got.at(-1).updated, 2000);
+  assert.equal(a.charts['fp:abc123'].title, 'Somos - Majo & Dan');
+});
+
+test('si las dos computadoras tenían versiones distintas, al conectarse las dos quedan con la más reciente', async t => {
+  const net = network(URLS);
+  const old = entry('abc123', 'G D', 1000, 'Eres Fiel');
+  const recent = { ...old, text: 'G D Em C', updated: 5000 };
+  const a = pc(net, { 'fp:abc123': recent });
+  const b = pc(net, { 'fp:abc123': old });
+  t.after(finish(a, b));
+  a.sync.start();
+  b.sync.start();
+  await wait(150);
+  assert.equal(a.charts['fp:abc123'].text, 'G D Em C');
+  assert.equal(b.charts['fp:abc123'].text, 'G D Em C');
+  for (const url of URLS) assert.equal(stored(net, url, 'abc123').updated, 5000, 'cada servidor guarda la versión nueva');
+});
+
+test('quitar un cifrado en una computadora lo quita en la otra, y una copia vieja no lo revive', async t => {
+  const net = network(URLS);
+  const song = entry('abc123', 'G D', 1000, 'Eres Fiel');
+  const a = pc(net, { 'fp:abc123': song });
+  const b = pc(net, { 'fp:abc123': song });
+  const c = pc(net, { 'fp:abc123': song }); // estaba apagada y aún tiene el cifrado
+  t.after(finish(a, b, c));
+  a.sync.start();
+  b.sync.start();
+  await wait(150);
+  a.save({ ...song, text: '', updated: 2000 });
+  await wait();
+  assert.equal(b.charts['fp:abc123'].text, '');
+  c.sync.start();
+  await wait(150);
+  assert.equal(c.charts['fp:abc123'].text, '');
+  for (const url of URLS) {
+    assert.equal(stored(net, url, 'abc123').text, '');
+    assert.ok(net.brokers.get(url).retained.get(chartTopic('abc123')).length > 0, 'la baja lleva contenido: un mensaje vacío borraría lo guardado en el servidor');
+  }
+  assert.equal(c.sync.status.received, 1);
+});
+
+test('con otro código no se ve nada de lo ajeno', async t => {
+  const net = network(URLS);
+  const a = pc(net, { 'fp:abc123': entry('abc123', 'G D', 1000, 'Eres Fiel') });
+  const stranger = pc(net, {}, { code: 'B8M2-NQ4T-W6RA' });
+  t.after(finish(a, stranger));
+  a.sync.start();
+  stranger.sync.start();
+  await wait(150);
+  assert.equal(stranger.got.length, 0);
+  assert.equal(stranger.sync.status.received, 0);
+  for (const slot of stranger.sync.slots) assert.deepEqual([...slot.client.subs], ['escena/cifrados/v1/B8M2NQ4TW6RA/+'], 'solo escucha su propio código');
+  assert.equal(a.sync.status.received, 1, 'solo recibe su propio eco');
+});
+
+test('al conectarse completa solo lo que le falta a cada servidor', async t => {
+  const net = network(URLS);
+  const x = entry('xxx', 'G D', 1000, 'X');
+  const y = entry('yyy', 'C F', 2000, 'Y');
+  const gone = entry('ggg', '', 3000, 'Borrada'); // una baja de algo que ningún servidor tiene: no hace falta publicarla
+  const a = pc(net, { 'fp:xxx': x, 'fp:yyy': y, 'fp:ggg': gone, 'viejo-7': { text: 'sin huella', updated: 5 } });
+  // El segundo servidor ya tiene X (alguien más lo dejó); el primero no tiene nada.
+  net.brokers.get(URLS[1]).retained.set(chartTopic('xxx'), new TextEncoder().encode(JSON.stringify({ v: 1, ...x })));
+  t.after(finish(a));
+  a.sync.start();
+  await wait(150);
+  const [first, second] = URLS.map(url => net.brokers.get(url));
+  assert.deepEqual([...first.retained.keys()].sort(), [chartTopic('xxx'), chartTopic('yyy')]);
+  assert.deepEqual([...second.retained.keys()].sort(), [chartTopic('xxx'), chartTopic('yyy')]);
+  const count = (broker, topic) => broker.log.filter(item => item === topic).length;
+  assert.equal(count(first, chartTopic('xxx')), 1);
+  assert.equal(count(second, chartTopic('xxx')), 0, 'al segundo no se le vuelve a mandar lo que ya tenía');
+  assert.equal(count(second, chartTopic('yyy')), 1);
+  assert.equal(count(first, chartTopic('ggg')) + count(second, chartTopic('ggg')), 0);
+});
+
+test('ignora mensajes rotos, de otro tema o demasiado grandes, y limita las fechas adelantadas', async t => {
+  const net = network(URLS);
+  const a = pc(net, {});
+  t.after(finish(a));
+  a.sync.start();
+  await wait();
+  const intruder = memorySocket(net.brokers.get(URLS[0]));
+  await wait();
+  const good = { v: 1, fp: 'abc', title: 'T', text: 'G D', updated: 5 };
+  const send = (topic, payload) => intruder.send(mqtt.publishPacket(topic, typeof payload === 'string' ? payload : JSON.stringify(payload)));
+  send(chartTopic('abc'), 'no es json');
+  send(chartTopic('abc'), { ...good, fp: 'otra' }); // la huella no coincide con el tema
+  send(chartTopic('abc'), { ...good, text: 7 });
+  send(chartTopic('abc'), { ...good, text: 'x'.repeat(sync.MAX_TEXT + 1) });
+  send(chartTopic('abc'), { ...good, updated: 'ayer' });
+  send(chartTopic('abc'), '');
+  send(`${chartTopic('abc')}/extra`, good);
+  await wait();
+  assert.equal(a.got.length, 0);
+  send(chartTopic('abc'), { ...good, updated: Date.now() + 90 * DAY });
+  await wait();
+  assert.equal(a.got.length, 1);
+  assert.ok(a.got[0].updated <= Date.now() + DAY, 'un reloj adelantado se limita a un día');
+});
+
+test('basta con un servidor, y al detener la sincronización ya no entra ni sale nada', async t => {
+  const net = network(URLS);
+  net.down.add(URLS[0]);
+  const a = pc(net, {});
+  const b = pc(net, {});
+  t.after(finish(a, b));
+  a.sync.start();
+  b.sync.start();
+  await wait();
+  assert.equal(a.sync.status.connected, 1);
+  assert.equal(a.sync.status.total, 2);
+  b.save(entry('abc123', 'G D', 1000, 'Eres Fiel'));
+  await wait();
+  assert.equal(a.charts['fp:abc123'].text, 'G D');
+  a.sync.stop();
+  await wait();
+  assert.equal(a.sync.status.running, false);
+  assert.equal(a.sync.status.connected, 0);
+  a.sync.push(entry('solo-a', 'C', 2000, 'No debe salir'));
+  b.save(entry('abc123', 'G D Em', 3000, 'Eres Fiel'));
+  await wait();
+  assert.equal(a.charts['fp:abc123'].text, 'G D', 'detenida, ya no recibe');
+  assert.equal(net.brokers.get(URLS[1]).retained.has(chartTopic('solo-a')), false, 'detenida, ya no publica');
+  a.sync.start(); // y se puede volver a encender
+  await wait(150);
+  assert.equal(a.charts['fp:abc123'].text, 'G D Em');
 });
 
 // ───────────── Reproductor ─────────────

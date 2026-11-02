@@ -5,10 +5,11 @@ import { app } from '../app.js';
 import { el, ensureStyles, createChartView } from './chart-view.js';
 import { parseChart, buildLayout, templateFor, extrapolate } from '../chart.js';
 import { LiveHost, BROKERS, newRoom, cleanRoom, prettyRoom, viewerUrl, publicBase } from '../live.js';
+import { fingerprint, chartKey, cleanEntry, mergeCharts, chartsToFile, chartsFromFile, newCode, cleanCode, prettyCode, ChartSync } from '../sync.js';
 
 const PREFS_KEY = 'escena.cifrado.prefs';
 const CHARTS_KEY = 'escena.cifrado.charts';
-const DEFAULTS = { button: true, notation: 'abc', shift: 0, size: 1, follow: true, theme: 'dark', room: '', base: '', brokers: null };
+const DEFAULTS = { button: true, notation: 'abc', shift: 0, size: 1, follow: true, theme: 'dark', room: '', base: '', brokers: null, syncCode: '' };
 
 const kv = {
   read(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } },
@@ -52,6 +53,17 @@ const CSS = `
 .cf-editor pre{margin:6px 0 0;padding:8px;border-radius:8px;background:var(--panel);color:var(--ink);overflow:auto;font-size:.8rem}
 .cf-check{min-height:1.3em;font-size:.85rem;color:var(--mute)}
 .cf-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.cf-library{position:absolute;inset:0;z-index:6;background:var(--bg);overflow-y:auto;padding:12px;display:grid;gap:10px;align-content:start}
+.cf-library h2{margin:0;font-size:1.05rem}
+.cf-lib{display:grid;gap:8px;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
+.cf-lib h3{margin:0;font-size:.98rem}
+.cf-lib p{margin:0;color:var(--mute);font-size:.85rem}
+.cf-lib textarea,.cf-lib input[type=text]{width:100%;padding:8px;border-radius:9px;border:1px solid var(--line);background:var(--bg);color:var(--ink);font:inherit;font-size:.88rem}
+.cf-lib textarea{resize:vertical}
+.cf-lib-part{display:grid;gap:8px}
+.cf-lib-part[hidden]{display:none}
+.cf-library .cf-room{font-size:1.5rem;overflow-wrap:anywhere}
+.cf-lib .cf-actions{justify-content:flex-start}
 `;
 
 const HELP = `Tono: G
@@ -84,6 +96,9 @@ class Cifrado {
     this.last = null;
     this.openState = false;
     this.detector = null;
+    this.sync = null;
+    this.syncStatus = null;
+    this.library = null;
     this.raf = 0;
     this.timer = 0;
     this.sigAt = 0;
@@ -101,12 +116,13 @@ class Cifrado {
     this.fab = el('button', { class: 'cf-fab', type: 'button', title: 'Cifrado y transmisión en vivo', 'aria-label': 'Abrir el cifrado', onClick: () => this.toggle() }, '♪');
     this.fab.hidden = !this.prefs.button;
     document.body.append(this.fab);
-    document.addEventListener('keydown', event => { if (event.key === 'Escape' && this.openState && !this.editor && !this.detector) this.close(); });
+    document.addEventListener('keydown', event => { if (event.key === 'Escape' && this.openState && !this.editor && !this.detector && !this.library) this.close(); });
     if (typeof app?.on === 'function') {
       app.on('song:loaded', () => this.attach());
       app.on('song:unloaded', () => this.attach());
     }
     this.attach();
+    if (this.syncCode) setTimeout(() => this.startSync(), 1500);
   }
 
   // ───────── Preferencias ─────────
@@ -140,6 +156,7 @@ class Cifrado {
     this.player = player;
     this.signature = '';
     this.snapshot = null;
+    this.migrate();
     if (player) {
       for (const name of ['state', 'loop', 'pitch', 'ended']) this.offs.push(player.on(name, () => this.publish()));
       this.refreshSong(true);
@@ -154,7 +171,37 @@ class Cifrado {
     return song ? String(song.id ?? song.title ?? '') : '';
   }
 
-  chartText() { return this.charts[this.songKey()]?.text || ''; }
+  // La huella del nombre: es la misma canción en todas las computadoras, aunque cada una le ponga su propio número interno.
+  songFp() { return fingerprint(this.player?.song?.title); }
+
+  // El cifrado de la canción actual: por su nombre o, si es de una versión anterior, por su número interno.
+  chartEntry() {
+    const fp = this.songFp();
+    return (fp && this.charts[chartKey(fp)]) || this.charts[this.songKey()] || null;
+  }
+
+  chartText() { return this.chartEntry()?.text || ''; }
+
+  // Los cifrados de versiones anteriores se guardaban por el número interno de la canción: se pasan a su nombre para que
+  // puedan viajar a otras computadoras.
+  migrate() {
+    const fp = this.songFp();
+    const id = this.songKey();
+    const old = fp && id && id !== chartKey(fp) ? this.charts[id] : null;
+    if (!old || typeof old.text !== 'string') return;
+    const current = this.charts[chartKey(fp)];
+    const updated = Number(old.updated) || Date.now();
+    // Si ya hay una versión por nombre (por ejemplo llegó de otra computadora), gana la más reciente.
+    if (!current || updated > (Number(current.updated) || 0)) {
+      this.charts[chartKey(fp)] = { fp, title: String(this.player.song.title || ''), text: old.text, updated };
+      this.sync?.push(this.charts[chartKey(fp)]);
+    }
+    delete this.charts[id];
+    kv.write(CHARTS_KEY, this.charts);
+  }
+
+  // Cifrados de versiones anteriores que aún no se pasaron a su nombre (se pasan al abrir cada canción).
+  legacyCount() { return Object.entries(this.charts).filter(([key, entry]) => !key.startsWith('fp:') && entry && typeof entry.text === 'string' && entry.text.trim()).length; }
 
   buildSnapshot() {
     const player = this.player;
@@ -293,6 +340,7 @@ class Cifrado {
       el('button', { class: 'cf-tb', type: 'button', 'aria-label': 'Letra más grande', onClick: () => size(0.1) }, 'A+'),
       el('button', { class: 'cf-tb', type: 'button', onClick: () => this.edit() }, 'Editar cifrado'),
       el('button', { class: 'cf-tb', type: 'button', onClick: () => this.detect() }, 'Detectar acordes'),
+      el('button', { class: 'cf-tb', type: 'button', onClick: () => this.openLibrary() }, 'Mis cifrados'),
       this.liveButton);
 
     this.liveBox = el('section', { class: 'cf-live', hidden: true, 'aria-label': 'Transmisión en vivo' });
@@ -359,10 +407,160 @@ class Cifrado {
 
   // Guarda el cifrado de la canción actual en este equipo (si está vacío, lo borra) y lo manda al panel y a los músicos.
   saveChart(text) {
-    const key = this.songKey();
-    if (String(text || '').trim()) this.charts[key] = { text: String(text), updated: Date.now() }; else delete this.charts[key];
+    const fp = this.songFp();
+    const body = String(text || '');
+    if (fp) {
+      // Una baja queda anotada (texto vacío) para que las demás computadoras también lo quiten.
+      const entry = { fp, title: String(this.player?.song?.title || ''), text: body.trim() ? body : '', updated: Date.now() };
+      this.charts[chartKey(fp)] = entry;
+      delete this.charts[this.songKey()];
+      this.sync?.push(entry);
+    } else {
+      const key = this.songKey();
+      if (body.trim()) this.charts[key] = { text: body, updated: Date.now() }; else delete this.charts[key];
+    }
     if (!kv.write(CHARTS_KEY, this.charts)) this.tell('No se pudo guardar el cifrado en este dispositivo', 'error');
     this.refreshSong(true);
+    this.paintLibrary?.();
+  }
+
+  // ───────── Entre computadoras ─────────
+  get syncCode() { return cleanCode(this.prefs.syncCode); }
+
+  startSync(code = this.syncCode) {
+    const clean = cleanCode(code);
+    if (!clean) return false;
+    this.stopSync();
+    if (clean !== this.prefs.syncCode) this.setPref('syncCode', clean);
+    const brokers = Array.isArray(this.prefs.brokers) && this.prefs.brokers.length ? this.prefs.brokers : BROKERS;
+    this.sync = new ChartSync({
+      code: clean,
+      brokers,
+      getCharts: () => this.charts,
+      onChart: entry => this.receive(entry),
+      onState: status => { this.syncStatus = status; this.paintLibrary?.(); },
+    });
+    this.sync.start();
+    this.paintLibrary?.();
+    return true;
+  }
+
+  stopSync(forget = false) {
+    this.sync?.stop();
+    this.sync = null;
+    this.syncStatus = null;
+    if (forget) this.setPref('syncCode', '');
+    this.paintLibrary?.();
+  }
+
+  // Llega un cifrado de otra computadora (o de un archivo): se queda el más reciente.
+  receive(entry) {
+    const { next, added, updated } = mergeCharts(this.charts, [entry]);
+    if (!added && !updated) return;
+    this.charts = next;
+    kv.write(CHARTS_KEY, this.charts);
+    if (entry.fp === this.songFp()) {
+      this.refreshSong(true);
+      this.tell(entry.text.trim() ? 'Cifrado actualizado desde otra computadora' : 'El cifrado se quitó desde otra computadora', 'info');
+    }
+    this.paintLibrary?.();
+  }
+
+  // Une un archivo (o texto pegado) de cifrados con los de este equipo. Devuelve el resumen para mostrarlo.
+  importCharts(text) {
+    const list = chartsFromFile(text);
+    const result = mergeCharts(this.charts, list);
+    this.charts = result.next;
+    kv.write(CHARTS_KEY, this.charts);
+    for (const raw of list) {
+      const entry = cleanEntry(raw);
+      if (entry && this.charts[chartKey(entry.fp)]?.updated === entry.updated) this.sync?.push(entry);
+    }
+    this.refreshSong(true);
+    this.paintLibrary?.();
+    const parts = [`${result.added} nuevos`, `${result.updated} actualizados`, `${result.kept} ya estaban al día`];
+    if (result.skipped) parts.push(`${result.skipped} no se pudieron leer`);
+    return `Listo: ${parts.join(', ')}.`;
+  }
+
+  chartCount() { return Object.values(this.charts).filter(entry => entry && typeof entry.text === 'string' && entry.text.trim()).length; }
+
+  openLibrary() {
+    if (this.library) return;
+    if (!this.panel) this.buildPanel();
+    const report = el('p', { class: 'cf-check', role: 'status' });
+    const intro = el('p');
+    const code = el('div', { class: 'cf-room' });
+    const state = el('div', { class: 'cf-state' }, el('i'), el('span'));
+    const codeInput = isolate(el('input', { type: 'text', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false', placeholder: 'Código de la otra computadora', 'aria-label': 'Código de sincronización' }));
+    const paste = isolate(el('textarea', { rows: '4', spellcheck: 'false', autocapitalize: 'off', autocomplete: 'off', placeholder: 'Pega aquí los cifrados copiados de otra computadora', 'aria-label': 'Cifrados copiados de otra computadora' }));
+    const picker = el('input', { type: 'file', accept: '.json,application/json,text/plain', hidden: true });
+    const off = el('div', { class: 'cf-lib-part' },
+      el('p', { text: 'Pon el mismo código en las dos computadoras y cada cifrado que guardes en una aparece solo en la otra.' }),
+      el('div', { class: 'cf-actions' }, el('button', { class: 'cf-tb primary', type: 'button', onClick: () => { this.startSync(newCode()); } }, 'Crear un código nuevo')),
+      codeInput,
+      el('div', { class: 'cf-actions' }, el('button', { class: 'cf-tb', type: 'button', onClick: () => {
+        const clean = cleanCode(codeInput.value);
+        if (!clean) { report.textContent = 'Ese código no es válido: son 12 letras y números (por ejemplo K7P2-9QXM-4HTD).'; return; }
+        report.textContent = '';
+        this.startSync(clean);
+      } }, 'Usar este código')));
+    const on = el('div', { class: 'cf-lib-part' },
+      code, state,
+      el('p', { text: 'Escribe este mismo código en la otra computadora («Mis cifrados» → «Usar este código»). Pasa por los servidores públicos gratuitos de la transmisión en vivo: quien tenga el código puede leer tus cifrados (es solo texto de acordes).' }),
+      el('div', { class: 'cf-actions' },
+        el('button', { class: 'cf-tb', type: 'button', onClick: async () => this.tell((await this.copy(this.syncCode)) ? 'Código copiado' : 'No se pudo copiar el código', 'info') }, 'Copiar código'),
+        el('button', { class: 'cf-tb danger', type: 'button', onClick: () => this.stopSync(true) }, 'Dejar de sincronizar')));
+    const close = () => { this.library?.remove(); this.library = null; this.paintLibrary = null; };
+    const exportText = () => chartsToFile(this.charts);
+    const load = async text => {
+      try { report.textContent = this.importCharts(text); } catch (error) { report.textContent = error.message || 'No se pudo leer.'; }
+    };
+    picker.addEventListener('change', async () => {
+      const file = picker.files && picker.files[0];
+      picker.value = '';
+      if (!file) return;
+      try { await load(await file.text()); } catch { report.textContent = 'No se pudo abrir ese archivo.'; }
+    });
+    this.paintLibrary = () => {
+      const status = this.syncStatus;
+      const saved = this.chartCount();
+      const legacy = this.legacyCount();
+      intro.textContent = `En este equipo hay ${saved} ${saved === 1 ? 'cifrado guardado' : 'cifrados guardados'}`
+        + (legacy ? `; ${legacy === 1 ? '1 es de una versión anterior y solo se podrá llevar' : `${legacy} son de una versión anterior y solo se podrán llevar`} a otra computadora después de abrir su canción una vez aquí.` : '.');
+      const active = Boolean(this.syncCode);
+      off.hidden = active;
+      on.hidden = !active;
+      code.textContent = prettyCode(this.syncCode);
+      const connected = status?.connected ?? 0;
+      const offline = status && !connected && status.waiting === status.total;
+      state.firstChild.className = connected ? 'ok' : offline ? 'bad' : 'warn';
+      state.lastChild.textContent = connected ? `${connected} de ${status.total} servidores conectados`
+        : offline ? 'Sin conexión con los servidores (¿hay internet?). Se reintenta solo.' : 'Conectando con los servidores…';
+    };
+    this.library = el('div', { class: 'cf-library' },
+      el('h2', { text: 'Mis cifrados' }), intro,
+      el('section', { class: 'cf-lib' }, el('h3', { text: 'Sincronizar con un código' }), off, on),
+      el('section', { class: 'cf-lib' }, el('h3', { text: 'Llevarlos en un archivo' }),
+        el('p', { text: 'Guarda todos tus cifrados en un archivo y cárgalo en la otra computadora. Cada canción se reconoce por su nombre; si hay dos versiones, se queda la más reciente.' }),
+        el('div', { class: 'cf-actions' },
+          el('button', { class: 'cf-tb', type: 'button', onClick: () => {
+            const url = URL.createObjectURL(new Blob([exportText()], { type: 'application/json' }));
+            const link = el('a', { href: url, download: 'escena-cifrados.json' });
+            document.body.append(link);
+            link.click();
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 4000);
+            report.textContent = 'Archivo escena-cifrados.json guardado (revisa la carpeta de descargas).';
+          } }, 'Guardar en un archivo'),
+          el('button', { class: 'cf-tb', type: 'button', onClick: async () => { report.textContent = (await this.copy(exportText())) ? 'Copiado: pégalo en «Mis cifrados» de la otra computadora.' : 'No se pudo copiar.'; } }, 'Copiar todo'),
+          el('button', { class: 'cf-tb', type: 'button', onClick: () => picker.click() }, 'Cargar de un archivo…'), picker),
+        paste,
+        el('div', { class: 'cf-actions' }, el('button', { class: 'cf-tb', type: 'button', onClick: () => load(paste.value) }, 'Cargar lo pegado')),
+        report),
+      el('div', { class: 'cf-actions' }, el('button', { class: 'cf-tb primary', type: 'button', onClick: close }, 'Cerrar')));
+    this.paintLibrary();
+    this.scroll.parentElement.append(this.library);
   }
 
   // ───────── Editor del cifrado ─────────

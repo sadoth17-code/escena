@@ -12,7 +12,7 @@
 //  5. Se estima el tono, se repite el Viterbi favoreciendo los acordes del tono y se escribe el texto.
 //
 // Es matemática pura: no usa DOM. Solo `LiveListener` y `decodeToMono` tocan Web Audio, y solo en el navegador.
-import { prefersFlats } from './chart.js';
+import { prefersFlats, parseChord } from './chart.js';
 
 export const SLOTS = 4; // partes de cada compás que se analizan por separado (por defecto, cuartos)
 export const FINE = 5; // casillas por semitono en el cromagrama fino
@@ -26,9 +26,18 @@ export const TYPES = [
   { id: 'min', suffix: 'm', base: 'min', tones: { 0: 1, 3: 0.9, 7: 0.9 } },
 ];
 
+// Cada nota trae sus armónicos: el 3.º cae una quinta más arriba, el 5.º una tercera mayor, el 9.º una segunda… Una
+// triada deja así energía en notas que no son suyas: en Db/F suenan también Do y Mib, justo las notas de Lab y de
+// Fa menor. Las plantillas ya cuentan con ese rastro (suave: si las notas son limpias, apenas se nota).
+const OVERTONE = [[7, 0.4], [4, 0.25], [2, 0.06], [10, 0.06]];
+
 const TEMPLATES = TYPES.map(type => Array.from({ length: 12 }, (_, root) => {
   const t = new Float32Array(12);
-  for (const [interval, weight] of Object.entries(type.tones)) t[(root + Number(interval)) % 12] = weight;
+  for (const [interval, weight] of Object.entries(type.tones)) {
+    const at = root + Number(interval);
+    t[at % 12] += weight;
+    for (const [shift, gain] of OVERTONE) t[(at + shift) % 12] += weight * gain;
+  }
   let norm = 0;
   for (const v of t) norm += v * v;
   norm = Math.sqrt(norm);
@@ -36,7 +45,9 @@ const TEMPLATES = TYPES.map(type => Array.from({ length: 12 }, (_, root) => {
   return t;
 }));
 
-const BASS_WEIGHT = 0.12; // cuánto pesa que el bajo toque la raíz
+const BASS_WEIGHT = 0.12; // cuánto pesa que el bajo toque el acorde
+// …y cuánto vale según la nota que toque: la raíz, la tercera o la quinta (acordes invertidos, como Db/F o Cm/Eb).
+const BASS_ROLE = { root: 1, third: 0.5, fifth: 0.35 };
 // Coste de cambiar de acorde en cada parte del compás: lo más barato en el tiempo fuerte, y algo menos a la mitad.
 const lambdaFor = n => Array.from({ length: n }, (_, i) => (i === 0 ? 0.12 : n % 2 === 0 && i === n / 2 ? 0.18 : n % 2 === 0 ? 0.35 : 0.32));
 
@@ -56,6 +67,9 @@ const TUNING_MIN = 0.15; // concentración mínima de las notas para fiarse de l
 // Umbrales (respecto a la media de raíz, tercera y quinta) para dar por buena una 7ª. Las armónicas de una triada
 // ya dejan energía en esas notas (hasta ~0.7 en la maj7 y ~0.5 en la m7), así que se exige bastante más.
 const SEVENTH = { dominant: 0.4, minor: 0.68, major: 0.95, sus: 0.7, susThird: 0.35 };
+const SLASH_SHARE = 0.45; // para marcar una inversión, el bajo debe dedicar al menos esta parte de su energía a la nota…
+const SLASH_OVER = 1.8; // …y sonar bastante más que la raíz (las armónicas de la raíz dejan algo en la quinta)
+const GUIDE_PENALTY = 0.2; // lo que cuesta, con un cifrado de referencia, elegir un acorde que no está en él
  // concentración mínima de las notas para fiarse de la afinación estimada
 
 const yieldNow = () => new Promise(resolve => setTimeout(resolve, 0));
@@ -704,6 +718,76 @@ function seventhPass(states, X, valid, kinds) {
   return suffix;
 }
 
+// Revisa cada acorde (tramo de partes seguidas con el mismo acorde) y mira si el bajo toca la tercera o la quinta en vez
+// de la raíz (Db/F, D/A). Devuelve, por parte, la nota del bajo (0-11) o -1 si el acorde está en estado fundamental.
+function slashPass(states, B, valid, kinds) {
+  const S = states.length;
+  const out = new Array(S).fill(-1);
+  for (let s = 0; s < S;) {
+    if (states[s] < 0) { s++; continue; }
+    let e = s;
+    while (e + 1 < S && states[e + 1] === states[s]) e++;
+    const sum = new Float64Array(12);
+    for (let i = s; i <= e; i++) if (valid[i]) for (let c = 0; c < 12; c++) sum[c] += B[i * 12 + c];
+    let total = 0;
+    for (const v of sum) total += v;
+    if (total > 0) {
+      const type = TYPES[kinds[Math.floor(states[s] / 12)]];
+      const root = states[s] % 12;
+      const third = (root + (type.base === 'min' ? 3 : 4)) % 12;
+      const fifth = (root + 7) % 12;
+      const note = sum[third] >= sum[fifth] ? third : fifth;
+      if (sum[note] >= SLASH_SHARE * total && sum[note] >= SLASH_OVER * sum[root]) for (let i = s; i <= e; i++) out[i] = note;
+    }
+    s = e + 1;
+  }
+  return out;
+}
+
+// ───────── Cifrado de referencia ─────────
+// Si ya hay un cifrado (por ejemplo el de un PDF), la detección solo tiene que decidir CUÁNDO suena cada acorde.
+const LETTER = { 0: 'C', 2: 'D', 4: 'E', 5: 'F', 7: 'G', 9: 'A', 11: 'B' };
+const IGNORED = /^(?:x\d{1,2}|\d{1,2}x|%|\.+|[-–—]+|bis|n\.?c\.?)$/i;
+const pitchOf = note => (note.nat + (note.acc === '#' ? 1 : note.acc === 'b' ? -1 : 0) + 12) % 12;
+const spell = note => LETTER[note.nat] + (note.acc === '#' || note.acc === 'b' ? note.acc : '');
+
+// Saca los acordes de un texto pegado: solo cuentan las líneas hechas únicamente de acordes («Db/F  Cm/Eb»), no la letra.
+// Devuelve [{ text, root, minor, bass, q, count }] del más al menos repetido.
+export function chordsFromText(text) {
+  const found = new Map();
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    let line = raw.replace(/\|/g, ' ').replace(/^\s*\[[^\]]*\]/, ' ');
+    const label = /^\s*[^\s:][^:]{0,28}:\s+(.+)$/.exec(line);
+    if (label) line = label[1];
+    const tokens = line.split(/\s+/).map(token => token.replace(/^[/([]+|[/)\],;]+$/g, '')).filter(Boolean);
+    if (!tokens.length) continue;
+    const chords = [];
+    let clean = true;
+    for (const token of tokens) {
+      const chord = parseChord(token);
+      if (chord) chords.push({ token, chord });
+      else if (!IGNORED.test(token)) { clean = false; break; }
+    }
+    if (!clean || !chords.length) continue;
+    // Una palabra suelta («Mi», «La», «Sol», «A») es más probable que sea de la letra que un acorde.
+    if (tokens.length === 1 && /^(?:Sol|Do|Re|Mi|Fa|La|Si|A)$/.test(chords[0].token)) continue;
+    for (const { chord } of chords) {
+      const text = spell(chord) + chord.q + (chord.bass ? '/' + spell(chord.bass) : '');
+      const known = found.get(text);
+      if (known) { known.count++; continue; }
+      found.set(text, {
+        text,
+        root: pitchOf(chord),
+        minor: /^(?:m(?!aj)|min|dim|°|º|ø|-)/.test(chord.q),
+        bass: chord.bass ? pitchOf(chord.bass) : null,
+        q: chord.q,
+        count: 1,
+      });
+    }
+  }
+  return [...found.values()].sort((a, b) => b.count - a.count);
+}
+
 // Las partes de un compás → el texto del compás: «G», «C G», «C . . D»… Se escribe con las menos partes posibles:
 // si cada mitad (o tercio…) empieza con un acorde y lo sostiene, basta con un acorde por mitad (o tercio…).
 export function barText(symbols) {
@@ -723,7 +807,7 @@ export function barText(symbols) {
 // Detección completa. `frames`: FrameBuffer; `song`: { bars, duration, sections: [{ n, b }] } como el de cifrado.js.
 // Devuelve { text, key, bars: [{ slots, symbols, text, margin }], uncertain: [número de compás…], covered,
 // confidence, tuning } o null si no hay nada que analizar.
-export function detectChart(frames, song, { extended = false, unifyRepeats = true, slots = SLOTS } = {}) {
+export function detectChart(frames, song, { extended = false, unifyRepeats = true, slots = SLOTS, inversions = true, allowed = null } = {}) {
   const n = Math.max(2, Math.min(8, Math.round(slots) || SLOTS));
   const edges = slotEdges(song, n);
   const S = edges.length - 1;
@@ -756,14 +840,55 @@ export function detectChart(frames, song, { extended = false, unifyRepeats = tru
     let bassTop = 0;
     for (let c = 0; c < 12; c++) bassTop = Math.max(bassTop, acc.B[s * 12 + c]);
     for (let a = 0; a < kinds.length; a++) {
+      const minor = TYPES[kinds[a]].base === 'min';
       for (let root = 0; root < 12; root++) {
         const template = TEMPLATES[kinds[a]][root];
         let dot = 0;
         for (let c = 0; c < 12; c++) dot += acc.X[s * 12 + c] * inv * template[c];
-        const bass = bassTop > 0 ? acc.B[s * 12 + root] / bassTop : 0;
+        let bass = 0;
+        if (bassTop > 0) {
+          const B = acc.B;
+          bass = Math.max(
+            B[s * 12 + root] * BASS_ROLE.root,
+            B[s * 12 + (root + (minor ? 3 : 4)) % 12] * BASS_ROLE.third,
+            B[s * 12 + (root + 7) % 12] * BASS_ROLE.fifth,
+          ) / bassTop;
+        }
         E[s * K + a * 12 + root] = dot + BASS_WEIGHT * bass;
       }
     }
+  }
+  // Con un cifrado de referencia (el de un PDF, por ejemplo) se prefieren sus acordes. Si el PDF está en otro tono que
+  // el audio, se prueba cada desplazamiento y se queda con el que mejor encaja.
+  const refChords = Array.isArray(allowed) && new Set(allowed.map(a => `${a.minor ? 1 : 0}:${a.root}`)).size >= 2 ? allowed : null;
+  let guide = null;
+  if (refChords) {
+    const maskFor = shift => {
+      const mask = new Uint8Array(K);
+      for (const a of refChords) mask[(a.minor ? 12 : 0) + ((a.root + shift) % 12)] = 1;
+      return mask;
+    };
+    const fitOf = mask => {
+      let total = 0;
+      for (let s = 0; s < S; s++) {
+        if (!valid[s]) continue;
+        let top = -Infinity;
+        for (let k = 0; k < K; k++) top = Math.max(top, E[s * K + k] - (mask[k] ? 0 : GUIDE_PENALTY));
+        total += top;
+      }
+      return total;
+    };
+    let shift = 0;
+    let bestFit = fitOf(maskFor(0));
+    const home = bestFit;
+    for (let t = 1; t < 12; t++) {
+      const f = fitOf(maskFor(t));
+      if (f > bestFit) { bestFit = f; shift = t; }
+    }
+    if (shift && !(bestFit > home * 1.02 + 1)) shift = 0; // solo se mueve si encaja claramente mejor
+    const mask = maskFor(shift);
+    for (let s = 0; s < S; s++) if (valid[s]) for (let k = 0; k < K; k++) if (!mask[k]) E[s * K + k] -= GUIDE_PENALTY;
+    guide = { shift, chords: refChords.length };
   }
   const lambda = lambdaFor(n);
   if (unifyRepeats) support(E, valid, K, repeatGroups(song, n), S);
@@ -790,6 +915,35 @@ export function detectChart(frames, song, { extended = false, unifyRepeats = tru
   const flats = key ? prefersFlats(keyText, 0) : false;
   const states = Array.from(path, (state, s) => (s < first || s > last ? -1 : state));
   const upgrades = extended ? seventhPass(states, acc.X, valid, kinds) : new Array(S).fill('');
+  const slashes = inversions || guide ? slashPass(states, acc.B, valid, kinds) : new Array(S).fill(-1);
+  const noteNames = flats ? NOTE_FLAT : NOTE_SHARP;
+  // Con referencia, cada acorde se escribe como en ella (Db/F), movido si hizo falta.
+  const byState = new Map();
+  if (guide) {
+    for (const a of refChords) {
+      const state = (a.minor ? 12 : 0) + ((a.root + guide.shift) % 12);
+      const bass = a.bass === null ? -1 : (a.bass + guide.shift) % 12;
+      const text = guide.shift ? noteNames[(a.root + guide.shift) % 12] + a.q + (bass >= 0 ? '/' + noteNames[bass] : '') : a.text;
+      if (!byState.has(state)) byState.set(state, []);
+      byState.get(state).push({ ...a, text, bassNote: bass });
+    }
+  }
+  const symbolAt = s => {
+    if (states[s] < 0) return '';
+    const listed = byState.get(states[s]);
+    if (listed) {
+      if (listed.length === 1) return listed[0].text;
+      let best = listed[0];
+      let top = -1;
+      for (const a of listed) {
+        const score = (slashes[s] >= 0 ? (a.bassNote === slashes[s] ? 2 : 0) : (a.bassNote < 0 ? 2 : 0))
+          + (upgrades[s] ? (a.q === upgrades[s] ? 1 : 0) : (a.q === '' || a.q === 'm' ? 1 : 0)) + a.count * 1e-3;
+        if (score > top) { top = score; best = a; }
+      }
+      return best.text;
+    }
+    return symbolOf(states[s], kinds, flats, upgrades[s]) + (inversions && slashes[s] >= 0 ? '/' + noteNames[slashes[s]] : '');
+  };
 
   const bars = [];
   const doubtful = [];
@@ -801,7 +955,7 @@ export function detectChart(frames, song, { extended = false, unifyRepeats = tru
     let counted = 0;
     for (let j = 0; j < n; j++) {
       const s = bar * n + j;
-      symbols.push(symbolOf(states[s], kinds, flats, upgrades[s]));
+      symbols.push(symbolAt(s));
       if (valid[s] && states[s] >= 0) {
         let other = -Infinity;
         for (let k = 0; k < K; k++) if (k !== states[s] && E[s * K + k] > other) other = E[s * K + k];
@@ -849,6 +1003,7 @@ export function detectChart(frames, song, { extended = false, unifyRepeats = tru
     confidence: barCount ? marginSum / barCount : 0,
     tuning,
     slots: n,
+    guide,
   };
 }
 

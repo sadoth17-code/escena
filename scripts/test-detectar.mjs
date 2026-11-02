@@ -184,7 +184,7 @@ async function frames(name, options = {}, mode = 'stems') {
 }
 
 const basic = symbol => {
-  const m = /^([A-G][#b]?)(maj7|m7|m|7|sus4)?$/.exec(symbol);
+  const m = /^([A-G][#b]?)(maj7|m7|m|7|sus4)?(?:\/[A-G][#b]?)?$/.exec(symbol);
   return m ? m[1] + (m[2] === 'm' || m[2] === 'm7' ? 'm' : '') : symbol;
 };
 
@@ -196,7 +196,7 @@ function score(song, result, { extended = false, rootsOnly = false } = {}) {
       const wanted = song.truth[index - song.silentBars]?.[slot];
       if (wanted === undefined) continue;
       total++;
-      let got = bar.symbols[slot];
+      let got = extended ? bar.symbols[slot] : basic(bar.symbols[slot]); // en las triadas, la inversión no cuenta
       let want = extended ? wanted : basic(wanted);
       if (rootsOnly) { got = (got.match(/^[A-G][#b]?/) || [''])[0]; want = (want.match(/^[A-G][#b]?/) || [''])[0]; }
       if (got === want || (rootsOnly && got && want && chordInfo(got).root === chordInfo(want).root)) ok++;
@@ -383,11 +383,11 @@ test('en compases de 3 tiempos se usan 3 partes y se acierta igual', async () =>
   assert.equal(result.slots, 3);
   assert.equal(result.bars.length, song.bars.length);
   assert.ok(score(song, result) >= 0.93, `vals: ${(score(song, result) * 100).toFixed(1)} %`);
-  assert.ok(result.text.includes('G . D') || result.text.includes('G G D'), 'el cambio a mitad de compás aparece en su sitio');
+  assert.ok(result.text.includes('D . G') || result.text.includes('D D G'), 'el cambio a mitad de compás aparece en su sitio');
   // El cifrado lo lee con la misma división: un acorde por tiempo.
   const layout = chart.buildLayout(info, chart.parseChart(result.text));
-  const bar = layout.items[0].bars[2];
-  assert.deepEqual(bar.slots.map(slot => chart.formatChord(slot.chord, {})), ['G', 'G', 'D']);
+  const bar = layout.items[0].bars[6];
+  assert.deepEqual(bar.slots.map(slot => chart.formatChord(slot.chord, {})), ['D', 'D', 'G']);
 });
 
 // ───────────── Pistas «por bloques» (el motor local de Escena) ─────────────
@@ -542,4 +542,128 @@ test('unshiftFrames rota los cuadros y no hace nada con 0 o 12 semitonos', () =>
   detect.unshiftFrames(frames, 0);
   assert.equal(frames.treble.indexOf(1), 5 * 5);
   assert.equal(detect.unshiftFrames(null, 3), null);
+});
+
+
+// ───────────── Inversiones, armónicos y cifrado de referencia ─────────────
+
+// «Somos» (Majo y Dan) según su cifrado: Db/F, Cm/Eb, Bb y Bbm/Db. El bajo toca la tercera, y las armónicas del bajo y
+// del teclado dejan energía en Do, Mib y La (Fa menor y Lab mayor). Con el detector anterior salía Fm, Eb y Ab.
+const exact = (song, result) => {
+  let ok = 0;
+  let total = 0;
+  result.bars.forEach((bar, index) => bar.symbols.forEach((symbol, slot) => {
+    const wanted = song.truth[index - song.silentBars]?.[slot];
+    if (wanted === undefined) return;
+    total++;
+    if (symbol === wanted) ok++;
+  }));
+  return ok / total;
+};
+
+test('acordes invertidos (Db/F, Cm/Eb): se leen bien y se escriben como en el cifrado', async () => {
+  const { song, frames: f } = await frames('somos');
+  const result = detect.detectChart(f, songInfo(song));
+  assert.ok(score(song, result) >= 0.97, `triadas: ${(score(song, result) * 100).toFixed(1)} %`);
+  assert.ok(exact(song, result) >= 0.95, `con inversión: ${(exact(song, result) * 100).toFixed(1)} %`);
+  for (const wanted of ['Db/F', 'Cm/Eb', 'Bbm/Db']) assert.ok(result.text.includes(wanted), `aparece ${wanted}`);
+  assert.ok(!result.text.includes('Bb/'), 'el Bb en estado fundamental no lleva inversión');
+  // El texto vuelve a leerse como cifrado, con su bajo.
+  const parsed = chart.parseChart(result.text);
+  const chords = parsed.sections.flatMap(section => section.bars.flatMap(bar => bar.chords.map(item => item.raw)));
+  assert.ok(chords.includes('Db/F') && chart.parseChord('Db/F').bass, 'Db/F se entiende como acorde con bajo');
+});
+
+test('sin marcar inversiones salen las triadas, sin bajo', async () => {
+  const { song, frames: f } = await frames('somos');
+  const result = detect.detectChart(f, songInfo(song), { inversions: false });
+  assert.ok(score(song, result) >= 0.97, `${(score(song, result) * 100).toFixed(1)} %`);
+  assert.ok(!result.text.includes('/'), 'ninguna inversión escrita');
+});
+
+test('las armónicas de timbres brillantes o apagados no confunden los acordes', async () => {
+  for (const brightness of [-0.7, 0.7, 1.4]) {
+    const { song, frames: f } = await frames('somos', { brightness });
+    const result = detect.detectChart(f, songInfo(song));
+    assert.ok(score(song, result) >= 0.97, `somos con brillo ${brightness}: ${(score(song, result) * 100).toFixed(1)} %`);
+  }
+  for (const name of ['sol', 'sib', 'dos']) {
+    const { song, frames: f } = await frames(name, { brightness: 0.7 });
+    const result = detect.detectChart(f, songInfo(song));
+    assert.ok(score(song, result) >= (name === 'dos' ? 0.9 : 0.97), `${name} brillante: ${(score(song, result) * 100).toFixed(1)} %`);
+  }
+});
+
+test('en canciones con los acordes en estado fundamental no se inventan inversiones', async () => {
+  for (const name of ['sol', 'lam', 'sib', 'ritmo']) {
+    const { frames: f, song } = await frames(name);
+    const result = detect.detectChart(f, songInfo(song));
+    assert.ok(!result.text.includes('/'), `${name}: ${result.text.split('\n').filter(line => line.includes('/')).join(' ')}`);
+  }
+});
+
+const PDF = `Somos por Somos
+Majo y Dan
+INTRO
+
+Db/F Cm/Eb
+
+VERSO 1
+
+Db/F      Cm/Eb
+
+En la soledad
+
+          Db/F Cm/Eb
+
+Escuché un suspiro
+
+CORO
+
+    Bb             Bbm/Db
+
+Que bailan a la luz de una vela
+
+INTRO x2
+
+//Db/F Cm/Eb //
+
+INSTRUMENTAL
+
+Db/F Cm/Eb Bb Bbm/Db
+
+Mi
+`;
+
+test('de un PDF pegado salen solo los acordes, no la letra', () => {
+  const found = detect.chordsFromText(PDF);
+  assert.deepEqual(found.map(c => c.text).sort(), ['Bb', 'Bbm/Db', 'Cm/Eb', 'Db/F']);
+  const db = found.find(c => c.text === 'Db/F');
+  assert.deepEqual([db.root, db.minor, db.bass, db.count], [1, false, 5, 5]);
+  const bbm = found.find(c => c.text === 'Bbm/Db');
+  assert.deepEqual([bbm.root, bbm.minor, bbm.bass], [10, true, 1]);
+  assert.equal(found.find(c => c.text === 'Bb').count, 2);
+  assert.deepEqual(detect.chordsFromText('Hola, esto es una letra sin acordes\nLa vida es bella\nA').map(c => c.text), []);
+  assert.deepEqual(detect.chordsFromText('Intro: G D Em7 C (x2)\n[Verso] G C/E D').map(c => c.text).sort(), ['C', 'C/E', 'D', 'Em7', 'G']);
+  assert.deepEqual(detect.chordsFromText('Sol Re Mim Do').map(c => c.text), ['G', 'D', 'Em', 'C']);
+});
+
+test('con el cifrado de referencia, una mezcla con ruido sale igual que el original', async () => {
+  const { song, frames: f } = await frames('somos', {}, 'mix');
+  const free = detect.detectChart(f, songInfo(song));
+  const guided = detect.detectChart(f, songInfo(song), { allowed: detect.chordsFromText(PDF) });
+  assert.ok(guided.guide && guided.guide.shift === 0 && guided.guide.chords === 4, JSON.stringify(guided.guide));
+  assert.ok(exact(song, guided) >= 0.97, `guiado: ${(exact(song, guided) * 100).toFixed(1)} %`);
+  assert.ok(exact(song, guided) >= exact(song, free), `guiado ${(exact(song, guided) * 100).toFixed(1)} % frente a ${(exact(song, free) * 100).toFixed(1)} % sin guía`);
+  // Con un solo acorde repetido no hay guía que valga.
+  assert.equal(detect.detectChart(f, songInfo(song), { allowed: detect.chordsFromText('Db/F Db/F') }).guide, null);
+});
+
+test('si el cifrado de referencia está en otro tono que el audio, se mueve', async () => {
+  const { song, frames: f } = await frames('sol'); // G D Em C
+  const lower = detect.chordsFromText('F C Dm Bb'); // el mismo cifrado un tono más abajo
+  const result = detect.detectChart(f, songInfo(song), { allowed: lower });
+  assert.equal(result.guide.shift, 2, JSON.stringify(result.guide));
+  assert.ok(score(song, result) >= 0.97, `${(score(song, result) * 100).toFixed(1)} %`);
+  assert.ok(result.text.includes('Em') && !result.text.includes('Dm'), result.text.slice(0, 160));
 });

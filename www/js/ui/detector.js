@@ -2,7 +2,7 @@
 // audio, o mientras suena), correr el detector de ../detect.js y entregar el resultado al editor del cifrado,
 // donde se revisa y se guarda. No toca el audio de Escena: lee los datos, o añade un analizador que no suena.
 import { el } from './chart-view.js';
-import { classifyTrack, bufferToMono, streamToMono, decodeToMono, PCMGroup, framesFromGroups, detectChart, LiveListener, meterSlots } from '../detect.js';
+import { classifyTrack, bufferToMono, streamToMono, decodeToMono, PCMGroup, framesFromGroups, detectChart, chordsFromText, LiveListener, meterSlots } from '../detect.js';
 
 const STYLE_ID = 'cf-detect-style';
 const CSS = `
@@ -18,6 +18,8 @@ const CSS = `
 .cf-d-row select,.cf-d-opts select,.cf-d-offset input{font:inherit;font-size:.85rem;padding:3px 6px;border-radius:7px;border:1px solid var(--line);background:var(--bg);color:var(--ink)}
 .cf-d-row[data-off=true]{opacity:.55}
 .cf-d-opts{display:grid;gap:6px;font-size:.88rem}
+.cf-d-refbox{width:100%;resize:vertical;padding:8px;border-radius:9px;border:1px solid var(--line);background:var(--bg);color:var(--ink);font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.cf-d-ref{margin:4px 0 0;color:var(--mute);font-size:.85rem;overflow-wrap:anywhere}
 .cf-d-opts label,.cf-d-offset{display:flex;gap:8px;align-items:center}
 .cf-d-offset input{width:5.5em}
 .cf-d-bar{height:10px;border-radius:6px;background:var(--line);overflow:hidden}
@@ -38,6 +40,7 @@ const SOURCES = [
   ['live', 'Mientras suena'],
 ];
 const HELP = {
+  reference: 'Pega los acordes de tu PDF o de una página de cifrados. La app ya no inventa los acordes: solo decide en qué compás suena cada uno de los tuyos, así sale casi igual que el original, con sus inversiones (Db/F). Si tu cifrado está en otro tono que el audio, lo detecta y lo mueve.',
   tracks: 'Lee el audio de las pistas de la canción, tal como las tiene Escena. No hace falta que suene, pero la canción debe estar parada o en pausa. Tarda de unos segundos a un minuto, según lo larga que sea.',
   files: 'Elige los archivos de audio de la canción: cada pista suelta, o la mezcla completa. Tienen que empezar en el mismo punto que la secuencia.',
   live: 'Pulsa «Empezar a escuchar» y luego ▶ en Escena. Deja correr la canción (entera, si puedes) y no cambies de pestaña: Escena va anotando los acordes mientras suena. Lo que esté silenciado o sin volumen no se oye. No cambia el audio.',
@@ -108,7 +111,8 @@ export function openDetector(cf, onClose = () => {}) {
     message: '',
     loud: 0,
     frames: 0,
-    opts: { extended: false, unify: true },
+    opts: { extended: false, unify: true, inversions: true },
+    reference: '',
     slots: 'auto',
     guess: guessSlots(player, cf.snapshot),
     offset: 0,
@@ -142,7 +146,8 @@ export function openDetector(cf, onClose = () => {}) {
   // ───────── Resultado ─────────
   function finish(frames, offset) {
     const slots = state.slots === 'auto' ? state.guess : Number(state.slots);
-    const result = detectChart(frames, songInfo(offset), { extended: state.opts.extended, unifyRepeats: state.opts.unify, slots });
+    const allowed = chordsFromText(state.reference);
+    const result = detectChart(frames, songInfo(offset), { extended: state.opts.extended, unifyRepeats: state.opts.unify, slots, inversions: state.opts.inversions, allowed });
     state.result = result && result.text ? result : { empty: true };
   }
 
@@ -161,6 +166,11 @@ export function openDetector(cf, onClose = () => {}) {
       lines.push(`Tono probable: ${result.key.text}${Math.abs(cents) >= 8 ? ` · la grabación está afinada ${cents > 0 ? '+' : ''}${cents} centésimas` : ''}`);
     }
     lines.push(`${total} compases, ${total - result.uncertain.length} claros.`);
+    if (result.guide) {
+      const move = result.guide.shift;
+      const semitones = n => `${n} ${n === 1 ? 'semitono' : 'semitonos'}`;
+      lines.push(`Se usaron los ${result.guide.chords} acordes de tu cifrado${!move ? '' : move <= 6 ? `; estaba ${semitones(move)} más abajo que el audio y se subió` : `; estaba ${semitones(12 - move)} más arriba que el audio y se bajó`}.`);
+    }
     const notes = [];
     if (result.uncertain.length) notes.push(`Revisa los compases ${result.uncertain.slice(0, 24).join(', ')}${result.uncertain.length > 24 ? '…' : ''}: salieron menos claros.`);
     if (result.covered < 0.9) notes.push(`Solo se escuchó el ${Math.round(result.covered * 100)} % de la canción; el resto quedó vacío.`);
@@ -355,7 +365,28 @@ export function openDetector(cf, onClose = () => {}) {
     const slots = isolate(el('select', { 'aria-label': 'Partes iguales en que se divide cada compás', disabled: locked, onChange: event => { state.slots = event.target.value; } },
       el('option', { value: 'auto', text: `Automático (${state.guess})` }), ...[2, 3, 4, 6].map(n => el('option', { value: String(n), text: String(n) }))));
     slots.value = String(state.slots);
+    const inversions = isolate(el('input', { type: 'checkbox', checked: state.opts.inversions, disabled: locked, onChange: event => { state.opts.inversions = event.target.checked; } }));
+    ui.refInfo = el('p', { class: 'cf-d-ref', role: 'status', 'aria-live': 'polite' });
+    const describeReference = () => {
+      const found = chordsFromText(state.reference);
+      const distinct = found.length;
+      ui.refInfo.textContent = !state.reference.trim() ? ''
+        : distinct >= 2 ? `Acordes encontrados (${distinct}): ${found.slice(0, 16).map(c => c.text).join(' · ')}${distinct > 16 ? '…' : ''}`
+        : distinct === 1 ? 'Solo se encontró un acorde; hacen falta al menos dos para que sirva de guía.'
+        : 'No se reconocen acordes. Pega las líneas de acordes (por ejemplo «Db/F  Cm/Eb») o el cifrado completo.';
+    };
+    const reference = isolate(el('textarea', {
+      class: 'cf-d-refbox', rows: '5', spellcheck: 'false', autocapitalize: 'off', autocomplete: 'off', disabled: locked,
+      'aria-label': 'Cifrado de referencia', placeholder: 'Pega aquí el cifrado (con letra o sin ella):\nDb/F  Cm/Eb\nBb  Bbm/Db',
+      onInput: event => { state.reference = event.target.value; describeReference(); },
+    }, state.reference));
+    describeReference();
+    kids.push(el('details', { open: state.reference.trim() ? true : null },
+      el('summary', { text: 'Ya tengo el cifrado (de un PDF o una página)' }),
+      el('p', { text: HELP.reference }),
+      reference, ui.refInfo));
     kids.push(el('div', { class: 'cf-d-opts' },
+      el('label', {}, inversions, el('span', { text: 'Marcar las inversiones del bajo (Db/F, Cm/Eb)' })),
       el('label', {}, extended, el('span', { text: 'Marcar también 7, m7, maj7 y sus4 (menos seguro)' })),
       el('label', {}, unify, el('span', { text: 'Apoyarse en las secciones que se repiten (Coro, Verso…)' })),
       el('label', {}, el('span', { text: 'Partes del compás' }), slots)));
