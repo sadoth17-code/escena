@@ -83,6 +83,7 @@ class Cifrado {
     this.status = null;
     this.last = null;
     this.openState = false;
+    this.detector = null;
     this.raf = 0;
     this.timer = 0;
     this.sigAt = 0;
@@ -100,7 +101,7 @@ class Cifrado {
     this.fab = el('button', { class: 'cf-fab', type: 'button', title: 'Cifrado y transmisión en vivo', 'aria-label': 'Abrir el cifrado', onClick: () => this.toggle() }, '♪');
     this.fab.hidden = !this.prefs.button;
     document.body.append(this.fab);
-    document.addEventListener('keydown', event => { if (event.key === 'Escape' && this.openState && !this.editor) this.close(); });
+    document.addEventListener('keydown', event => { if (event.key === 'Escape' && this.openState && !this.editor && !this.detector) this.close(); });
     if (typeof app?.on === 'function') {
       app.on('song:loaded', () => this.attach());
       app.on('song:unloaded', () => this.attach());
@@ -135,6 +136,7 @@ class Cifrado {
     if (player === this.player) return;
     for (const off of this.offs) off();
     this.offs = [];
+    this.detector?.close();
     this.player = player;
     this.signature = '';
     this.snapshot = null;
@@ -290,6 +292,7 @@ class Cifrado {
       el('button', { class: 'cf-tb', type: 'button', 'aria-label': 'Letra más pequeña', onClick: () => size(-0.1) }, 'A−'),
       el('button', { class: 'cf-tb', type: 'button', 'aria-label': 'Letra más grande', onClick: () => size(0.1) }, 'A+'),
       el('button', { class: 'cf-tb', type: 'button', onClick: () => this.edit() }, 'Editar cifrado'),
+      el('button', { class: 'cf-tb', type: 'button', onClick: () => this.detect() }, 'Detectar acordes'),
       this.liveButton);
 
     this.liveBox = el('section', { class: 'cf-live', hidden: true, 'aria-label': 'Transmisión en vivo' });
@@ -355,10 +358,13 @@ class Cifrado {
   }
 
   // ───────── Editor del cifrado ─────────
-  edit() {
-    if (!this.player || !this.snapshot || this.editor) { if (!this.player) this.tell('Carga una canción para escribir su cifrado', 'info'); return; }
+  // `initial`: texto con que abrir el editor (por ejemplo, el que salió de la detección); si el editor ya está
+  // abierto, lo reemplaza. `detected` avisa de que es un borrador automático.
+  edit(initial, { detected = false } = {}) {
+    if (this.editor) { if (typeof initial === 'string') this.editorSet?.(initial, detected); return; }
+    if (!this.player || !this.snapshot) { this.tell('Carga una canción para escribir su cifrado', 'info'); return; }
     const area = isolate(el('textarea', { spellcheck: 'false', autocapitalize: 'off', autocomplete: 'off', 'aria-label': 'Cifrado de la canción', placeholder: 'Pega aquí el cifrado o usa «Plantilla de las secciones»' }));
-    area.value = this.chartText();
+    area.value = typeof initial === 'string' ? initial : this.chartText();
     const check = el('div', { class: 'cf-check', role: 'status' });
     const validate = () => {
       const layout = buildLayout(this.snapshot, parseChart(area.value));
@@ -369,12 +375,13 @@ class Cifrado {
         : 'No se encontró ningún compás. Escribe los acordes entre barras: | G | D | Em | C |';
     };
     area.addEventListener('input', validate);
-    const close = () => { this.editor.remove(); this.editor = null; };
+    const close = () => { this.editor.remove(); this.editor = null; this.editorSet = null; };
     this.editor = el('div', { class: 'cf-editor' },
       el('h2', { text: `Cifrado de «${this.snapshot.title}»` }),
       area, check,
       el('details', {}, el('summary', { text: 'Cómo se escribe' }), el('pre', { text: HELP })),
       el('div', { class: 'cf-actions' },
+        el('button', { class: 'cf-tb', type: 'button', onClick: () => this.detect() }, 'Detectar acordes'),
         el('button', { class: 'cf-tb', type: 'button', onClick: () => { area.value = `${area.value.trim() ? `${area.value.replace(/\s+$/, '')}\n\n` : ''}${templateFor(this.snapshot)}`; validate(); area.focus(); } }, 'Plantilla de las secciones'),
         el('button', { class: 'cf-tb', type: 'button', onClick: close }, 'Cancelar'),
         el('button', { class: 'cf-tb primary', type: 'button', onClick: () => {
@@ -386,7 +393,28 @@ class Cifrado {
         } }, 'Guardar')));
     this.scroll.parentElement.append(this.editor);
     validate();
+    if (detected) check.textContent = `Detectado automáticamente (borrador): revísalo y corrige lo que haga falta. ${check.textContent}`;
+    this.editorSet = (text, fromDetector) => {
+      area.value = text;
+      validate();
+      if (fromDetector) check.textContent = `Detectado automáticamente (borrador): revísalo y corrige lo que haga falta. ${check.textContent}`;
+      area.focus();
+    };
     area.focus();
+  }
+
+  // ───────── Detección automática de acordes ─────────
+  async detect() {
+    if (!this.player || !this.snapshot) { this.tell('Carga una canción para detectar sus acordes', 'info'); return; }
+    if (this.detector) return;
+    try {
+      const { openDetector } = await import('./detector.js');
+      if (this.detector) return;
+      this.detector = openDetector(this, () => { this.detector = null; });
+    } catch (error) {
+      console.error('Cifrado: no se pudo abrir la detección de acordes', error);
+      this.tell('No se pudo abrir la detección de acordes', 'error');
+    }
   }
 
   // ───────── Abrir y cerrar ─────────
