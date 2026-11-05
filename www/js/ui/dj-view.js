@@ -2,15 +2,27 @@
 // Solo dibuja y llama al controlador (dj.js); no toca el audio.
 
 import { h, clamp, fmtBytes } from '../util.js';
-import { icon, iconButton, openModal, confirmDialog, promptDialog, createRange, createSwitch, createSegmented, setText, setClass, dbLabel } from './kit.js';
+import { icon, iconButton, openModal, confirmDialog, promptDialog, createRange, createSwitch, createSegmented, setText, setClass, dbLabel, showToast } from './kit.js';
 import { fmtClock, parseClock, itemEnd } from '../dj-math.js';
 import { ACTIONS, CONTINUOUS, describeTrigger, isKeyTrigger, shortTrigger } from '../dj-midi.js';
+import { isAudioFile } from '../dj.js';
 
 const STYLE_ID = 'dj-styles';
 
 function ensureStyles() {
   if (document.getElementById(STYLE_ID)) return;
   document.head.append(h('link', { id: STYLE_ID, rel: 'stylesheet', href: new URL('../../css/dj.css', import.meta.url).href }));
+}
+
+// Entrega el archivo al navegador como una descarga normal (carpeta Descargas o la ventana de guardar del escritorio).
+function downloadBlob(blob, fileName) {
+  const url = URL.createObjectURL(blob);
+  const link = h('a', { href: url, download: fileName, class: 'dj-file', tabindex: '-1' });
+  document.body.append(link);
+  link.click();
+  link.remove();
+  // El navegador lee el archivo mientras lo guarda: se suelta recién pasado un buen rato.
+  setTimeout(() => URL.revokeObjectURL(url), 10 * 60 * 1000);
 }
 
 const fadeText = (seconds) => (seconds <= 0 ? 'corte' : `${Number.isInteger(seconds) ? seconds : seconds.toFixed(1)} s`);
@@ -41,7 +53,8 @@ export function createDjView({ dj }) {
   function renderBanners() {
     const learning = state.learning;
     const importing = state.importing;
-    const signature = [state.audioBlocked, state.storage, learning && learning.label, importing && `${importing.done}/${importing.total}/${importing.name}`].join('|');
+    const exporting = state.exporting;
+    const signature = [state.audioBlocked, state.storage, learning && learning.label, importing && `${importing.done}/${importing.total}/${importing.name}/${importing.label || ''}`, exporting && `${exporting.done}/${exporting.total}/${exporting.name}`].join('|');
     refresh('banners', signature, () => {
       const list = [];
       if (learning) {
@@ -71,8 +84,19 @@ export function createDjView({ dj }) {
             'div',
             { class: 'dj-banner is-info', 'data-banner': 'import' },
             h('span', { class: 'spinner' }),
-            h('b', { text: `Añadiendo canciones… ${importing.done} de ${importing.total}` }),
+            h('b', { text: `${importing.label || 'Añadiendo canciones…'} ${importing.done} de ${importing.total}` }),
             h('span', { class: 'dj-banner-sub', text: importing.name })
+          )
+        );
+      }
+      if (exporting) {
+        list.push(
+          h(
+            'div',
+            { class: 'dj-banner is-info', 'data-banner': 'export' },
+            h('span', { class: 'spinner' }),
+            h('b', { text: exporting.total > 0 ? `Preparando el paquete… ${Math.min(exporting.done, exporting.total)} de ${exporting.total}` : 'Preparando el paquete…' }),
+            h('span', { class: 'dj-banner-sub', text: exporting.name })
           )
         );
       }
@@ -195,6 +219,16 @@ export function createDjView({ dj }) {
     addToProgram = toProgram;
     fileInput.click();
   };
+
+  // Paquete de otra PC (.zip con canciones o .json solo con el programa).
+  const packageInput = h('input', { type: 'file', class: 'dj-file', accept: '.zip,.json,application/zip,application/x-zip-compressed,application/json', 'aria-label': 'Elegir un paquete de Escena DJ', tabindex: '-1' });
+  packageInput.addEventListener('change', () => {
+    const file = packageInput.files && packageInput.files[0];
+    packageInput.value = '';
+    if (file) openImport(file);
+  });
+  const pickPackage = () => packageInput.click();
+  const transferButton = () => h('button', { type: 'button', class: 'btn', 'data-act': 'transfer', onClick: openTransferModal }, icon('share', 18), 'Llevar a otra PC');
 
   const tabs = createSegmented({
     options: [
@@ -332,7 +366,27 @@ export function createDjView({ dj }) {
           iconButton({ name: 'trash', label: 'Borrar el programa', onClick: deleteProgram })
         )
       );
-      const actions = h('div', { class: 'dj-program-actions' }, h('button', { type: 'button', class: 'btn primary', 'data-act': 'add', onClick: () => pickFiles(true) }, icon('plus', 18), 'Añadir canciones'), layout.el);
+      const actions = h(
+        'div',
+        { class: 'dj-program-actions' },
+        h('div', { class: 'dj-action-group' }, h('button', { type: 'button', class: 'btn primary', 'data-act': 'add', onClick: () => pickFiles(true) }, icon('plus', 18), 'Añadir canciones'), transferButton()),
+        layout.el
+      );
+      const missing = items.filter((item) => item.missing);
+      const missingNote = missing.length
+        ? h(
+            'div',
+            { class: 'dj-banner is-warn dj-missing-note', 'data-banner': 'missing' },
+            icon('info', 20),
+            h('b', {
+              text:
+                missing.length === 1
+                  ? 'A 1 participante le falta su archivo. Añade la canción con «Añadir canciones»: si se llama como el archivo original, se vincula sola.'
+                  : `A ${missing.length} participantes les falta su archivo. Añade las canciones con «Añadir canciones»: las que se llamen como los archivos originales se vinculan solas.`,
+            }),
+            h('button', { type: 'button', class: 'btn small', 'data-act': 'add-missing', onClick: () => pickFiles(true) }, 'Añadir')
+          )
+        : null;
       let body;
       let hint = null;
       if (!items.length) body = emptyProgram();
@@ -343,7 +397,7 @@ export function createDjView({ dj }) {
         body = h('div', { class: 'dj-list' }, items.map(buildRow));
         hint = 'Toca un nombre para marcarlo como «Sigue» (queda cargado y listo). El botón ▶ lo mezcla ahora.';
       }
-      workBody.replaceChildren(...[head, actions, hint ? h('p', { class: 'dj-hint' }, hint) : null, body].filter(Boolean));
+      workBody.replaceChildren(...[head, actions, missingNote, hint ? h('p', { class: 'dj-hint' }, hint) : null, body].filter(Boolean));
       if (program) workBody.dataset.program = program.id;
     });
     patchProgram();
@@ -362,7 +416,7 @@ export function createDjView({ dj }) {
           if (estimate && estimate.quota) storage.textContent = `Espacio usado en este dispositivo: ${fmtBytes(estimate.usage)} de ${fmtBytes(estimate.quota)} disponibles.`;
         })
         .catch(() => {});
-      const head = h('div', { class: 'dj-program-actions' }, h('button', { type: 'button', class: 'btn primary', 'data-act': 'add', onClick: () => pickFiles(false) }, icon('upload', 18), 'Añadir canciones'));
+      const head = h('div', { class: 'dj-program-actions' }, h('div', { class: 'dj-action-group' }, h('button', { type: 'button', class: 'btn primary', 'data-act': 'add', onClick: () => pickFiles(false) }, icon('upload', 18), 'Añadir canciones'), transferButton()));
       const rows = state.tracks.map((track) =>
         h(
           'div',
@@ -697,9 +751,149 @@ export function createDjView({ dj }) {
     return modal;
   }
 
+  // ------------------------------------------------------------ llevar el programa a otra PC
+
+  const choice = ({ act, iconName, title, detail, onClick }) => {
+    const detailEl = h('span', { class: 'dj-choice-detail', text: detail });
+    const el = h('button', { type: 'button', class: 'dj-choice', 'data-act': act, onClick }, icon(iconName, 24), h('span', { class: 'dj-choice-text' }, h('b', { text: title }), detailEl));
+    return { el, setDetail: (text) => setText(detailEl, text) };
+  };
+
+  function openTransferModal() {
+    const scope = { value: 'current' };
+    let modal = null;
+    const warn = h('p', { class: 'dj-hint is-warn', 'data-role': 'transfer-warn', hidden: true });
+    const run = async (audio) => {
+      if (modal) modal.close();
+      const out = await dj.exportPackage({ scope: scope.value, audio });
+      if (!out) return;
+      downloadBlob(out.blob, out.fileName);
+      showToast({ message: `Listo: «${out.fileName}» (${fmtBytes(out.bytes)}). Cópialo a la otra PC y ábrelo allá en «Llevar a otra PC» > «Elegir un paquete…».`, duration: 10000 });
+    };
+    const full = choice({ act: 'export-full', iconName: 'download', title: 'Paquete completo (.zip)', detail: '', onClick: () => run(true) });
+    const light = choice({
+      act: 'export-light',
+      iconName: 'file',
+      title: 'Solo el programa (.json)',
+      detail: 'Archivo liviano, sin audio. En la otra PC cada participante espera su canción y se vincula por el nombre del archivo cuando la añades.',
+      onClick: () => run(false),
+    });
+    const pick = choice({
+      act: 'import-pick',
+      iconName: 'upload',
+      title: 'Elegir un paquete…',
+      detail: 'Un archivo .zip o .json hecho con «Llevar a otra PC». También puedes arrastrarlo a esta pantalla.',
+      onClick: () => {
+        if (modal) modal.close();
+        pickPackage();
+      },
+    });
+    const update = () => {
+      const preview = dj.previewPackage(scope.value);
+      const empty = !preview.participants;
+      full.setDetail(`Canciones, orden, tiempos, pads y mezcla en un solo archivo: ${plural(preview.participants, 'participante', 'participantes')}, ${plural(preview.withAudio, 'canción', 'canciones')}, unos ${fmtBytes(preview.bytes)}.`);
+      full.el.disabled = empty || preview.tooBig || !preview.withAudio;
+      light.el.disabled = empty;
+      const notes = [];
+      if (empty) notes.push('Este programa está vacío.');
+      if (preview.tooBig) notes.push('Estas canciones pesan más de 4 GB y no caben en un solo paquete: lleva un programa a la vez, o usa «Solo el programa» y copia las canciones aparte.');
+      if (preview.waiting) notes.push(`${plural(preview.waiting, 'canción', 'canciones')} ${preview.waiting === 1 ? 'todavía espera' : 'todavía esperan'} su archivo en esta PC y ${preview.waiting === 1 ? 'viaja' : 'viajan'} sin audio.`);
+      if (preview.skipped) notes.push(`${plural(preview.skipped, 'participante', 'participantes')} sin canción ${preview.skipped === 1 ? 'no se incluye' : 'no se incluyen'}.`);
+      warn.hidden = !notes.length;
+      setText(warn, notes.join(' '));
+    };
+    const scopeSeg =
+      state.programs.length > 1
+        ? createSegmented({
+            options: [
+              { value: 'current', label: 'Este programa' },
+              { value: 'all', label: `Todos (${state.programs.length})` },
+            ],
+            value: 'current',
+            label: 'Qué llevar',
+            className: 'dj-scope',
+            onChange: (value) => {
+              scope.value = value;
+              update();
+            },
+          })
+        : null;
+    const body = h(
+      'div',
+      { class: 'dj-transfer-body' },
+      h('p', { class: 'dj-hint', text: 'Las canciones del DJ se guardan solo en este dispositivo: no se suben a internet. Para usar el mismo programa en otra computadora, crea un archivo aquí, cópialo (USB, correo, tu nube personal…) y ábrelo allá.' }),
+      h('h4', { class: 'sub', text: 'Llevar a otra PC' }),
+      scopeSeg ? scopeSeg.el : null,
+      full.el,
+      light.el,
+      warn,
+      h('h4', { class: 'sub', text: 'Traer a esta PC' }),
+      pick.el
+    );
+    modal = openModal({ title: 'Llevar el programa a otra PC', size: 'md', className: 'dj-modal dj-transfer', body, actions: [{ label: 'Cerrar', onClick: (api) => api.close() }] });
+    update();
+    return modal;
+  }
+
+  async function openImport(file) {
+    const result = await dj.openPackage(file);
+    if (result) openImportModal(result, file);
+  }
+
+  function openImportModal({ opened, summary }, file) {
+    const playing = state.transport === 'playing';
+    let useSettings = summary.hasSettings && !(summary.hasBindings && summary.customBindings);
+    const shown = summary.programs.slice(0, 8);
+    const facts = [];
+    if (summary.withAudio) facts.push(h('li', { 'data-fact': 'audio' }, h('b', { text: String(summary.withAudio) }), ` ${summary.withAudio === 1 ? 'canción nueva' : 'canciones nuevas'} con audio · ${fmtBytes(summary.audioBytes)} · se guardan en este dispositivo`));
+    if (summary.reused) facts.push(h('li', { 'data-fact': 'reused' }, h('b', { text: String(summary.reused) }), ` ${summary.reused === 1 ? 'ya estaba' : 'ya estaban'} en esta PC · no se repiten`));
+    if (summary.linked) facts.push(h('li', { 'data-fact': 'linked' }, h('b', { text: String(summary.linked) }), ` sin audio en el paquete, pero ya ${summary.linked === 1 ? 'tienes un archivo con ese nombre' : 'tienes archivos con esos nombres'} · se vinculan solas`));
+    if (summary.waiting) facts.push(h('li', { 'data-fact': 'waiting' }, h('b', { text: String(summary.waiting) }), ` sin audio · ${summary.waiting === 1 ? 'queda esperando su archivo' : 'quedan esperando su archivo'}: al añadirlo con «Añadir canciones» se vincula por el nombre`));
+    const settingsRow = summary.hasSettings
+      ? (() => {
+          const toggle = createSwitch({ value: useSettings, label: 'Usar también la mezcla y los pads del paquete', onChange: (value) => (useSettings = value) });
+          const detail = summary.hasBindings ? (summary.customBindings ? 'Reemplaza los pads y las teclas que tienes asignados en este equipo.' : 'Los pads y las teclas quedan asignados igual que en la otra PC.') : 'Duración de la mezcla y avance automático.';
+          return h('div', { class: 'dj-switch-row', 'data-role': 'import-settings' }, h('div', { class: 'dj-switch-text' }, h('strong', { text: 'Usar también la mezcla y los pads del paquete' }), h('span', { text: detail })), toggle.el);
+        })()
+      : null;
+    const body = h(
+      'div',
+      { class: 'dj-import' },
+      h('p', { class: 'dj-import-file' }, h('b', { text: summary.fileName || 'Paquete' }), ` · ${summary.kind === 'zip' ? fmtBytes(file.size) : 'solo el programa, sin audio'}`),
+      h(
+        'ul',
+        { class: 'dj-sumlist', 'data-role': 'programs' },
+        shown.map((entry) => h('li', {}, h('b', { text: entry.name }), ` · ${plural(entry.participants, 'participante', 'participantes')}`)),
+        summary.programs.length > shown.length ? h('li', { text: `y ${summary.programs.length - shown.length} más` }) : null
+      ),
+      facts.length ? h('ul', { class: 'dj-sumlist is-facts', 'data-role': 'songs' }, facts) : null,
+      settingsRow,
+      playing ? h('p', { class: 'dj-hint is-warn', text: 'Hay música sonando. Detenla (o ponla en pausa) antes de traer el programa.' }) : null
+    );
+    openModal({
+      title: summary.programs.length === 1 ? 'Traer un programa' : 'Traer programas',
+      size: 'md',
+      className: 'dj-modal dj-import-modal',
+      body,
+      actions: [
+        { label: 'Cancelar', onClick: (api) => api.close() },
+        {
+          label: summary.programs.length === 1 ? 'Traer el programa' : 'Traer los programas',
+          kind: 'primary',
+          icon: 'check',
+          disabled: playing,
+          onClick: (api) => {
+            api.close();
+            dj.importPackage(opened, { applySettings: useSettings });
+          },
+        },
+      ],
+    });
+  }
+
   // ------------------------------------------------------------ arrastrar archivos
 
-  const root = h('div', { class: 'dj' }, banners, deck, work, fileInput);
+  const root = h('div', { class: 'dj' }, banners, deck, work, fileInput, packageInput);
   let dragDepth = 0;
   const hasFiles = (event) => event.dataTransfer && Array.from(event.dataTransfer.types || []).includes('Files');
   root.addEventListener('dragenter', (event) => {
@@ -725,7 +919,14 @@ export function createDjView({ dj }) {
     event.stopPropagation();
     dragDepth = 0;
     root.classList.remove('is-dropping');
-    dj.importFiles(Array.from(event.dataTransfer.files), { addToProgram: state.settings.tab !== 'library' });
+    const files = Array.from(event.dataTransfer.files);
+    // Un paquete (.zip/.json) suelto se abre como paquete; con canciones de por medio, se tratan como canciones.
+    const packageFile = files.find((file) => /\.(zip|json)$/i.test(file.name || ''));
+    if (packageFile && !files.some(isAudioFile)) {
+      openImport(packageFile);
+      return;
+    }
+    dj.importFiles(files, { addToProgram: state.settings.tab !== 'library' });
   });
 
   // ------------------------------------------------------------ teclado (solo con la pestaña DJ a la vista)
@@ -763,6 +964,7 @@ export function createDjView({ dj }) {
     setClass(nowCard, 'is-paused', state.transport === 'paused');
     setText(nextTitle, nextView ? nextView.title : items.length ? 'Fin del programa' : '—');
     setText(nextSub, nextView ? itemSub(nextView) : '');
+    const playable = dj.playableNext();
     const status = next ? dj.itemStatus(next) : 'none';
     setText(nextState, STATUS_TEXT[status] || '');
     if (nextDot.__s !== status) {
@@ -778,8 +980,9 @@ export function createDjView({ dj }) {
     btnPlay.setAttribute('aria-label', playLabel);
     btnPlay.title = playLabel;
     const fade = state.settings.fade;
-    setText(nextBtnSub, !next ? 'no hay más canciones' : playing ? (fade <= 0 ? 'corte directo' : `mezcla de ${fadeText(fade)}`) : 'empezar');
-    btnNext.disabled = !next;
+    const nextButtonText = !next ? 'no hay más canciones' : !playable ? 'les falta el archivo' : nextView && nextView.missing ? 'salta al que sí tiene archivo' : playing ? (fade <= 0 ? 'corte directo' : `mezcla de ${fadeText(fade)}`) : 'empezar';
+    setText(nextBtnSub, nextButtonText);
+    btnNext.disabled = !playable;
     btnPrev.disabled = !now || items.findIndex((item) => item.id === now.id) <= 0;
     btnStop.disabled = state.transport === 'idle';
     for (const preset of presets) setClass(preset, 'is-on', Number(preset.dataset.seconds) === fade);

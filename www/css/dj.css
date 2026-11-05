@@ -685,7 +685,13 @@
 }
 
 .dj-row.is-missing {
-  opacity: 0.6;
+  opacity: 0.9;
+  border-style: dashed;
+  border-color: rgba(255, 176, 32, 0.5);
+}
+
+.dj-row.is-missing .dj-row-sub {
+  color: var(--amber);
 }
 
 .dj-num {
@@ -858,7 +864,9 @@
 }
 
 .dj-pad.is-missing {
-  opacity: 0.55;
+  opacity: 0.8;
+  border-style: dashed;
+  border-color: rgba(255, 176, 32, 0.5);
 }
 
 /* ---------- Vacío ---------- */
@@ -1102,7 +1110,9 @@
 /* ---------- Arrastrar archivos ---------- */
 
 .dj.is-dropping::after {
-  content: "Suelta aquí las canciones";
+  content: "Suelta aquí las canciones o un paquete de Escena DJ";
+  padding: 0 24px;
+  text-align: center;
   position: absolute;
   inset: 8px;
   z-index: 20;
@@ -1116,6 +1126,118 @@
   font-size: 18px;
   font-weight: 800;
   pointer-events: none;
+}
+
+/* ---------- Llevar el programa a otra PC ---------- */
+
+.dj-action-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.dj-missing-note {
+  flex-wrap: wrap;
+}
+
+.dj-missing-note .btn {
+  flex: none;
+  margin-left: auto;
+}
+
+.dj-transfer-body,
+.dj-import {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.dj-scope {
+  width: 100%;
+}
+
+.dj-scope .seg {
+  flex: 1;
+  justify-content: center;
+}
+
+.dj-choice {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  min-height: 64px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: var(--panel-2);
+  border: 1px solid var(--line-2);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.dj-choice:hover:not(:disabled),
+.dj-choice:focus-visible {
+  border-color: var(--accent);
+}
+
+.dj-choice:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.dj-choice svg {
+  flex: none;
+  color: var(--accent);
+}
+
+.dj-choice-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.dj-choice-text b {
+  font-size: 15px;
+}
+
+.dj-choice-detail {
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--text-3);
+}
+
+.dj-import-file {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+.dj-sumlist {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.dj-sumlist li {
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  font-size: 14px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.dj-sumlist.is-facts li b {
+  margin-right: 2px;
+  color: var(--accent);
 }
 
 /* ---------- Pantallas bajas (teléfono de lado) ---------- */

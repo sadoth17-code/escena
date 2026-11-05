@@ -7,6 +7,7 @@ import { createEmitter, uid, naturalCompare, clamp, FADER_DEFAULT, faderToGain }
 import { DEFAULT_FADE, START_FADE, PAUSE_FADE, PANIC_FADE, fadeSeconds, itemEnd, remainingSeconds, resolveNextItem, resolvePrevItem, moveItem, softTakeover, newTakeover, indexOfItem } from './dj-math.js';
 import { createMemoryDjStore } from './dj-store.js';
 import { ACTIONS, CONTINUOUS, DEFAULT_BINDINGS, MAX_SLOTS, actionName, assignBinding, clearSlots, createMidiPorts, createRouter, midiPermission, midiSupported, removeBinding, replaceMidiBinding, slotAction, slotNumber } from './dj-midi.js';
+import { MANIFEST_NAME, ZIP_MAX_BYTES, buildManifest, buildZip, entryNameFor, estimatePackageBytes, guessAudioType, packageFileName, readPackage, readmeText, relinkKey, serializeManifest } from './dj-package.js';
 
 const AUDIO_EXTENSIONS = /\.(mp3|wav|wave|m4a|aac|flac|ogg|oga|opus|weba|webm|mp4|aif|aiff|caf)$/i;
 const MAX_PREFETCH = 40;
@@ -44,7 +45,8 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
     cueId: null,
     transport: 'idle', // idle | playing | paused
     busy: new Set(),
-    importing: null,
+    importing: null, // { done, total, name, label? } mientras se añaden canciones o se trae un paquete
+    exporting: null, // { done, total, name } mientras se prepara un paquete para llevar a otra PC
     learning: null,
     audioBlocked: false,
     active: false,
@@ -102,23 +104,52 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
   const nowItem = () => itemsRaw().find((item) => item.id === state.nowId) || null;
   const cueItem = () => itemsRaw().find((item) => item.id === state.cueId) || null;
   const nextItem = () => resolveNextItem(itemsRaw(), state.nowId, state.cueId);
-  const itemTitle = (item) => item.label || (trackOf(item.trackId) ? trackOf(item.trackId).name : 'Canción borrada');
+  // Un participante que llegó en un paquete sin audio ("want") espera un archivo con ese nombre.
+  const itemTitle = (item) => item.label || (trackOf(item.trackId) ? trackOf(item.trackId).name : (item.want && item.want.name) || 'Canción borrada');
+  const isPlayable = (item) => Boolean(item && trackOf(item.trackId));
 
   function viewItems() {
     return itemsRaw().map((item, index) => {
       const track = trackOf(item.trackId);
+      const want = !track && item.want ? item.want : null;
       return {
         ...item,
         index,
         number: index + 1,
         track,
         title: itemTitle(item),
-        trackName: track ? track.name : 'Falta el archivo',
-        trackDuration: track ? track.duration : 0,
+        trackName: track ? track.name : want && want.file ? `Falta «${want.file}»` : 'Falta el archivo',
+        trackDuration: track ? track.duration : want ? want.duration || 0 : 0,
         missing: !track,
         slot: index < MAX_SLOTS ? slotAction(index + 1) : null,
       };
     });
+  }
+
+  // La primera canción con archivo desde `item` (incluida) en el sentido pedido. Así un participante sin archivo no
+  // detiene el programa: "Siguiente" y el avance automático lo saltan.
+  function playableFrom(item, step = 1) {
+    const items = itemsRaw();
+    for (let index = item ? items.indexOf(item) : -1; index >= 0 && index < items.length; index += step) {
+      if (isPlayable(items[index])) return items[index];
+    }
+    return null;
+  }
+
+  function playableNext() {
+    const target = nextItem();
+    return target ? playableFrom(target, 1) : null;
+  }
+
+  // `from` era el destino pedido y `to` el que de verdad se toca: los participantes que quedan en medio no tienen archivo.
+  function toastSkipped(from, to) {
+    const items = itemsRaw();
+    const a = items.indexOf(from);
+    const b = items.indexOf(to);
+    if (a < 0 || b < 0 || a === b) return;
+    const skipped = items.slice(Math.min(a, b), Math.max(a, b) + 1).filter((entry) => entry !== to && !isPlayable(entry));
+    if (!skipped.length) return;
+    toast(skipped.length === 1 ? `Se saltó «${itemTitle(skipped[0])}»: falta su archivo.` : `Se saltaron ${skipped.length} participantes sin archivo.`);
   }
 
   function itemStatus(item) {
@@ -198,7 +229,9 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
 
   async function prepareItem(item, { force = false } = {}) {
     const track = trackOf(item.trackId);
-    if (!track) throw new Error(`“${itemTitle(item)}”: el archivo ya no está en la biblioteca`);
+    if (!track) {
+      throw new Error(item.want ? `“${itemTitle(item)}”: falta el archivo «${item.want.file}». Añádelo con «Añadir canciones» y se vincula solo.` : `“${itemTitle(item)}”: el archivo ya no está en la biblioteca`);
+    }
     const blob = await blobFor(track.id);
     if (!blob) throw new Error(`No se encontró el archivo de “${track.name}”. Vuelve a añadirlo.`);
     const deck = await engine.load(item.id, blob, { sourceId: track.id, start: item.start, gainDb: item.gainDb, force });
@@ -214,8 +247,8 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
   async function preload() {
     const run = ++preloadRun;
     const items = itemsRaw();
-    const first = nextItem();
-    const second = first ? items[items.indexOf(first) + 1] : null;
+    const first = playableNext();
+    const second = first ? playableFrom(items[items.indexOf(first) + 1], 1) : null;
     const list = [first, second].filter((item) => item && item.id !== state.nowId);
     engine.setWanted(list.map((item) => item.id));
     for (const item of list) {
@@ -301,7 +334,13 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
       toast(itemsRaw().length ? 'Es la última canción del programa' : 'El programa está vacío. Añade canciones primero.');
       return Promise.resolve(false);
     }
-    return startItem(target);
+    const playable = playableFrom(target, 1);
+    if (!playable) {
+      toast('A los participantes que siguen les falta el archivo. Añádelos con «Añadir canciones».', 'error');
+      return Promise.resolve(false);
+    }
+    if (playable !== target) toastSkipped(target, playable);
+    return startItem(playable);
   }
 
   function prev() {
@@ -310,7 +349,13 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
       toast('Es la primera canción del programa');
       return Promise.resolve(false);
     }
-    return startItem(target);
+    const playable = playableFrom(target, -1);
+    if (!playable) {
+      toast('A los participantes anteriores les falta el archivo.', 'error');
+      return Promise.resolve(false);
+    }
+    if (playable !== target) toastSkipped(target, playable);
+    return startItem(playable);
   }
 
   function jump(itemId) {
@@ -319,7 +364,12 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
   }
 
   function cue(itemId) {
-    if (!itemsRaw().some((item) => item.id === itemId) || itemId === state.nowId) return;
+    const found = itemsRaw().find((item) => item.id === itemId);
+    if (!found || itemId === state.nowId) return;
+    if (!isPlayable(found)) {
+      toast(found.want ? `Falta el archivo «${found.want.file}». Añádelo con «Añadir canciones» y se vincula solo.` : 'Esa canción ya no está en la biblioteca.', 'error');
+      return;
+    }
     state.cueId = state.cueId === itemId ? null : itemId;
     emit();
     preload();
@@ -350,11 +400,17 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
   async function playPause() {
     if (state.transport === 'playing') return pause();
     if (state.transport === 'paused') return resume();
-    const target = cueItem() || nowItem() || itemsRaw()[0];
-    if (!target) {
+    const first = cueItem() || nowItem() || itemsRaw()[0];
+    if (!first) {
       toast('El programa está vacío. Añade canciones primero.');
       return false;
     }
+    const target = playableFrom(first, 1);
+    if (!target) {
+      toast('A ningún participante le queda un archivo para sonar. Añade las canciones con «Añadir canciones».', 'error');
+      return false;
+    }
+    if (target !== first) toastSkipped(first, target);
     return startItem(target);
   }
 
@@ -426,7 +482,7 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
     const fade = state.settings.fade;
     if (remaining > Math.max(fade, 0) + 0.03) return;
     autoRun = runId;
-    const target = nextItem();
+    const target = playableNext();
     if (target) startItem(target, { fade: Math.max(0.3, Math.min(fade || 0.3, remaining)) });
     else if (item.maxDur > 0) {
       engine.stopAll({ duration: Math.max(0.3, remaining) });
@@ -443,7 +499,7 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
     syncWake();
     if (state.settings.autoAdvance && autoRun !== runId) {
       autoRun = runId;
-      const target = nextItem();
+      const target = playableNext();
       if (target) startItem(target, { fade: START_FADE });
     }
     emit();
@@ -498,6 +554,28 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
 
   // ---------------------------------------------------------- biblioteca
 
+  // Participantes de un paquete sin audio que esperan un archivo con este nombre: se vinculan solos al añadirlo.
+  function claimWaiting(track, fileName) {
+    const key = relinkKey(fileName);
+    let count = 0;
+    for (const entry of state.programs) {
+      let touched = false;
+      for (const item of entry.items) {
+        if (!item.want || isPlayable(item) || relinkKey(item.want.file) !== key) continue;
+        item.trackId = track.id;
+        delete item.want;
+        if (track.duration) item.start = clamp(item.start, 0, Math.max(0, track.duration - 1));
+        touched = true;
+        count++;
+      }
+      if (touched) {
+        entry.updated = now();
+        later(`program:${entry.id}`, () => saveProgram(entry));
+      }
+    }
+    return count;
+  }
+
   async function importFiles(fileList, { addToProgram = true } = {}) {
     const all = Array.from(fileList || []);
     const files = all.filter(isAudioFile).sort((a, b) => naturalCompare(a.name, b.name));
@@ -511,6 +589,7 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
     }
     const added = [];
     const failed = [];
+    let relinked = 0;
     state.importing = { done: 0, total: files.length, name: '' };
     emit();
     for (const file of files) {
@@ -524,7 +603,10 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
         state.tracks.push(track);
         remember(track.id, file);
         added.push(track);
-        if (addToProgram) {
+        // Si un programa traído de otra PC esperaba este archivo, se vincula a su participante y no se agrega otro.
+        const claimed = claimWaiting(track, file.name);
+        relinked += claimed;
+        if (addToProgram && !claimed) {
           if (!program()) await createProgram('Programa 1');
           program().items.push({ id: uid(), trackId: track.id, label: '', start: 0, maxDur: 0, gainDb: 0 });
         }
@@ -536,11 +618,362 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
     state.importing = null;
     if (addToProgram && added.length) touchProgram();
     emit(true);
-    if (added.length) toast(added.length === 1 ? 'Canción añadida' : `${added.length} canciones añadidas`);
+    if (added.length) {
+      const base = added.length === 1 ? 'Canción añadida' : `${added.length} canciones añadidas`;
+      toast(relinked ? `${base} · ${relinked === 1 ? '1 participante recuperó su canción' : `${relinked} participantes recuperaron su canción`}` : base);
+    }
     if (failed.length) toast(failed.length === 1 ? failed[0] : `${failed.length} archivos no se pudieron añadir. Primero: ${failed[0]}`, 'error');
     prefetch();
     preload();
     return added;
+  }
+
+  // ---------------------------------------------------------- llevar el programa a otra PC (paquete)
+
+  // ¿Esta canción ya está en la biblioteca? Mismo nombre de archivo (y mismo tamaño si `strict`).
+  function findLibraryTrack(fileName, size = 0, strict = false) {
+    const key = relinkKey(fileName);
+    const same = state.tracks.filter((track) => relinkKey(track.file || track.name) === key);
+    if (!same.length) return null;
+    const exact = size ? same.find((track) => track.size === size) : null;
+    if (exact) return exact;
+    return strict ? null : same[0];
+  }
+
+  // Lee el audio sin dejarlo en la memoria de reserva: un paquete grande no debe desalojar lo que ya está preparado.
+  async function readBlob(trackId) {
+    const hit = blobs.get(trackId);
+    if (hit) return hit;
+    const row = await store.get('blobs', trackId);
+    return row && row.blob ? row.blob : null;
+  }
+
+  // Cuánto pesaría y qué llevaría el paquete, para mostrarlo antes de generarlo.
+  function previewPackage(scope = 'current') {
+    const chosen = scope === 'all' ? state.programs : program() ? [program()] : [];
+    const songs = new Map();
+    const waiting = new Set();
+    let participants = 0;
+    let skipped = 0;
+    for (const entry of chosen) {
+      for (const item of entry.items) {
+        const track = trackOf(item.trackId);
+        if (track) {
+          participants++;
+          songs.set(track.id, track.size || 0);
+        } else if (item.want) {
+          participants++;
+          waiting.add(`${relinkKey(item.want.file)}|${item.want.size || 0}`);
+        } else skipped++;
+      }
+    }
+    const bytes = estimatePackageBytes(Array.from(songs.values()));
+    return { programs: chosen.length, participants, songs: songs.size + waiting.size, withAudio: songs.size, waiting: waiting.size, skipped, bytes, tooBig: bytes > ZIP_MAX_BYTES };
+  }
+
+  // Arma el archivo para llevarse el programa: { blob, fileName, ... }. No lo descarga (eso lo hace la pantalla).
+  //   scope 'current' = el programa abierto · 'all' = todos      audio true = ZIP con canciones · false = solo el programa
+  async function exportPackage({ scope = 'current', audio = true } = {}) {
+    if (state.exporting) {
+      toast('Ya se está preparando un paquete. Espera a que termine.');
+      return null;
+    }
+    const chosen = scope === 'all' ? state.programs.slice() : program() ? [program()] : [];
+    if (!chosen.length) {
+      toast('No hay ningún programa para llevar', 'error');
+      return null;
+    }
+    state.exporting = { done: 0, total: 1, name: '' };
+    emit();
+    try {
+      const refs = new Map(); // canción de la biblioteca -> referencia dentro del paquete
+      const waiting = new Map(); // canciones que ya esperaban su archivo -> referencia
+      const list = [];
+      let skipped = 0;
+      const programs = chosen.map((entry) => {
+        const items = [];
+        for (const item of entry.items) {
+          const track = trackOf(item.trackId);
+          let ref = null;
+          if (track) {
+            ref = refs.get(track.id);
+            if (!ref) {
+              ref = `t${list.length + 1}`;
+              refs.set(track.id, ref);
+              list.push({ ref, track });
+            }
+          } else if (item.want) {
+            const key = `${relinkKey(item.want.file)}|${item.want.size || 0}`;
+            ref = waiting.get(key);
+            if (!ref) {
+              ref = `t${list.length + 1}`;
+              waiting.set(key, ref);
+              list.push({ ref, want: item.want });
+            }
+          } else {
+            skipped++; // su canción ya no existe y no se sabe cuál era
+            continue;
+          }
+          items.push({ track: ref, label: item.label, start: item.start, maxDur: item.maxDur, gainDb: item.gainDb });
+        }
+        return { name: entry.name, items };
+      });
+
+      const tracks = [];
+      const files = [];
+      const shown = new Map();
+      for (const entry of list) {
+        const source = entry.track || entry.want;
+        const row = {
+          ref: entry.ref,
+          name: entry.track ? entry.track.name : entry.want.name || cleanName(entry.want.file),
+          file: entry.track ? entry.track.file || entry.track.name : entry.want.file,
+          type: entry.track ? entry.track.type || '' : '',
+          size: source.size || 0,
+          duration: source.duration || 0,
+          entry: '',
+        };
+        if (audio && entry.track) {
+          const blob = await readBlob(entry.track.id);
+          if (!blob) throw new Error(`No se encontró en este dispositivo el archivo de «${entry.track.name}». Bórrala de la biblioteca y vuelve a añadirla.`);
+          row.entry = entryNameFor(files.length, row.file);
+          row.size = blob.size;
+          files.push({ name: row.entry, blob });
+          shown.set(row.entry, row.file);
+        }
+        tracks.push(row);
+      }
+      if (audio && estimatePackageBytes(files.map((file) => file.blob.size)) > ZIP_MAX_BYTES) {
+        throw new Error('Estas canciones pesan más de 4 GB juntas y no caben en un solo paquete. Lleva un programa a la vez, o usa «Solo el programa» y copia las canciones aparte.');
+      }
+
+      const manifest = buildManifest({
+        audio,
+        created: new Date(now()),
+        programs,
+        tracks,
+        settings: { fade: state.settings.fade, autoAdvance: state.settings.autoAdvance, bindings: effectiveBindings() },
+      });
+      const manifestText = serializeManifest(manifest);
+      const fileName = packageFileName(programs.map((entry) => entry.name), { audio });
+      let blob;
+      if (audio) {
+        const encoder = new TextEncoder();
+        state.exporting = { done: 0, total: files.length, name: '' };
+        emit();
+        blob = await buildZip([{ name: MANIFEST_NAME, bytes: encoder.encode(manifestText) }, { name: 'LEEME.txt', bytes: encoder.encode(readmeText()) }, ...files], {
+          onProgress: ({ index, name }) => {
+            if (!state.exporting) return;
+            state.exporting.done = Math.max(0, index - 2); // las dos primeras entradas son el programa y el LEEME
+            state.exporting.name = shown.get(name) || '';
+            emit();
+          },
+        });
+      } else {
+        blob = new Blob([manifestText], { type: 'application/json' });
+      }
+      return {
+        blob,
+        fileName,
+        bytes: blob.size,
+        programs: programs.length,
+        participants: programs.reduce((total, entry) => total + entry.items.length, 0),
+        songs: tracks.length,
+        withAudio: files.length,
+        waiting: audio ? tracks.length - files.length : 0,
+        skipped,
+      };
+    } catch (error) {
+      fail(error);
+      return null;
+    } finally {
+      state.exporting = null;
+      emit();
+    }
+  }
+
+  // Qué trae un paquete y qué pasaría al abrirlo, sin cambiar nada todavía.
+  function summarizePackage(opened) {
+    const manifest = opened.manifest;
+    const used = new Set(manifest.programs.flatMap((entry) => entry.items.map((item) => item.track)));
+    const defs = manifest.tracks.filter((track) => used.has(track.ref));
+    let withAudio = 0;
+    let audioBytes = 0;
+    let reused = 0;
+    let linked = 0;
+    let waiting = 0;
+    for (const def of defs) {
+      const size = opened.audioSize(def);
+      if (size !== null) {
+        if (findLibraryTrack(def.file, size, true)) reused++;
+        else {
+          withAudio++;
+          audioBytes += size;
+        }
+      } else if (findLibraryTrack(def.file, def.size, false)) linked++;
+      else waiting++;
+    }
+    return {
+      kind: opened.kind,
+      fileName: opened.fileName,
+      programs: manifest.programs.map((entry) => ({ name: entry.name, participants: entry.items.length })),
+      participants: manifest.programs.reduce((total, entry) => total + entry.items.length, 0),
+      songs: defs.length,
+      withAudio,
+      audioBytes,
+      reused,
+      linked,
+      waiting,
+      dropped: manifest.dropped,
+      created: manifest.created,
+      hasSettings: Boolean(manifest.settings),
+      hasBindings: Boolean(manifest.settings && manifest.settings.bindings),
+      customBindings: Boolean(state.settings.bindings),
+    };
+  }
+
+  // Abre el archivo elegido (ZIP o JSON) y dice qué trae. Devuelve { opened, summary } o null si no sirve.
+  async function openPackage(file) {
+    try {
+      const opened = await readPackage(file);
+      return { opened, summary: summarizePackage(opened) };
+    } catch (error) {
+      fail(error);
+      return null;
+    }
+  }
+
+  function uniqueProgramName(base, taken) {
+    let name = base;
+    let count = 2;
+    while (taken.has(name.toLowerCase())) name = `${base.slice(0, 54)} (${count++})`;
+    taken.add(name.toLowerCase());
+    return name;
+  }
+
+  // Trae a este dispositivo lo que trae el paquete: guarda las canciones, crea los programas y, si se pide, usa también
+  // los pads y la mezcla del paquete. Lo que ya está en la biblioteca no se duplica; lo que no trae audio queda esperando
+  // su archivo (se vincula por nombre al añadirlo). No interrumpe la música que esté en pausa y no corre mientras suena.
+  async function importPackage(opened, { applySettings = false } = {}) {
+    if (destroyed || !opened || !opened.manifest) return null;
+    if (state.importing || state.exporting) {
+      toast('Espera a que termine lo anterior.');
+      return null;
+    }
+    if (state.transport === 'playing') {
+      toast('Detén la música antes de traer un programa.', 'error');
+      return null;
+    }
+    const manifest = opened.manifest;
+    const used = new Set(manifest.programs.flatMap((entry) => entry.items.map((item) => item.track)));
+    const defs = manifest.tracks.filter((track) => used.has(track.ref));
+    const report = { programs: 0, participants: 0, saved: 0, reused: 0, linked: 0, waiting: 0, damaged: [], failed: [], programIds: [], selected: false };
+    const resolved = new Map();
+    state.importing = { done: 0, total: defs.length, name: '', label: 'Trayendo el programa…' };
+    emit();
+    try {
+      for (const def of defs) {
+        state.importing.name = def.file;
+        emit();
+        let storedId = null;
+        try {
+          const size = opened.audioSize(def);
+          if (size !== null) {
+            const same = findLibraryTrack(def.file, size, true);
+            if (same) {
+              resolved.set(def.ref, same.id);
+              report.reused++;
+            } else {
+              const data = await opened.readAudio(def);
+              const type = def.type || data.type || guessAudioType(def.file);
+              const typed = data.type === type ? data : data.slice(0, data.size, type);
+              let duration = def.duration;
+              if (!duration) {
+                try {
+                  duration = (await probe(new File([typed], def.file, { type }))).duration || 0;
+                } catch {
+                  duration = 0;
+                }
+              }
+              const track = { id: uid(), name: def.name, file: def.file, type, size: typed.size, duration, added: now() };
+              storedId = track.id;
+              await store.put('blobs', { id: track.id, blob: typed });
+              await store.put('tracks', track);
+              state.tracks.push(track);
+              resolved.set(def.ref, track.id);
+              report.saved++;
+            }
+          } else {
+            const same = findLibraryTrack(def.file, def.size, false);
+            if (same) {
+              resolved.set(def.ref, same.id);
+              report.linked++;
+            } else report.waiting++;
+          }
+        } catch (error) {
+          if (storedId) store.remove('blobs', storedId).catch(() => {});
+          if (error && error.code === 'damaged') report.damaged.push(def.file);
+          else report.failed.push(`${def.file}: ${(error && error.message) || 'no se pudo guardar'}`);
+          report.waiting++;
+        }
+        state.importing.done++;
+      }
+
+      const taken = new Set(state.programs.map((entry) => entry.name.toLowerCase()));
+      const defsByRef = new Map(defs.map((def) => [def.ref, def]));
+      const created = manifest.programs.map((spec) => {
+        const items = spec.items.map((entry) => {
+          const def = defsByRef.get(entry.track);
+          const trackId = resolved.get(entry.track) || '';
+          const track = trackOf(trackId);
+          const item = { id: uid(), trackId, label: entry.label, start: entry.start, maxDur: entry.maxDur, gainDb: entry.gainDb };
+          if (track) {
+            if (track.duration) item.start = clamp(item.start, 0, Math.max(0, track.duration - 1));
+          } else {
+            item.want = { name: def.name, file: def.file, size: def.size, duration: def.duration };
+          }
+          return item;
+        });
+        return { id: uid(), name: uniqueProgramName(spec.name, taken), items, created: now(), updated: now() };
+      });
+      for (const entry of created) {
+        state.programs.push(entry);
+        await saveProgram(entry);
+        report.programs++;
+        report.participants += entry.items.length;
+        report.programIds.push(entry.id);
+      }
+
+      if (applySettings && manifest.settings) {
+        const incoming = manifest.settings;
+        if ('fade' in incoming) state.settings.fade = incoming.fade;
+        if ('autoAdvance' in incoming) state.settings.autoAdvance = incoming.autoAdvance;
+        if (incoming.bindings) state.settings.bindings = incoming.bindings;
+        saveSettingsSoon();
+      }
+    } catch (error) {
+      fail(error);
+    } finally {
+      state.importing = null;
+    }
+    // Con la música detenida se abre de una vez el programa que llegó; si está en pausa se deja donde estaba.
+    if (report.programIds.length && state.transport === 'idle') {
+      selectProgram(report.programIds[0]);
+      report.selected = state.programId === report.programIds[0];
+    }
+    emit(true);
+    if (report.programs) {
+      const first = state.programs.find((entry) => entry.id === report.programIds[0]);
+      const saved = report.saved ? ` · ${report.saved === 1 ? '1 canción guardada' : `${report.saved} canciones guardadas`}` : '';
+      const where = report.selected ? '' : ' Elígelo en la lista de programas.';
+      toast(report.programs === 1 ? `Programa «${first.name}» traído: ${report.participants} participantes${saved}.${where}` : `${report.programs} programas traídos: ${report.participants} participantes${saved}.${where}`);
+    }
+    if (report.waiting) toast(report.waiting === 1 ? 'Falta 1 canción. Añádela con «Añadir canciones»: se vincula sola por el nombre del archivo.' : `Faltan ${report.waiting} canciones. Añádelas con «Añadir canciones»: se vinculan solas por el nombre del archivo.`);
+    if (report.damaged.length) toast(report.damaged.length === 1 ? `«${report.damaged[0]}» llegó dañada en el paquete. Vuelve a copiar el paquete.` : `${report.damaged.length} canciones llegaron dañadas en el paquete. Vuelve a copiar el paquete.`, 'error');
+    if (report.failed.length) toast(report.failed.length === 1 ? report.failed[0] : `${report.failed.length} canciones no se pudieron guardar. Primera: ${report.failed[0]}`, 'error');
+    prefetch();
+    preload();
+    return report;
   }
 
   async function removeTrack(trackId) {
@@ -953,6 +1386,7 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
     setTab,
     setLayout,
     live,
+    notify: toast,
     // consultas
     program,
     items: viewItems,
@@ -979,6 +1413,7 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
     setVolume,
     // biblioteca y programas
     importFiles,
+    playableNext,
     removeTrack,
     createProgram,
     selectProgram,
@@ -988,6 +1423,11 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
     removeItem,
     moveItemBy,
     updateItem,
+    // llevar el programa a otra PC
+    previewPackage,
+    exportPackage,
+    openPackage,
+    importPackage,
     // MIDI y teclado
     enableMidi,
     disableMidi,
