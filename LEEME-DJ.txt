@@ -1,0 +1,135 @@
+ESCENA — PESTAÑA DJ 1
+5 de noviembre de 2026
+
+ESTA ENTREGA AÑADE UNA PESTAÑA NUEVA
+Junto a Tocar, Mezcla y Setlist aparece «DJ». Subes canciones sueltas, armas un
+programa (una boda, un desfile, un evento) y cambias de canción con un botón, un
+pad de tu controlador MIDI o una tecla. El cambio es una mezcla suave entre las
+dos canciones, como la hace un DJ: una baja mientras la otra sube, sin corte
+brusco y sin que el volumen total se hunda ni se dispare en medio.
+Es un motor de audio aparte. No toca el motor del multitrack ni tus canciones,
+setlists, claves o usuarios. Los dos nunca suenan a la vez: al iniciar el DJ se
+pausa el multitrack, y al iniciar el multitrack se pausa el DJ.
+
+CÓMO ACTUALIZAR
+1. Descomprime el ZIP.
+2. Copia EL CONTENIDO de actualizacion/ a la raíz del proyecto ESCENA,
+   respetando las rutas y sustituyendo los archivos existentes.
+   Archivos nuevos: www/js/dj.js, dj-engine.js, dj-math.js, dj-midi.js,
+   dj-store.js, dj-mount.js, www/js/ui/dj-view.js, www/css/dj.css, las pruebas
+   tests/dj-core.test.mjs y tests/browser-dj.cjs, y este LEEME.
+   Archivos que ya existían y cambian poco: www/js/main.js, www/js/controls.js,
+   www/js/ui/shell.js, www/js/ui/kit.js (dos iconos nuevos) y package.json
+   (solo las líneas de scripts de prueba; si lo cambiaste hoy, puedes omitirlo,
+   la app no lo necesita).
+3. Publica los cambios en main como de costumbre. GitHub Actions genera la web;
+   scripts/preparar-web.mjs incluye solos los archivos nuevos para el uso sin
+   conexión. Este ZIP no publicó el sitio ni contiene instaladores.
+4. Cuando termine la publicación, aplica el aviso «Hay una versión nueva de
+   Escena» (o cierra todas las pestañas de ESCENA y vuelve a abrir). Debe
+   aparecer «DJ», con un disco, a la derecha de Setlist.
+5. En una app EXE/APK/DMG instala la nueva compilación generada; publicar la web
+   no sustituye un instalador antiguo.
+6. No hace falta actualizar el Worker ni borrar datos del navegador. Las
+   canciones del DJ se guardan en este dispositivo, en una base aparte.
+
+CÓMO ARMAR UNA BODA O UN DESFILE
+1. DJ > Programa > «Añadir canciones». Puedes elegir muchas a la vez o
+   arrastrarlas a la pantalla. Entran ordenadas por nombre: si las llamas
+   «01 …», «02 …», «03 …» quedan en ese orden. Se guardan en este dispositivo y
+   suenan sin internet.
+2. Cada fila es un participante o un momento. Con ⋯ le pones nombre («Entrada de
+   los novios», «Madrina Rosa»), «Empieza en» (para saltar la introducción),
+   «Dura como máximo» (a ese tiempo pasa a la siguiente) y un volumen propio por
+   si una canción suena más fuerte que las demás. ▲ ▼ cambian el orden.
+3. «Mezcla entre canciones»: Corte, 2 s, 4 s, 8 s, o cualquier valor de 0 a 12 s.
+4. «Siguiente» mezcla con la que sigue. «Anterior» vuelve a la anterior. Tocar un
+   nombre lo marca como «SIGUE» (queda cargado y listo). ▶ de una fila la mezcla
+   ahora mismo. En la vista «Pads» cada participante es un botón grande: un
+   toque y entra, sin importar el orden.
+5. «Avance automático» (opcional): cuando se cumple el tiempo máximo del
+   participante, o termina su canción, pasa solo a la siguiente mezclando.
+6. «Parar con fade» baja la música despacio. «Pánico» la corta de inmediato.
+7. La pantalla muestra «AHORA» y «SIGUE» con el tiempo que falta. Mientras el DJ
+   suena se pide al navegador que no apague la pantalla.
+8. Si pulsas varias veces seguidas, manda la última orden: la mezcla en curso se
+   reacomoda sin saltos de volumen. Pulsar el pad de la canción que ya suena no
+   la reinicia.
+
+MIDI Y TECLADO
+1. DJ > MIDI > «Activar MIDI» y acepta el permiso del navegador. Funciona en
+   Chrome, Edge y Opera (computadora y Android) y en la app de escritorio.
+   Safari y el iPhone/iPad no tienen MIDI web: allí usa toques o teclado.
+2. Junto a cada acción pulsa «Asignar» y luego el botón, pad o tecla que quieras:
+   Siguiente, Anterior, Reproducir/pausa, Parar con fade, Pánico y Volumen
+   (perilla o fader). Funciona con cualquier controlador; la pantalla muestra la
+   última señal recibida para comprobar que llega.
+3. Pads de los participantes: «Pulsar el pad 1 y seguir solo» reparte los demás
+   con las notas siguientes (36, 37, 38…), o «Asignar en orden» te pide un pad
+   por participante. Cada fila muestra su pad («Nota 36»).
+4. La perilla de volumen no da saltos: no cambia nada hasta que su posición
+   alcanza el volumen actual.
+5. Teclado por omisión: Espacio = reproducir/pausa, → o Av Pág = siguiente,
+   ← o Re Pág = anterior, 1 a 9 = participantes 1 a 9. Se pueden cambiar.
+6. Mientras estás en la pestaña DJ, las teclas y el MIDI del multitrack se apartan
+   para no pisarse; al volver a Tocar, Mezcla o Setlist funcionan como siempre.
+   Los controles del DJ solo responden dentro de la pestaña DJ.
+
+ANTES DE UN EVENTO
+Abre Escena con internet para que renueve la autorización sin conexión: el DJ
+respeta el mismo bloqueo de acceso que el resto de Escena y, si la autorización
+vence o se revoca, se pausa hasta renovarla. Prueba con los parlantes del lugar,
+con la pantalla encendida y Escena a la vista (ver límites). Con audífonos o
+parlantes Bluetooth el sonido llega más tarde; para el escenario usa cable.
+Conviene hacer un ensayo con dos canciones y tu controlador antes del evento.
+
+DETALLE DE PANTALLA EN TELÉFONO
+El botón flotante ♪ del cifrado (ya existía) quedaba sobre la barra inferior y
+con cuatro pestañas habría tapado «DJ». En teléfono y tableta vertical ahora se
+sube justo encima de la barra, y se oculta dentro de la pestaña DJ para no
+tocarlo sin querer durante un evento. En el resto no cambia.
+
+VALIDACIÓN Y LÍMITES
+32 pruebas automatizadas del DJ aprobadas (curvas de mezcla, tiempos, limitador,
+asignación MIDI y teclado, orden y duración de los participantes).
+23 pruebas de navegador aprobadas en Chrome 153 real, con canciones sintéticas y
+midiendo el audio que sale del motor, no solo el estado de la pantalla:
+ - Mezcla de 3 s: la que sale y la que entra siguen una curva de potencia
+   constante (potencia total medida entre 0.95 y 1.00; 1.00 = constante).
+ - Cambio de idea a mitad de la mezcla: sin saltos de volumen.
+ - Corte directo sin chasquidos; pausa, reanudación, parar con fade y pánico.
+ - Limitador de seguridad: con dos canciones al 95 % mezcladas y el volumen al
+   máximo, el pico de salida fue 0.974 (nunca pasa de 1.000).
+ - Avance automático: con tiempo máximo de 5 s y mezcla de 2 s, empezó a los 3.1 s.
+ - MIDI simulado: asignar botones, pads de participantes y perilla de volumen.
+ - Las canciones guardadas siguen tras recargar y suenan con la red cortada.
+ - DJ y multitrack no suenan a la vez; la pérdida de autorización pausa el DJ.
+ - Teléfono de 390 px: sin desplazamiento lateral, con Siguiente y Pánico a la
+   vista y la pestaña DJ tocable.
+Todo se repitió con la regla normal de Chrome para el audio (solo suena después
+de tocar la página) y desde una copia limpia de tu proyecto con este ZIP aplicado.
+Tiempo medido en el navegador: con la canción ya preparada, la orden llega al
+motor en milisegundos y el sonido apareció en la salida del navegador a unos
+75 ms de la pulsación (medido con una ventana de análisis de unos 93 ms, así que
+el tiempo real es igual o menor). Escena prepara la siguiente y la que sigue a
+ella mientras suena; una canción que no estaba preparada puede tardar más según
+el dispositivo.
+Las pruebas que ya tenía Escena dieron lo mismo con y sin este cambio: los
+scripts de audio y las 56 de acceso/nube aprobados, y cuatro de las cinco pruebas
+de navegador. Dos hallazgos que ya estaban antes y no se tocaron:
+scripts/test-stream-player.mjs falla 19 de 30 con tu versión original (llama a
+funciones como player.warmWaveform que no existen en el código actual) y
+tests/browser-cloud-view.cjs marca 7 de 8 por un 404 del favicon en su servidor
+de prueba al usar Chrome real.
+
+NO SE PROBÓ: un controlador MIDI físico (el MIDI se simuló con un puerto falso
+que manda los mismos mensajes), parlantes ni la latencia real de tu tarjeta de
+audio, Safari/iPhone, las apps EXE/APK/DMG ni un bloqueo real de autorización
+desde la nube (se simuló la orden de bloqueo).
+NO INCLUYE: ajuste de tempo ni sincronía de compases (beatmatching), efectos ni
+un crossfader manual: la mezcla se hace sola con la duración elegida, y lo
+manual es el volumen general. Cada canción suena a su velocidad original.
+Mantén Escena visible con la pantalla encendida: un navegador que mande la
+ventana a segundo plano puede retrasar los temporizadores (el avance automático
+podría moverse hasta un segundo) y en iPhone bloquear la pantalla puede cortar
+el audio.

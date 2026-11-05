@@ -60,6 +60,9 @@ const midi = {
 
 let learning = null;
 let lookup = new Map();
+// Mientras la pestaña DJ está a la vista, los controles del multitrack se apartan para no pisarse
+// (las teclas y los pads del DJ valen para otra cosa). Aprender un control sigue funcionando.
+let suspended = false;
 
 function currentBindings() {
   return app.settings.bindings || DEFAULT_BINDINGS;
@@ -100,6 +103,7 @@ function fire(trigger) {
     done(trigger);
     return true;
   }
+  if (suspended) return false;
   const action = lookup.get(trigger);
   if (!action) return false;
   bus.emit('trigger', action, trigger);
@@ -117,6 +121,7 @@ function onKeyDown(event) {
     if (!event.repeat) fire(trigger);
     return;
   }
+  if (suspended) return;
   if (typing(event.target) || document.querySelector('.modal-layer')) return;
   if (!lookup.has(trigger)) return;
   event.preventDefault();
@@ -124,7 +129,7 @@ function onKeyDown(event) {
 }
 
 function onKeyUp(event) {
-  if (learning || typing(event.target) || document.querySelector('.modal-layer')) return;
+  if (learning || suspended || typing(event.target) || document.querySelector('.modal-layer')) return;
   if (lookup.has(keyTrigger(event))) event.preventDefault();
 }
 
@@ -139,7 +144,7 @@ function onMidi(message) {
     const now = performance.now();
     midi.last.set(key, { value: second, time: now });
     if (second >= 64 && (previous.value < 64 || (second === previous.value && now - previous.time > 400))) fire(`m:cc:${first}`);
-  } else if (type === 0xc0 && app.settings.midiProgramChange && !learning) {
+  } else if (type === 0xc0 && app.settings.midiProgramChange && !learning && !suspended) {
     app.goToSetlistIndex(first);
   }
 }
@@ -159,6 +164,12 @@ export const controls = {
   midi,
   get learning() {
     return Boolean(learning);
+  },
+  get suspended() {
+    return suspended;
+  },
+  setSuspended(flag) {
+    suspended = Boolean(flag);
   },
   init() {
     rebuild();

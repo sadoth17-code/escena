@@ -1,0 +1,899 @@
+// Pantalla de la pestaña DJ: "Ahora / Sigue", botones grandes, programa de participantes, canciones y MIDI.
+// Solo dibuja y llama al controlador (dj.js); no toca el audio.
+
+import { h, clamp, fmtBytes } from '../util.js';
+import { icon, iconButton, openModal, confirmDialog, promptDialog, createRange, createSwitch, createSegmented, setText, setClass, dbLabel } from './kit.js';
+import { fmtClock, parseClock, itemEnd } from '../dj-math.js';
+import { ACTIONS, CONTINUOUS, describeTrigger, isKeyTrigger, shortTrigger } from '../dj-midi.js';
+
+const STYLE_ID = 'dj-styles';
+
+function ensureStyles() {
+  if (document.getElementById(STYLE_ID)) return;
+  document.head.append(h('link', { id: STYLE_ID, rel: 'stylesheet', href: new URL('../../css/dj.css', import.meta.url).href }));
+}
+
+const fadeText = (seconds) => (seconds <= 0 ? 'corte' : `${Number.isInteger(seconds) ? seconds : seconds.toFixed(1)} s`);
+const plural = (count, one, many) => `${count} ${count === 1 ? one : many}`;
+const STATUS_TEXT = { ready: 'Lista', loading: 'Preparando…', cold: 'Se carga al pulsar', missing: 'Falta el archivo', none: '' };
+
+export function createDjView({ dj }) {
+  ensureStyles();
+  const state = dj.state;
+  let active = false;
+  let raf = 0;
+  let paintQueued = 0;
+  let mixingNow = false;
+  const signatures = new Map();
+
+  // Vuelve a dibujar una zona solo si lo que muestra cambió de verdad (así no se pierde el foco ni se corta un toque).
+  const refresh = (name, signature, build) => {
+    if (signatures.get(name) === signature) return false;
+    signatures.set(name, signature);
+    build();
+    return true;
+  };
+
+  // ------------------------------------------------------------ avisos arriba
+
+  const banners = h('div', { class: 'dj-banners', role: 'status', 'aria-live': 'polite' });
+
+  function renderBanners() {
+    const learning = state.learning;
+    const importing = state.importing;
+    const signature = [state.audioBlocked, state.storage, learning && learning.label, importing && `${importing.done}/${importing.total}/${importing.name}`].join('|');
+    refresh('banners', signature, () => {
+      const list = [];
+      if (learning) {
+        list.push(
+          h(
+            'div',
+            { class: 'dj-banner is-learn', 'data-banner': 'learn' },
+            icon('keyboard', 20),
+            h('b', { text: learning.label }),
+            h('button', { type: 'button', class: 'btn small', onClick: () => dj.cancelLearn() }, 'Cancelar')
+          )
+        );
+      }
+      if (state.audioBlocked) {
+        list.push(
+          h(
+            'button',
+            { type: 'button', class: 'dj-banner is-warn', 'data-banner': 'audio', onClick: () => dj.activateAudio() },
+            icon('speaker', 20),
+            h('b', { text: 'El navegador tiene el audio en pausa. Toca aquí para activarlo.' })
+          )
+        );
+      }
+      if (importing) {
+        list.push(
+          h(
+            'div',
+            { class: 'dj-banner is-info', 'data-banner': 'import' },
+            h('span', { class: 'spinner' }),
+            h('b', { text: `Añadiendo canciones… ${importing.done} de ${importing.total}` }),
+            h('span', { class: 'dj-banner-sub', text: importing.name })
+          )
+        );
+      }
+      if (state.storage === 'memory') {
+        list.push(h('div', { class: 'dj-banner is-warn', 'data-banner': 'memory' }, icon('info', 20), h('b', { text: 'Este navegador no deja guardar las canciones: se perderán al cerrar la ventana.' })));
+      }
+      banners.replaceChildren(...list);
+    });
+  }
+
+  // ------------------------------------------------------------ AHORA
+
+  const nowChip = h('span', { class: 'dj-chip' });
+  const nowTitle = h('div', { class: 'dj-title' });
+  const nowSub = h('div', { class: 'dj-sub' });
+  const elapsedEl = h('span', { class: 'dj-elapsed', text: '0:00' });
+  const leftEl = h('span', { class: 'dj-left' });
+  const barFill = h('i', { class: 'dj-bar-fill' });
+  const barZone = h('i', { class: 'dj-bar-zone' });
+  const meterFill = h('i', { class: 'dj-meter-fill' });
+  const nowCard = h(
+    'section',
+    { class: 'dj-card dj-now', 'aria-label': 'Ahora suena' },
+    h('div', { class: 'dj-card-head' }, h('span', { class: 'dj-tag', text: 'Ahora' }), nowChip),
+    nowTitle,
+    nowSub,
+    h('div', { class: 'dj-clock' }, elapsedEl, leftEl),
+    h('div', { class: 'dj-bar', role: 'progressbar', 'aria-label': 'Avance de la canción' }, barZone, barFill),
+    h('div', { class: 'dj-meter', 'aria-hidden': 'true' }, meterFill)
+  );
+
+  // ------------------------------------------------------------ SIGUE
+
+  const nextDot = h('i', { class: 'dj-dot none' });
+  const nextState = h('span', { class: 'dj-state' });
+  const nextTitle = h('div', { class: 'dj-title is-small' });
+  const nextSub = h('div', { class: 'dj-sub' });
+  const nextCard = h(
+    'section',
+    { class: 'dj-card dj-next', 'aria-label': 'Sigue' },
+    h('div', { class: 'dj-card-head' }, h('span', { class: 'dj-tag is-amber', text: 'Sigue' }), h('span', { class: 'dj-readiness' }, nextDot, nextState)),
+    nextTitle,
+    nextSub
+  );
+
+  // ------------------------------------------------------------ botones de mando
+
+  const btnPrev = h('button', { type: 'button', class: 'dj-round', 'data-act': 'prev', 'aria-label': 'Anterior (mezcla)', title: 'Anterior (mezcla)', onClick: () => dj.prev() }, icon('skipPrev', 26));
+  const playIcon = h('span', { class: 'dj-play-icon' });
+  const btnPlay = h('button', { type: 'button', class: 'dj-round is-big', 'data-act': 'playPause', onClick: () => dj.playPause() }, playIcon);
+  const nextBtnSub = h('span', { class: 'dj-next-sub' });
+  const btnNext = h('button', { type: 'button', class: 'dj-next-btn', 'data-act': 'next', onClick: () => dj.next() }, h('span', { class: 'dj-next-main' }, h('b', { text: 'Siguiente' }), nextBtnSub), icon('skipNext', 30));
+  const btnStop = h('button', { type: 'button', class: 'btn dj-wide', 'data-act': 'stopFade', onClick: () => dj.stopFade() }, icon('stop', 18), 'Parar con fade');
+  const btnPanic = h('button', { type: 'button', class: 'btn danger dj-wide', 'data-act': 'panic', onClick: () => dj.panic() }, icon('close', 18), 'Pánico');
+  const transport = h('div', { class: 'dj-transport' }, h('div', { class: 'dj-t-main' }, btnPrev, btnPlay, btnNext), h('div', { class: 'dj-t-sub' }, btnStop, btnPanic));
+
+  // ------------------------------------------------------------ mezcla, volumen y avance automático
+
+  const fadeRange = createRange({
+    min: 0,
+    max: 12,
+    step: 0.5,
+    value: state.settings.fade,
+    label: 'Duración de la mezcla',
+    format: (value) => (value <= 0 ? 'Corte' : fadeText(value)),
+    onInput: (value) => dj.setFade(value),
+  });
+  const presets = [0, 2, 4, 8].map((seconds) =>
+    h(
+      'button',
+      {
+        type: 'button',
+        class: 'dj-preset',
+        'data-seconds': String(seconds),
+        onClick: () => {
+          fadeRange.set(seconds);
+          dj.setFade(seconds);
+        },
+      },
+      seconds === 0 ? 'Corte' : `${seconds} s`
+    )
+  );
+  const volumeRange = createRange({
+    min: 0,
+    max: 100,
+    step: 1,
+    value: Math.round(state.settings.volume * 100),
+    label: 'Volumen general',
+    format: (value) => `${dbLabel(value / 100)} dB`,
+    onInput: (value) => dj.setVolume(value / 100),
+  });
+  const pickupHint = h('div', { class: 'dj-hint is-warn', hidden: true });
+  const autoSwitch = createSwitch({ value: state.settings.autoAdvance, label: 'Avance automático', onChange: (value) => dj.setAutoAdvance(value) });
+
+  const controls = h(
+    'section',
+    { class: 'dj-card dj-controls', 'aria-label': 'Mezcla y volumen' },
+    h('div', { class: 'dj-field' }, h('div', { class: 'dj-field-head' }, h('span', { class: 'dj-label', text: 'Mezcla entre canciones' }), h('div', { class: 'dj-presets' }, presets)), fadeRange.el),
+    h('div', { class: 'dj-field' }, h('div', { class: 'dj-field-head' }, h('span', { class: 'dj-label', text: 'Volumen' })), volumeRange.el, pickupHint),
+    h(
+      'div',
+      { class: 'dj-switch-row' },
+      h('div', { class: 'dj-switch-text' }, h('strong', { text: 'Avance automático' }), h('span', { text: 'Pasa solo a la siguiente cuando termina el tiempo de cada participante (o la canción).' })),
+      autoSwitch.el
+    )
+  );
+
+  const deck = h('div', { class: 'dj-deck' }, nowCard, nextCard, transport, controls);
+
+  // ------------------------------------------------------------ trabajo: programa / canciones / MIDI
+
+  const fileInput = h('input', { type: 'file', class: 'dj-file', multiple: true, accept: 'audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg,.oga,.opus,.aif,.aiff', 'aria-label': 'Elegir canciones', tabindex: '-1' });
+  let addToProgram = true;
+  fileInput.addEventListener('change', () => {
+    const files = Array.from(fileInput.files || []);
+    fileInput.value = '';
+    if (files.length) dj.importFiles(files, { addToProgram });
+  });
+  const pickFiles = (toProgram) => {
+    addToProgram = toProgram;
+    fileInput.click();
+  };
+
+  const tabs = createSegmented({
+    options: [
+      { value: 'program', label: 'Programa', icon: 'list' },
+      { value: 'library', label: 'Canciones', icon: 'music' },
+      { value: 'midi', label: 'MIDI', icon: 'keyboard' },
+    ],
+    value: state.settings.tab,
+    label: 'Sección',
+    className: 'dj-tabs',
+    onChange: (value) => dj.setTab(value),
+  });
+  const workBody = h('div', { class: 'dj-work-body' });
+  const work = h('section', { class: 'dj-work', 'aria-label': 'Programa, canciones y MIDI' }, tabs.el, workBody);
+
+  // ------------------------------------------------------------ participantes: filas y pads
+
+  const triggersOf = (slot) => (slot ? dj.effectiveBindings()[slot] || [] : []);
+
+  function padBadge(item) {
+    const list = triggersOf(item.slot);
+    const midi = list.find((trigger) => !isKeyTrigger(trigger));
+    const shown = midi || list.find(isKeyTrigger);
+    if (!shown) return null;
+    return h('span', { class: `dj-badge${midi ? ' is-midi' : ''}`, title: list.map(describeTrigger).join(' · '), text: shortTrigger(shown) });
+  }
+
+  function itemSub(item) {
+    const parts = [item.trackName];
+    if (item.trackDuration) parts.push(fmtClock(item.trackDuration));
+    if (item.start > 0) parts.push(`desde ${fmtClock(item.start)}`);
+    if (item.maxDur > 0) parts.push(`máx. ${fmtClock(item.maxDur)}`);
+    if (item.gainDb) parts.push(`${item.gainDb > 0 ? '+' : ''}${item.gainDb} dB`);
+    return parts.join(' · ');
+  }
+
+  function buildRow(item) {
+    return h(
+      'div',
+      { class: `dj-row${item.missing ? ' is-missing' : ''}`, 'data-id': item.id },
+      h('span', { class: 'dj-num' }, h('b', { text: String(item.number) }), h('i', { class: 'dj-dot none' })),
+      h(
+        'button',
+        { type: 'button', class: 'dj-row-body', title: 'Marcar como la que sigue', onClick: () => dj.cue(item.id) },
+        h('span', { class: 'dj-row-title', text: item.title }),
+        h('span', { class: 'dj-row-sub', text: itemSub(item) })
+      ),
+      padBadge(item),
+      h('span', { class: 'dj-tagline', text: 'SIGUE' }),
+      h('button', { type: 'button', class: 'dj-icon-btn is-up', 'aria-label': `Subir: ${item.title}`, title: 'Subir', onClick: () => dj.moveItemBy(item.id, -1) }, icon('up', 18)),
+      h('button', { type: 'button', class: 'dj-icon-btn is-down', 'aria-label': `Bajar: ${item.title}`, title: 'Bajar', onClick: () => dj.moveItemBy(item.id, 1) }, icon('down', 18)),
+      h('button', { type: 'button', class: 'dj-icon-btn is-play', 'data-act': 'jump', 'aria-label': `Poner ahora: ${item.title}`, title: 'Poner ahora (con mezcla)', onClick: () => dj.jump(item.id) }, icon('play', 20)),
+      h('button', { type: 'button', class: 'dj-icon-btn', 'aria-label': `Editar: ${item.title}`, title: 'Editar', onClick: () => openItemEditor(item.id) }, icon('more', 20))
+    );
+  }
+
+  function buildPad(item) {
+    return h(
+      'button',
+      { type: 'button', class: `dj-pad${item.missing ? ' is-missing' : ''}`, 'data-id': item.id, 'data-act': 'jump', title: itemSub(item), onClick: () => dj.jump(item.id) },
+      h('span', { class: 'dj-pad-top' }, h('b', { text: String(item.number) }), h('i', { class: 'dj-dot none' })),
+      h('span', { class: 'dj-pad-name', text: item.title }),
+      padBadge(item)
+    );
+  }
+
+  // Estado de cada fila o pad (suena / sigue / marcada / lista) sin volver a crear nada: los toques no se pierden.
+  function patchProgram() {
+    const items = dj.items();
+    const next = dj.nextItem();
+    const nextId = next ? next.id : null;
+    const byId = new Map(items.map((item) => [item.id, item]));
+    for (const el of workBody.querySelectorAll('.dj-row[data-id], .dj-pad[data-id]')) {
+      const item = byId.get(el.dataset.id);
+      if (!item) continue;
+      setClass(el, 'is-now', item.id === state.nowId);
+      setClass(el, 'is-next', item.id === nextId);
+      setClass(el, 'is-cued', item.id === state.cueId);
+      const status = dj.itemStatus(item);
+      const dot = el.querySelector('.dj-dot');
+      if (dot && dot.__s !== status) {
+        dot.__s = status;
+        dot.className = `dj-dot ${status}`;
+      }
+    }
+  }
+
+  function emptyProgram() {
+    return h(
+      'div',
+      { class: 'dj-empty' },
+      icon('disc', 40),
+      h('h3', { text: 'Arma tu programa' }),
+      h('p', { text: 'Añade las canciones de la boda, el desfile o el evento. Cada una es un participante o un momento: la mezcla entre ellas es suave, como la de un DJ.' }),
+      h(
+        'ol',
+        { class: 'dj-steps' },
+        h('li', { text: 'Añade las canciones (puedes elegir muchas a la vez).' }),
+        h('li', { text: 'Ponles el nombre del participante y, si quieres, desde qué segundo empiezan y cuánto duran.' }),
+        h('li', { text: 'Conecta tu controlador en la pestaña MIDI y asigna Siguiente y los pads.' })
+      ),
+      h('button', { type: 'button', class: 'btn primary big', 'data-act': 'add', onClick: () => pickFiles(true) }, icon('plus', 20), 'Añadir canciones')
+    );
+  }
+
+  function renderProgram() {
+    const items = dj.items();
+    const program = dj.program();
+    const signature = ['program', state.structure, state.programId, state.settings.layout].join('|');
+    refresh('work', signature, () => {
+      const select = h(
+        'select',
+        { class: 'select dj-program-select', 'aria-label': 'Programa' },
+        state.programs.map((entry) => h('option', { value: entry.id, text: entry.name, selected: entry.id === state.programId }))
+      );
+      select.addEventListener('change', () => dj.selectProgram(select.value));
+      const layout = createSegmented({
+        options: [
+          { value: 'list', label: 'Lista', icon: 'list' },
+          { value: 'pads', label: 'Pads', icon: 'pads' },
+        ],
+        value: state.settings.layout,
+        label: 'Vista',
+        onChange: (value) => dj.setLayout(value),
+      });
+      const head = h(
+        'div',
+        { class: 'dj-program-head' },
+        select,
+        h(
+          'div',
+          { class: 'dj-program-tools' },
+          iconButton({ name: 'plus', label: 'Programa nuevo', onClick: newProgram }),
+          iconButton({ name: 'edit', label: 'Cambiar el nombre del programa', onClick: renameProgram }),
+          iconButton({ name: 'trash', label: 'Borrar el programa', onClick: deleteProgram })
+        )
+      );
+      const actions = h('div', { class: 'dj-program-actions' }, h('button', { type: 'button', class: 'btn primary', 'data-act': 'add', onClick: () => pickFiles(true) }, icon('plus', 18), 'Añadir canciones'), layout.el);
+      let body;
+      let hint = null;
+      if (!items.length) body = emptyProgram();
+      else if (state.settings.layout === 'pads') {
+        body = h('div', { class: 'dj-pads' }, items.map(buildPad));
+        hint = 'Toca un pad para mezclar a ese participante al instante.';
+      } else {
+        body = h('div', { class: 'dj-list' }, items.map(buildRow));
+        hint = 'Toca un nombre para marcarlo como «Sigue» (queda cargado y listo). El botón ▶ lo mezcla ahora.';
+      }
+      workBody.replaceChildren(...[head, actions, hint ? h('p', { class: 'dj-hint' }, hint) : null, body].filter(Boolean));
+      if (program) workBody.dataset.program = program.id;
+    });
+    patchProgram();
+  }
+
+  // ------------------------------------------------------------ canciones
+
+  function renderLibrary() {
+    const signature = ['library', state.structure, state.tracks.length, state.programs.length].join('|');
+    refresh('work', signature, () => {
+      const usage = new Map();
+      for (const program of state.programs) for (const item of program.items) usage.set(item.trackId, (usage.get(item.trackId) || 0) + 1);
+      const storage = h('p', { class: 'dj-hint' });
+      dj.estimate()
+        .then((estimate) => {
+          if (estimate && estimate.quota) storage.textContent = `Espacio usado en este dispositivo: ${fmtBytes(estimate.usage)} de ${fmtBytes(estimate.quota)} disponibles.`;
+        })
+        .catch(() => {});
+      const head = h('div', { class: 'dj-program-actions' }, h('button', { type: 'button', class: 'btn primary', 'data-act': 'add', onClick: () => pickFiles(false) }, icon('upload', 18), 'Añadir canciones'));
+      const rows = state.tracks.map((track) =>
+        h(
+          'div',
+          { class: 'dj-row is-library', 'data-track': track.id },
+          h('span', { class: 'dj-num' }, icon('music', 18)),
+          h(
+            'div',
+            { class: 'dj-row-body is-static' },
+            h('span', { class: 'dj-row-title', text: track.name }),
+            h('span', { class: 'dj-row-sub', text: [track.duration ? fmtClock(track.duration) : null, fmtBytes(track.size), usage.get(track.id) ? `en ${plural(usage.get(track.id), 'participante', 'participantes')}` : 'sin usar'].filter(Boolean).join(' · ') })
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              class: 'dj-icon-btn',
+              'aria-label': `Añadir al programa: ${track.name}`,
+              title: 'Añadir al programa actual',
+              onClick: () => {
+                dj.addItem(track.id);
+                dj.setTab('program');
+              },
+            },
+            icon('plus', 20)
+          ),
+          h('button', { type: 'button', class: 'dj-icon-btn', 'aria-label': `Borrar: ${track.name}`, title: 'Borrar de la biblioteca', onClick: () => removeTrack(track) }, icon('trash', 20))
+        )
+      );
+      const body = rows.length
+        ? h('div', { class: 'dj-list' }, rows)
+        : h('div', { class: 'dj-empty' }, icon('music', 40), h('h3', { text: 'Todavía no hay canciones' }), h('p', { text: 'Añade archivos MP3, WAV, M4A o FLAC. También puedes arrastrarlos a esta pantalla. Quedan guardados en este dispositivo y funcionan sin internet.' }));
+      workBody.replaceChildren(head, body, storage);
+    });
+  }
+
+  // ------------------------------------------------------------ MIDI
+
+  const monitor = h('div', { class: 'dj-monitor', 'aria-live': 'off' });
+  const updateMonitor = () => {
+    setText(monitor, state.midi.last || 'Todavía no llegó ninguna señal. Pulsa un pad o mueve una perilla.');
+    setClass(monitor, 'is-idle', !state.midi.last);
+    const waiting = state.midi.pickup !== null && state.midi.pickup !== undefined;
+    pickupHint.hidden = !waiting;
+    if (waiting) setText(pickupHint, `Mueve la perilla hasta el volumen actual para tomar el control (está en ${Math.round(state.midi.pickup * 100)}%).`);
+  };
+
+  function chips(action) {
+    const list = dj.effectiveBindings()[action] || [];
+    return list.map((trigger) =>
+      h(
+        'span',
+        { class: `dj-chiptag${isKeyTrigger(trigger) ? ' is-key' : ' is-midi'}` },
+        h('span', { text: describeTrigger(trigger) }),
+        h('button', { type: 'button', class: 'dj-chip-x', 'aria-label': `Quitar ${describeTrigger(trigger)}`, title: 'Quitar', onClick: () => dj.unassign(action, trigger) }, icon('close', 14))
+      )
+    );
+  }
+
+  function midiStatusBlock() {
+    const status = state.midi.status;
+    const inputs = state.midi.inputs;
+    if (!state.midi.supported || status === 'unsupported') {
+      return h(
+        'div',
+        { class: 'notice info' },
+        icon('info', 22),
+        h('div', {}, h('b', { text: 'Este navegador no permite controladores MIDI' }), h('p', { text: 'Funciona en Chrome o Edge (computador o Android) y en Firefox. No existe en Safari ni en iPhone/iPad. Mientras tanto puedes usar la pantalla y el teclado.' }))
+      );
+    }
+    if (status === 'ready') {
+      return h(
+        'div',
+        { class: 'dj-midi-status is-ok' },
+        h('div', {}, h('b', { text: inputs.length ? `Conectado: ${inputs.join(', ')}` : 'MIDI activado, pero no veo ningún controlador' }), inputs.length ? null : h('p', { class: 'dj-hint', text: 'Conéctalo por USB (o Bluetooth) y enciéndelo. Si no aparece, desconéctalo y vuelve a conectarlo.' })),
+        h('button', { type: 'button', class: 'btn small', onClick: () => dj.disableMidi() }, 'Desactivar')
+      );
+    }
+    if (status === 'denied') {
+      return h(
+        'div',
+        { class: 'notice warn' },
+        icon('info', 22),
+        h(
+          'div',
+          {},
+          h('b', { text: 'El navegador bloqueó el MIDI' }),
+          h('p', { text: 'Toca el candado junto a la dirección de la página, permite «Dispositivos MIDI» y vuelve a pulsar Activar.' }),
+          h('button', { type: 'button', class: 'btn small', onClick: () => dj.enableMidi() }, 'Activar MIDI')
+        )
+      );
+    }
+    return h(
+      'div',
+      { class: 'dj-midi-status' },
+      h('div', {}, h('b', { text: status === 'asking' ? 'Esperando el permiso del navegador…' : 'MIDI apagado' }), h('p', { class: 'dj-hint', text: 'Actívalo para usar los pads, botones, perillas y faders de tu controlador.' })),
+      h('button', { type: 'button', class: 'btn primary', 'data-act': 'midi-on', disabled: status === 'asking', onClick: () => dj.enableMidi() }, icon('keyboard', 18), 'Activar MIDI')
+    );
+  }
+
+  function actionRow(action) {
+    const learningThis = Boolean(state.learning && state.learning.action === action.id);
+    return h(
+      'div',
+      { class: `dj-map-row${learningThis ? ' is-learning' : ''}`, 'data-action': action.id },
+      h('div', { class: 'dj-map-name' }, h('b', { text: action.name }), h('span', { text: action.detail })),
+      h('div', { class: 'dj-map-chips' }, chips(action.id)),
+      h(
+        'button',
+        { type: 'button', class: `btn small${learningThis ? ' primary' : ''}`, 'data-act': 'learn', onClick: () => (learningThis ? dj.cancelLearn() : dj.learn(action.id)) },
+        learningThis ? 'Esperando…' : CONTINUOUS.has(action.id) ? 'Asignar perilla' : 'Asignar'
+      )
+    );
+  }
+
+  function renderMidi() {
+    const signature = ['midi', state.structure, state.midi.status, state.midi.inputs.join(','), state.learning && state.learning.action, dj.items().length].join('|');
+    refresh('work', signature, () => {
+      const total = dj.items().length;
+      const pads = h(
+        'div',
+        { class: 'dj-pads-box' },
+        h('h4', { class: 'sub', text: 'Pads de los participantes' }),
+        h('p', {
+          class: 'dj-hint',
+          text: total
+            ? `Cada pad lleva a un participante del programa (${plural(total, 'participante', 'participantes')}): el pad 1 al primero, el 2 al segundo… Al pulsarlo la música mezcla a esa canción. Con el teclado ya funcionan las teclas 1 a 9.`
+            : 'Primero añade canciones al programa y luego asigna un pad a cada participante.',
+        }),
+        h(
+          'div',
+          { class: 'dj-pads-actions' },
+          h('button', { type: 'button', class: 'btn', 'data-act': 'learn-slots', disabled: !total, onClick: () => dj.learnSlots(1) }, icon('pads', 18), 'Asignar en orden'),
+          h('button', { type: 'button', class: 'btn', 'data-act': 'learn-notes', disabled: !total, onClick: () => dj.learnSlotsByNote() }, icon('music', 18), 'Pulsar el pad 1 y seguir solo'),
+          h('button', { type: 'button', class: 'btn', onClick: () => dj.clearPads() }, 'Quitar los pads')
+        ),
+        h('p', { class: 'dj-hint', text: '«Asignar en orden» te pide un pad para cada participante. «Pulsar el pad 1» sirve si tus pads mandan notas consecutivas: pulsas el primero y el resto se reparte solo.' })
+      );
+      workBody.replaceChildren(
+        midiStatusBlock(),
+        h('div', { class: 'dj-monitor-box' }, h('span', { class: 'dj-label', text: 'Última señal recibida' }), monitor),
+        h('h4', { class: 'sub', text: 'Botones' }),
+        h('div', { class: 'dj-map' }, ACTIONS.map(actionRow)),
+        pads,
+        h('div', { class: 'dj-keys-help' }, h('b', { text: 'Teclado: ' }), 'Espacio = reproducir/pausa · → o Av Pág = siguiente · ← o Re Pág = anterior · 1 a 9 = participantes 1 a 9.'),
+        h('button', { type: 'button', class: 'btn small', onClick: resetBindings }, 'Restablecer todas las asignaciones')
+      );
+      updateMonitor();
+    });
+  }
+
+  function renderWork() {
+    const tab = state.settings.tab;
+    if (tab === 'library') renderLibrary();
+    else if (tab === 'midi') renderMidi();
+    else renderProgram();
+    tabs.set(tab);
+  }
+
+  // ------------------------------------------------------------ diálogos
+
+  async function newProgram() {
+    const name = await promptDialog({ title: 'Programa nuevo', label: 'Nombre (boda, desfile, cumpleaños…)', value: `Programa ${state.programs.length + 1}`, confirm: 'Crear' });
+    if (name) dj.createProgram(name);
+  }
+
+  async function renameProgram() {
+    const program = dj.program();
+    if (!program) return;
+    const name = await promptDialog({ title: 'Nombre del programa', label: 'Nombre', value: program.name, confirm: 'Guardar' });
+    if (name) dj.renameProgram(program.id, name);
+  }
+
+  async function deleteProgram() {
+    const program = dj.program();
+    if (!program) return;
+    const ok = await confirmDialog({ title: 'Borrar el programa', message: `¿Borrar «${program.name}»? Las canciones siguen en la biblioteca.`, confirm: 'Borrar', danger: true });
+    if (ok) dj.deleteProgram(program.id);
+  }
+
+  async function removeTrack(track) {
+    const ok = await confirmDialog({ title: 'Borrar la canción', message: `¿Borrar «${track.name}» de este dispositivo? También se quita de los programas donde esté.`, confirm: 'Borrar', danger: true });
+    if (ok) dj.removeTrack(track.id);
+  }
+
+  async function resetBindings() {
+    const ok = await confirmDialog({ title: 'Restablecer asignaciones', message: 'Se borran todos los botones y pads asignados y vuelven las teclas de siempre.', confirm: 'Restablecer', danger: true });
+    if (ok) dj.resetBindings();
+  }
+
+  function openItemEditor(itemId) {
+    const find = () => dj.items().find((entry) => entry.id === itemId);
+    const item = find();
+    if (!item) return null;
+    const label = h('input', { type: 'text', class: 'input', value: item.label, placeholder: item.trackName, maxlength: '80', autocomplete: 'off', 'aria-label': 'Nombre del participante o momento', 'data-field': 'label' });
+    const start = h('input', { type: 'text', class: 'input num', value: fmtClock(item.start), inputmode: 'decimal', autocomplete: 'off', 'aria-label': 'Empieza en', 'data-field': 'start' });
+    const max = h('input', { type: 'text', class: 'input num', value: item.maxDur > 0 ? fmtClock(item.maxDur) : '', placeholder: 'Toda la canción', inputmode: 'decimal', autocomplete: 'off', 'aria-label': 'Duración máxima', 'data-field': 'max' });
+    const gain = createRange({
+      min: -12,
+      max: 6,
+      step: 0.5,
+      value: item.gainDb,
+      label: 'Volumen de esta canción',
+      format: (value) => `${value > 0 ? '+' : ''}${value} dB`,
+      onInput: (value) => dj.updateItem(itemId, { gainDb: value }),
+    });
+    label.addEventListener('change', () => dj.updateItem(itemId, { label: label.value }));
+    start.addEventListener('change', () => {
+      const seconds = parseClock(start.value);
+      if (Number.isNaN(seconds)) {
+        start.value = fmtClock(find()?.start || 0);
+        return;
+      }
+      dj.updateItem(itemId, { start: seconds });
+      start.value = fmtClock(find()?.start || 0);
+    });
+    max.addEventListener('change', () => {
+      if (!max.value.trim()) {
+        dj.updateItem(itemId, { maxDur: 0 });
+        return;
+      }
+      const seconds = parseClock(max.value);
+      if (Number.isNaN(seconds)) {
+        const current = find();
+        max.value = current && current.maxDur > 0 ? fmtClock(current.maxDur) : '';
+        return;
+      }
+      dj.updateItem(itemId, { maxDur: seconds });
+      max.value = seconds > 0 ? fmtClock(seconds) : '';
+    });
+    const padBox = h('div', { class: 'dj-modal-pad' });
+    let learning = false;
+    const renderPad = () => {
+      const current = find();
+      if (!current) return;
+      const list = triggersOf(current.slot);
+      padBox.replaceChildren(
+        h(
+          'div',
+          { class: 'dj-map-chips' },
+          list.length
+            ? list.map((trigger) =>
+                h(
+                  'span',
+                  { class: `dj-chiptag${isKeyTrigger(trigger) ? ' is-key' : ' is-midi'}` },
+                  h('span', { text: describeTrigger(trigger) }),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      class: 'dj-chip-x',
+                      'aria-label': `Quitar ${describeTrigger(trigger)}`,
+                      onClick: () => {
+                        dj.unassign(current.slot, trigger);
+                        renderPad();
+                      },
+                    },
+                    icon('close', 14)
+                  )
+                )
+              )
+            : h('span', { class: 'dj-hint', text: 'Sin pad ni tecla asignados' })
+        ),
+        h(
+          'button',
+          {
+            type: 'button',
+            class: `btn small${learning ? ' primary' : ''}`,
+            'data-act': 'learn-item',
+            onClick: async () => {
+              if (learning) {
+                dj.cancelLearn();
+                return;
+              }
+              learning = true;
+              renderPad();
+              try {
+                await dj.learn(current.slot, { replace: true });
+              } finally {
+                learning = false;
+                renderPad();
+              }
+            },
+          },
+          learning ? 'Pulsa el pad o la tecla… (Esc cancela)' : 'Asignar pad o tecla'
+        )
+      );
+    };
+    renderPad();
+    const body = h(
+      'div',
+      { class: 'dj-editor' },
+      h('label', { class: 'field' }, h('span', { class: 'field-label', text: 'Participante o momento' }), label, h('span', { class: 'field-hint', text: 'Por ejemplo «Entrada de los novios». Si lo dejas vacío se muestra el nombre de la canción.' })),
+      h('div', { class: 'field' }, h('span', { class: 'field-label', text: 'Canción' }), h('div', { class: 'dj-readonly', text: item.trackName + (item.trackDuration ? ` · ${fmtClock(item.trackDuration)}` : '') })),
+      h(
+        'div',
+        { class: 'dj-two' },
+        h('label', { class: 'field' }, h('span', { class: 'field-label', text: 'Empieza en' }), start, h('span', { class: 'field-hint', text: 'Para saltarte la introducción (m:ss).' })),
+        h('label', { class: 'field' }, h('span', { class: 'field-label', text: 'Dura como máximo' }), max, h('span', { class: 'field-hint', text: 'Vacío = toda la canción.' }))
+      ),
+      h('div', { class: 'field' }, h('span', { class: 'field-label', text: 'Volumen de esta canción' }), gain.el, h('span', { class: 'field-hint', text: 'Sube o baja solo esta canción si suena más fuerte o más suave que las demás.' })),
+      h('div', { class: 'field' }, h('span', { class: 'field-label', text: 'Pad o tecla' }), padBox),
+      h(
+        'div',
+        { class: 'dj-editor-tools' },
+        h('button', { type: 'button', class: 'btn small', onClick: () => dj.moveItemBy(itemId, -1) }, icon('up', 16), 'Subir'),
+        h('button', { type: 'button', class: 'btn small', onClick: () => dj.moveItemBy(itemId, 1) }, icon('down', 16), 'Bajar'),
+        h(
+          'button',
+          {
+            type: 'button',
+            class: 'btn small danger',
+            'data-act': 'remove-item',
+            onClick: () => {
+              if (dj.removeItem(itemId)) modal.close();
+            },
+          },
+          icon('trash', 16),
+          'Quitar del programa'
+        )
+      )
+    );
+    const modal = openModal({
+      title: `Participante ${item.number}`,
+      size: 'md',
+      className: 'dj-modal',
+      body,
+      actions: [{ label: 'Listo', kind: 'primary', icon: 'check', onClick: (api) => api.close() }],
+      onClose: () => {
+        if (learning) dj.cancelLearn();
+      },
+    });
+    return modal;
+  }
+
+  // ------------------------------------------------------------ arrastrar archivos
+
+  const root = h('div', { class: 'dj' }, banners, deck, work, fileInput);
+  let dragDepth = 0;
+  const hasFiles = (event) => event.dataTransfer && Array.from(event.dataTransfer.types || []).includes('Files');
+  root.addEventListener('dragenter', (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepth++;
+    root.classList.add('is-dropping');
+  });
+  root.addEventListener('dragover', (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  root.addEventListener('dragleave', (event) => {
+    if (!hasFiles(event)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) root.classList.remove('is-dropping');
+  });
+  root.addEventListener('drop', (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepth = 0;
+    root.classList.remove('is-dropping');
+    dj.importFiles(Array.from(event.dataTransfer.files), { addToProgram: state.settings.tab !== 'library' });
+  });
+
+  // ------------------------------------------------------------ teclado (solo con la pestaña DJ a la vista)
+
+  const onKeyDown = (event) => {
+    if (!active) return;
+    if (dj.router.handleKey(event)) event.stopPropagation();
+  };
+  const onKeyUp = (event) => {
+    if (!active) return;
+    if (dj.router.claimsKey(event)) event.preventDefault();
+  };
+  window.addEventListener('keydown', onKeyDown, true);
+  window.addEventListener('keyup', onKeyUp, true);
+
+  // ------------------------------------------------------------ dibujar
+
+  const transportText = () => {
+    if (state.transport === 'playing') return 'Sonando';
+    if (state.transport === 'paused') return 'En pausa';
+    return state.nowId ? 'Detenido' : 'Listo';
+  };
+
+  function renderDeck() {
+    const now = dj.nowItem();
+    const next = dj.nextItem();
+    const items = dj.items();
+    const nowView = now ? items.find((item) => item.id === now.id) : null;
+    const nextView = next ? items.find((item) => item.id === next.id) : null;
+    const playing = state.transport === 'playing';
+    setText(nowTitle, nowView ? nowView.title : 'Nada sonando');
+    setText(nowSub, nowView ? `${nowView.trackName} · ${nowView.number} de ${items.length}` : items.length ? 'Pulsa Siguiente para empezar' : 'Añade canciones para empezar');
+    if (!mixingNow) setText(nowChip, transportText());
+    setClass(nowCard, 'is-playing', playing);
+    setClass(nowCard, 'is-paused', state.transport === 'paused');
+    setText(nextTitle, nextView ? nextView.title : items.length ? 'Fin del programa' : '—');
+    setText(nextSub, nextView ? itemSub(nextView) : '');
+    const status = next ? dj.itemStatus(next) : 'none';
+    setText(nextState, STATUS_TEXT[status] || '');
+    if (nextDot.__s !== status) {
+      nextDot.__s = status;
+      nextDot.className = `dj-dot ${status}`;
+    }
+    setClass(nextCard, 'is-cued', Boolean(state.cueId));
+    if (playIcon.__p !== playing) {
+      playIcon.__p = playing;
+      playIcon.replaceChildren(icon(playing ? 'pause' : 'play', 34));
+    }
+    const playLabel = playing ? 'Pausar' : state.transport === 'paused' ? 'Reanudar' : 'Reproducir';
+    btnPlay.setAttribute('aria-label', playLabel);
+    btnPlay.title = playLabel;
+    const fade = state.settings.fade;
+    setText(nextBtnSub, !next ? 'no hay más canciones' : playing ? (fade <= 0 ? 'corte directo' : `mezcla de ${fadeText(fade)}`) : 'empezar');
+    btnNext.disabled = !next;
+    btnPrev.disabled = !now || items.findIndex((item) => item.id === now.id) <= 0;
+    btnStop.disabled = state.transport === 'idle';
+    for (const preset of presets) setClass(preset, 'is-on', Number(preset.dataset.seconds) === fade);
+    if (document.activeElement !== fadeRange.input) fadeRange.set(fade);
+    if (document.activeElement !== volumeRange.input) volumeRange.set(Math.round(state.settings.volume * 100));
+    autoSwitch.set(state.settings.autoAdvance);
+    updateMonitor();
+  }
+
+  function render() {
+    renderBanners();
+    renderDeck();
+    renderWork();
+  }
+
+  // Junta varios avisos seguidos en un solo dibujo por cuadro.
+  function schedule() {
+    if (paintQueued || !active) return;
+    paintQueued = requestAnimationFrame(() => {
+      paintQueued = 0;
+      if (active) render();
+    });
+  }
+
+  const last = { zone: '', bar: -1, meter: -1 };
+
+  function frame() {
+    raf = requestAnimationFrame(frame);
+    const live = dj.live();
+    const item = dj.nowItem();
+    setText(elapsedEl, item ? fmtClock(live.elapsed) : '0:00');
+    let left = '';
+    let tone = '';
+    if (item) {
+      if (item.maxDur > 0 && live.elapsed > item.maxDur + 0.5) {
+        left = `+${fmtClock(live.elapsed - item.maxDur)} de más`;
+        tone = 'over';
+      } else if (live.remaining !== null) {
+        left = `quedan ${fmtClock(live.remaining)}`;
+        tone = live.remaining <= 10 && state.transport === 'playing' ? 'warn' : '';
+      }
+    }
+    setText(leftEl, left);
+    setClass(leftEl, 'is-warn', tone === 'warn');
+    setClass(leftEl, 'is-over', tone === 'over');
+    const bar = Math.round(live.progress * 1000);
+    if (bar !== last.bar) {
+      last.bar = bar;
+      barFill.style.transform = `scaleX(${live.progress.toFixed(4)})`;
+    }
+    // Zona de mezcla: los últimos segundos antes del final, donde empieza a entrar la siguiente.
+    let zone = '';
+    if (item && live.duration) {
+      const end = itemEnd(item, live.duration);
+      const span = end - item.start;
+      if (span > 0) {
+        const width = clamp(state.settings.fade / span, 0, 1);
+        zone = `${((1 - width) * 100).toFixed(2)}|${(width * 100).toFixed(2)}`;
+      }
+    }
+    if (zone !== last.zone) {
+      last.zone = zone;
+      const [from, size] = zone ? zone.split('|') : ['100', '0'];
+      barZone.style.left = `${from}%`;
+      barZone.style.width = `${size}%`;
+    }
+    const level = live.level > 0.001 ? clamp((20 * Math.log10(live.level) + 60) / 60, 0, 1) : 0;
+    const meter = Math.round(level * 100);
+    if (meter !== last.meter) {
+      last.meter = meter;
+      meterFill.style.transform = `scaleX(${level.toFixed(3)})`;
+      setClass(meterFill, 'is-hot', level > 0.97);
+    }
+    const mixing = Boolean(live.mixing && live.mixing.active);
+    mixingNow = mixing;
+    setClass(nowCard, 'is-mixing', mixing);
+    if (mixing) {
+      setText(nowChip, `Mezclando… ${Math.round(live.mixing.progress * 100)}%`);
+      nowCard.style.setProperty('--mix', live.mixing.progress.toFixed(3));
+    } else {
+      setText(nowChip, transportText());
+    }
+  }
+
+  const offChange = dj.on('change', schedule);
+  const offSignal = dj.on('signal', () => {
+    if (active) updateMonitor();
+  });
+
+  return {
+    el: root,
+    setActive(on) {
+      active = Boolean(on);
+      if (active) {
+        render();
+        if (!raf) raf = requestAnimationFrame(frame);
+      } else {
+        if (raf) cancelAnimationFrame(raf);
+        raf = 0;
+        if (paintQueued) cancelAnimationFrame(paintQueued);
+        paintQueued = 0;
+      }
+    },
+    render,
+    openItemEditor,
+    destroy() {
+      offChange();
+      offSignal();
+      window.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('keyup', onKeyUp, true);
+      if (raf) cancelAnimationFrame(raf);
+      if (paintQueued) cancelAnimationFrame(paintQueued);
+      raf = 0;
+      paintQueued = 0;
+    },
+  };
+}

@@ -10,9 +10,13 @@ const TABS = [
   { id: 'play', label: 'Tocar', icon: 'wave' },
   { id: 'mix', label: 'Mezcla', icon: 'mixer' },
   { id: 'lib', label: 'Setlist', icon: 'list' },
+  { id: 'dj', label: 'DJ', icon: 'disc' },
 ];
 
-export function createShell({ onSettings, onStage, onAccess }) {
+export function createShell({ onSettings, onStage, onAccess, onTab }) {
+  // La hoja de estilos del DJ se pide desde el principio (es pequeña y queda guardada para usar sin internet):
+  // así su pestaña y su botón se ven bien desde el primer toque, aunque el DJ se cargue después.
+  if (!document.getElementById('dj-styles')) document.head.append(h('link', { id: 'dj-styles', rel: 'stylesheet', href: new URL('../../css/dj.css', import.meta.url).href }));
   const root = $('#app');
   root.replaceChildren();
   const mark = h('span', { class: 'brand-mark' });
@@ -44,8 +48,9 @@ export function createShell({ onSettings, onStage, onAccess }) {
     lib: h('aside', { class: 'panel panel-lib', 'aria-label': 'Setlist y biblioteca' }),
     play: h('section', { class: 'panel panel-play', 'aria-label': 'Reproducción' }),
     mix: h('section', { class: 'panel panel-mix', 'aria-label': 'Mezcla' }),
+    dj: h('section', { class: 'panel panel-dj', 'aria-label': 'DJ' }),
   };
-  const layout = h('main', { class: 'layout', dataset: { tab: 'play' } }, panels.lib, h('div', { class: 'stack' }, panels.play, panels.mix));
+  const layout = h('main', { class: 'layout', dataset: { tab: 'play' } }, panels.lib, h('div', { class: 'stack' }, panels.play, panels.mix, panels.dj));
   const buttons = new Map();
   const tabbar = h(
     'nav',
@@ -69,15 +74,25 @@ export function createShell({ onSettings, onStage, onAccess }) {
       return media.matches;
     },
     setTab(id) {
+      const previous = layout.dataset.tab;
       layout.dataset.tab = id;
       root.dataset.tab = id;
       for (const [key, button] of buttons) {
         button.classList.toggle('active', key === id);
         button.setAttribute('aria-selected', key === id ? 'true' : 'false');
       }
+      if (previous !== id && onTab) onTab(id, previous);
+    },
+    // Punto de aviso en una pestaña (por ejemplo, el DJ sigue sonando).
+    setBadge(id, on) {
+      const button = buttons.get(id);
+      if (button) button.classList.toggle('has-badge', Boolean(on));
     },
     isVisible(name) {
-      return media.matches ? name === 'lib' || (layout.dataset.tab === 'mix' ? name === 'mix' : name === 'play') : layout.dataset.tab === name;
+      const tab = layout.dataset.tab;
+      if (tab === 'dj') return name === 'dj';
+      if (name === 'dj') return false;
+      return media.matches ? name === 'lib' || (tab === 'mix' ? name === 'mix' : name === 'play') : tab === name;
     },
   };
   api.setTab('play');

@@ -78,7 +78,45 @@ async function boot() {
     stage.show();
   };
 
-  shell = createShell({ onSettings: openSettings, onStage: openStage, onAccess: openAccess });
+  // Pestaña DJ: se carga la primera vez que se abre. Si algo fallara allí, el resto de Escena no se entera.
+  let dj = null;
+  let djLoading = null;
+  const loadDj = () => {
+    if (!djLoading) {
+      shell.panels.dj.replaceChildren(h('div', { class: 'boot' }, h('div', { class: 'spinner' }), h('p', { text: 'Preparando el DJ…' })));
+      djLoading = import('./dj-mount.js')
+        .then((module) => module.mountDj({ app, panel: shell.panels.dj, onBadge: (on) => shell.setBadge('dj', on) }))
+        .then((mounted) => {
+          dj = mounted;
+          return mounted;
+        })
+        .catch((error) => {
+          console.error(error);
+          djLoading = null;
+          shell.panels.dj.replaceChildren(
+            h(
+              'div',
+              { class: 'fatal' },
+              h('p', { text: `No se pudo abrir el DJ: ${error && error.message ? error.message : 'error desconocido'}` }),
+              h('button', { type: 'button', class: 'btn primary', onClick: () => openDj() }, 'Reintentar')
+            )
+          );
+          return null;
+        });
+    }
+    return djLoading;
+  };
+  const openDj = () =>
+    loadDj().then((mounted) => {
+      if (mounted && shell.tab === 'dj') mounted.setActive(true);
+    });
+  const handleTab = (id, previous) => {
+    controls.setSuspended(id === 'dj');
+    if (id === 'dj') openDj();
+    else if (previous === 'dj' && dj) dj.setActive(false);
+  };
+
+  shell = createShell({ onSettings: openSettings, onStage: openStage, onAccess: openAccess, onTab: handleTab });
   stage = createStage();
   playerView = createPlayerView({ onEdit: editCurrent, onImport: () => startImport(null), onDemo: makeDemo });
   mixer = createMixer({ onEdit: editCurrent });
@@ -103,12 +141,18 @@ async function boot() {
     app.unloadCurrent();
     app.endLoading();
     app.pad?.stop();
+    // Igual que con el multitrack: si la autorización se pierde, el DJ también se pausa y deja de responder.
+    if (dj) {
+      dj.setActive(false);
+      Promise.resolve(dj.pause()).catch(() => {});
+    }
     if (stage.open) stage.close();
     try {
       await ensureApprovedAccess(reason);
       access.setCloudRole(cloud.role);
       app.sessionAllowed = true;
       app.warmUp();
+      if (dj && shell.tab === 'dj') dj.setActive(true);
     } finally { returningToAccess = false; }
   };
   cloud.on('change', () => {
@@ -139,9 +183,11 @@ async function boot() {
   document.body.append(dropzone);
   let dragDepth = 0;
   const hasFiles = (event) => event.dataTransfer && Array.from(event.dataTransfer.types || []).includes('Files');
+  // En la pestaña DJ los archivos se arrastran a la propia pantalla del DJ; aquí solo se evita que el navegador abra el archivo.
   window.addEventListener('dragenter', (event) => {
     if (!hasFiles(event)) return;
     event.preventDefault();
+    if (shell.tab === 'dj') return;
     dragDepth++;
     dropzone.hidden = false;
   });
@@ -149,7 +195,7 @@ async function boot() {
     if (hasFiles(event)) event.preventDefault();
   });
   window.addEventListener('dragleave', (event) => {
-    if (!hasFiles(event)) return;
+    if (!hasFiles(event) || shell.tab === 'dj') return;
     dragDepth = Math.max(0, dragDepth - 1);
     if (!dragDepth) dropzone.hidden = true;
   });
@@ -158,6 +204,7 @@ async function boot() {
     event.preventDefault();
     dragDepth = 0;
     dropzone.hidden = true;
+    if (shell.tab === 'dj') return;
     const entries = await readDropped(event.dataTransfer);
     if (entries.length) startImport(entries);
   });

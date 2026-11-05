@@ -48,6 +48,8 @@ const PATHS = {
   shield: [STROKE, '<path d="M12 3l7.5 3v5.5c0 4.5-3.2 8-7.5 9.5-4.3-1.5-7.5-5-7.5-9.5V6z"/><path d="M9 12l2.2 2.2L15.5 10"/>'],
   swap: [STROKE, '<path d="M4 8h14l-3.5-3.5M20 16H6l3.5 3.5"/>'],
   share: [STROKE, '<path d="M12 15V4M8 8l4-4 4 4"/><path d="M5 13v6.5h14V13"/>'],
+  disc: [STROKE, '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.4"/><path d="M12 6.4a5.6 5.6 0 0 1 5.6 5.6"/>'],
+  pads: [STROKE, '<rect x="3.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.6"/>'],
 };
 
 export function icon(name, size = 20) {
