@@ -28,7 +28,15 @@ export async function mountDj({ app, panel, onBadge = () => {} }) {
 
   const dj = createDj({ store, engine, probe: probeAudio, host });
   await dj.init();
-  const view = createDjView({ dj });
+  // Los programas en la nube usan la conexión de la pestaña Nube. Si algo fallara al cargarla, el DJ sigue funcionando sin ella.
+  let djCloud = null;
+  try {
+    const [{ cloud }, { createDjCloud }] = await Promise.all([import('./cloud.js'), import('./dj-cloud.js')]);
+    djCloud = createDjCloud({ dj, cloud });
+  } catch (error) {
+    console.warn('Escena DJ: la nube no está disponible en esta sesión.', error);
+  }
+  const view = createDjView({ dj, djCloud });
   panel.replaceChildren(view.el);
 
   // Punto verde en la pestaña mientras suena el DJ y se está en otra pestaña.
@@ -58,6 +66,7 @@ export async function mountDj({ app, panel, onBadge = () => {} }) {
 
   return {
     dj,
+    djCloud,
     view,
     setActive(on) {
       dj.setActive(on);

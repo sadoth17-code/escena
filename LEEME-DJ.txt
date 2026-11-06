@@ -1,16 +1,24 @@
-ESCENA — PESTAÑA DJ 2
+ESCENA — PESTAÑA DJ 3
 5 de noviembre de 2026
 
-NOVEDAD DE ESTA VERSIÓN: LLEVAR EL PROGRAMA A OTRA PC
-Las canciones del DJ se guardan solo en el navegador de la computadora donde las
-subiste: no se suben a internet ni a la nube de Escena. Para usar el mismo
-programa en otra computadora, el botón «Llevar a otra PC» crea un archivo (un
-paquete) que copias con una USB, por correo o con tu nube personal, y lo abres
-allá. Hay dos formas: el paquete completo (.zip, con las canciones) y solo el
-programa (.json, liviano, sin audio). Los pasos están más abajo.
-Este ZIP es acumulativo: trae todo el DJ (versión 1 y versión 2). Si ya habías
-aplicado la versión 1, copia esta encima y sustituye los archivos.
-El Worker y la nube de Escena no se tocaron.
+NOVEDAD DE ESTA VERSIÓN: LOS PROGRAMAS DEL DJ, EN TU NUBE
+Ahora un programa del DJ, con sus canciones, se puede subir a la MISMA nube de
+Escena que ya usas para los multitracks (el mismo Worker, el mismo
+almacenamiento y las mismas claves personales) y traer en cualquier otro
+dispositivo conectado a esa nube. Se hace desde la pestaña DJ: botón «Llevar a
+otra PC» > sección «Con tu nube». Los pasos están más abajo.
+Los programas del DJ van en una sección aparte de la nube: no aparecen en la
+lista de canciones multitrack de la pestaña Nube (esa pestaña ahora lo explica
+en una línea), y los multitracks no se tocan.
+ESTA VERSIÓN SÍ CAMBIA EL WORKER. Hay que publicar primero el Worker nuevo
+(server/worker.mjs, un solo archivo que se pega entero en Cloudflare) y después
+la app. El Worker nuevo solo añade rutas nuevas (/v1/dj/…) y un dato en la
+respuesta de /v1/ping: las rutas de siempre no cambian y las apps que ya
+tienes siguen funcionando con él.
+Lo de la versión 2 (paquetes .zip y .json para llevar el programa con USB o
+correo, sin internet) sigue igual.
+Este ZIP es acumulativo: trae todo el DJ (versiones 1, 2 y 3). Si ya habías
+aplicado una versión anterior, copia esta encima y sustituye los archivos.
 
 ESTA ENTREGA AÑADE UNA PESTAÑA NUEVA
 Junto a Tocar, Mezcla y Setlist aparece «DJ». Subes canciones sueltas, armas un
@@ -22,34 +30,127 @@ Es un motor de audio aparte. No toca el motor del multitrack ni tus canciones,
 setlists, claves o usuarios. Los dos nunca suenan a la vez: al iniciar el DJ se
 pausa el multitrack, y al iniciar el multitrack se pausa el DJ.
 
-CÓMO ACTUALIZAR
+CÓMO ACTUALIZAR (EN ESTE ORDEN)
 1. Descomprime el ZIP.
-2. Copia EL CONTENIDO de actualizacion/ a la raíz del proyecto ESCENA,
-   respetando las rutas y sustituyendo los archivos existentes.
+2. PRIMERO EL WORKER. Guarda una copia del Worker que tienes ahora (por si
+   algún día quisieras volver atrás). En Cloudflare abre tu Worker de Escena
+   (Workers & Pages > escena-nube), pulsa «Edit code», borra todo su contenido,
+   pega el contenido completo de actualizacion/server/worker.mjs y pulsa
+   «Deploy». No hay variables ni almacenamientos nuevos: el bucket, la clave
+   del propietario y los orígenes permitidos se quedan como están.
+3. DESPUÉS LA APP. Copia EL CONTENIDO de actualizacion/ a la raíz del proyecto
+   ESCENA, respetando las rutas y sustituyendo los archivos existentes (la copia
+   de server/worker.mjs mantiene tu repositorio al día; lo que corre es lo que
+   pegaste en Cloudflare).
    Archivos nuevos: www/js/dj.js, dj-engine.js, dj-math.js, dj-midi.js,
-   dj-store.js, dj-mount.js, dj-package.js (nuevo en la versión 2),
+   dj-store.js, dj-mount.js, dj-package.js (versión 2), dj-cloud.js (versión 3),
    www/js/ui/dj-view.js, www/css/dj.css, las pruebas tests/dj-core.test.mjs,
-   tests/dj-package.test.mjs, tests/browser-dj.cjs y
-   tests/browser-dj-package.cjs, y este LEEME.
-   Archivos que ya existían y cambian poco: www/js/main.js, www/js/controls.js,
-   www/js/ui/shell.js, www/js/ui/kit.js (dos iconos nuevos) y package.json
-   (solo las líneas de scripts de prueba; si lo cambiaste hoy, puedes omitirlo,
-   la app no lo necesita). Las pruebas no se ejecutan al publicar ni hacen falta
-   para usar Escena; las de navegador necesitan Chrome, Playwright y, la de
-   «Llevar a otra PC», el programa «unzip».
-3. Publica los cambios en main como de costumbre. GitHub Actions genera la web;
+   tests/dj-package.test.mjs, tests/dj-cloud-worker.test.mjs,
+   tests/dj-cloud.test.mjs, tests/browser-dj.cjs, tests/browser-dj-package.cjs
+   y tests/browser-dj-cloud.cjs, y este LEEME.
+   Archivos que ya existían y cambian: server/worker.mjs (rutas nuevas del DJ),
+   www/js/main.js, www/js/controls.js, www/js/ui/shell.js, www/js/ui/kit.js (dos
+   iconos nuevos), www/js/ui/cloud-view.js (una frase en la pestaña Nube que
+   dice dónde están los programas del DJ), tests/helpers/cloud-world.mjs (una
+   palabra, para las pruebas) y package.json (solo las líneas de scripts de
+   prueba; si lo cambiaste hoy, puedes omitirlo, la app no lo necesita). Las
+   pruebas no se ejecutan al publicar ni hacen falta para usar Escena; las de
+   navegador necesitan Chrome, Playwright y, la de «Llevar a otra PC», el
+   programa «unzip».
+4. Publica los cambios en main como de costumbre. GitHub Actions genera la web;
    scripts/preparar-web.mjs incluye solos los archivos nuevos para el uso sin
    conexión. Este ZIP no publicó el sitio ni contiene instaladores.
-4. Cuando termine la publicación, aplica el aviso «Hay una versión nueva de
+5. Cuando termine la publicación, aplica el aviso «Hay una versión nueva de
    Escena» (o cierra todas las pestañas de ESCENA y vuelve a abrir). Debe
    aparecer «DJ», con un disco, a la derecha de Setlist.
-5. En una app EXE/APK/DMG instala la nueva compilación generada; publicar la web
+6. En una app EXE/APK/DMG instala la nueva compilación generada; publicar la web
    no sustituye un instalador antiguo.
-6. No hace falta actualizar el Worker ni borrar datos del navegador. Las
-   canciones y programas del DJ que ya tenías siguen ahí: se guardan en este
-   dispositivo, en una base aparte.
+7. Comprueba: DJ > «Llevar a otra PC». La sección «Con tu nube» debe decir
+   «Todavía no hay programas del DJ en tu nube.» (o listar los que ya subiste).
+   Si en cambio dice «Tu nube todavía no guarda programas del DJ. Publica
+   primero el Worker nuevo…», el Worker nuevo no está publicado: repite el
+   paso 2. Nada más se rompe si publicas la app antes que el Worker: solo falta
+   la nube del DJ hasta que lo hagas.
+8. No hace falta borrar datos del navegador. Las canciones y programas del DJ
+   que ya tenías siguen ahí: se guardan en este dispositivo, en una base aparte.
+9. PRIMERA PRUEBA REAL (hazla con tiempo, no el día del evento): arma un
+   programa de prueba con dos canciones cortas, súbelo a la nube y tráelo en
+   otro dispositivo (ver más abajo). Todo esto se probó con el Worker real y un
+   almacenamiento simulado, no con tu cuenta de Cloudflare.
 
-LLEVAR EL PROGRAMA A OTRA PC (NUEVO)
+SUBIR EL PROGRAMA A TU NUBE Y TRAERLO EN OTRO DISPOSITIVO (NUEVO)
+Hace falta: haber entrado a Escena con tu clave personal (la nube conectada) y,
+para subir, internet y una cuenta de editor o propietario.
+Subir, en el dispositivo que tiene las canciones:
+1. DJ > Programa > «Llevar a otra PC». Arriba está «Con tu nube».
+2. Pulsa «Subir «Boda Ana y Luis» a la nube». Debajo dice cuántos
+   participantes y canciones son y cuánto pesa. Si el botón está apagado, la
+   ventana dice por qué (cuenta de músico, sin internet, programa sin canciones
+   con audio o música sonando).
+3. Arriba aparece el avance: «Preparando «Boda Ana y Luis»… 2 de 4» (revisa las
+   canciones), «Subiendo «Boda Ana y Luis» a tu nube… 37%» (con los MB subidos)
+   y «Guardando «Boda Ana y Luis» en tu nube…» (el último paso, dura un instante).
+   «Cancelar» está disponible mientras prepara y sube. No cierres Escena ni
+   apagues el equipo hasta que avise que quedó en tu nube.
+4. Al terminar avisa, por ejemplo: «Boda Ana y Luis» está en tu nube: 4
+   canciones (3 subidas ahora, 1 ya estaba). Cada canción se sube en partes de
+   8 MB y el Worker comprueba cada parte. Una canción que ya está en tu nube
+   (porque la subió otro programa u otro dispositivo) no se vuelve a subir.
+Traer, en cualquier otro dispositivo conectado a la misma nube:
+5. Abre Escena con tu clave > DJ > «Llevar a otra PC». En «En tu nube» están los
+   programas: cada uno dice cuántos participantes y canciones tiene, cuánto
+   pesa, quién lo subió y cuándo. «Actualizar» vuelve a consultar la nube.
+6. Pulsa «Traer». La ventana dice qué trae: las canciones nuevas con audio (y
+   cuánto pesan) y las que ya estaban en ese dispositivo (no se bajan otra vez).
+   Igual que con un paquete, puedes elegir si también se traen la mezcla y los
+   pads.
+7. «Traer el programa». Arriba aparece «Trayendo «Boda Ana y Luis» de tu nube…
+   2 de 4» con «Cancelar». Cada parte se comprueba contra la huella que dejó
+   quien subió el programa; si algo llega dañado, no se guarda. Después las
+   canciones suenan sin internet.
+   Si cancelas, las canciones que ya llegaron se quedan y no se repiten al
+   volver a traerlo.
+Actualizar un programa que ya está en la nube:
+8. Cambia el programa (orden, nombres, tiempos, canciones nuevas…). En «Con tu
+   nube» el botón pasa a «Subir los cambios de «Boda Ana y Luis»» y la ventana
+   avisa «Tienes cambios en este programa que todavía no están en la nube».
+   Sube solo lo que falta y sigue siendo el mismo programa de la nube (no se
+   duplica). «Subir como programa nuevo» crea otro aparte si prefieres eso.
+9. En el otro dispositivo la ventana avisa «La nube tiene una versión más nueva
+   de este programa». Al pulsar «Traer» ofrece dos caminos: «Actualizar mi
+   programa» (cambia los participantes de ese programa en su sitio) o «Traer
+   como programa nuevo» (deja el tuyo intacto y trae otro). Si en ese
+   dispositivo habías hecho cambios que no subiste, viene marcado «programa
+   nuevo» y avisa que actualizar los perdería.
+10. Si dos dispositivos cambian el mismo programa, el segundo en subir recibe
+   «La nube tiene otra versión de este programa»: no se pisa nada. Puede traer
+   primero la de la nube o usar «Subir como programa nuevo».
+11. Eliminar de la nube (solo el propietario): el icono de papelera junto al
+   programa, con confirmación. Se borra para todos los equipos conectados y las
+   canciones que ningún otro programa usa se borran también. Los dispositivos
+   que ya lo habían traído conservan su copia, y si lo vuelves a subir desde uno
+   de ellos se crea de nuevo.
+12. Sin internet: la ventana lo dice, «Subir» queda apagado y no se cuelga.
+    Lo ya traído sigue sonando; llevar el programa con un archivo (versión 2)
+    tampoco necesita internet.
+
+QUIÉN PUEDE QUÉ Y CUÁNTO CUESTA
+ - Músico (solo reproducir): ve la lista y trae programas. No sube ni elimina.
+ - Editor: además sube y actualiza programas.
+ - Propietario: además elimina programas de la nube.
+ Son las mismas cuentas de la pestaña Nube; no hay claves nuevas. Los editores
+ son personas de confianza: dales ese permiso solo a quien lo necesite.
+ - Las canciones del DJ ocupan lugar en el mismo almacenamiento (R2) que tus
+   multitracks. Según los precios que publica Cloudflare al preparar esta
+   entrega (revísalos en tu cuenta, pueden cambiar): los primeros 10 GB al mes
+   son gratis, después cuesta unos 0.015 USD por GB al mes, las operaciones de
+   subir y bajar están muy por debajo de lo gratuito y bajar archivos a tus
+   equipos no cobra transferencia. En la captura que enviaste, tu nube ya tenía
+   unos 8 GB de multitracks; un programa de boda de unas diez canciones pesa
+   del orden de 80 a 100 MB. Una canción que usan varios programas se guarda
+   una sola vez.
+
+LLEVAR EL PROGRAMA A OTRA PC (VERSIÓN 2, SIN INTERNET)
 Para crear el paquete, en la PC donde tienes las canciones:
 1. DJ > Programa > «Llevar a otra PC» (el mismo botón está en la pestaña
    Canciones). Nada se sube a internet: se crea un archivo en tu computadora.
@@ -150,8 +251,10 @@ vence o se revoca, se pausa hasta renovarla. Prueba con los parlantes del lugar,
 con la pantalla encendida y Escena a la vista (ver límites). Con audífonos o
 parlantes Bluetooth el sonido llega más tarde; para el escenario usa cable.
 Conviene hacer un ensayo con dos canciones y tu controlador antes del evento.
-Si el evento es en otra computadora, trae el paquete y ábrelo allá con tiempo,
-no el mismo día, y ensaya ahí con tu controlador.
+Si el evento es en otra computadora, trae el paquete (o el programa de tu nube)
+y ábrelo allá con tiempo, no el mismo día, y ensaya ahí con tu controlador.
+Con la nube, baja el programa a ese equipo con buena conexión antes del
+evento: ya traído, durante el evento no hace falta internet.
 
 DETALLE DE PANTALLA EN TELÉFONO
 El botón flotante ♪ del cifrado (ya existía) quedaba sobre la barra inferior y
@@ -160,16 +263,23 @@ sube justo encima de la barra, y se oculta dentro de la pestaña DJ para no
 tocarlo sin querer durante un evento. En el resto no cambia.
 
 VALIDACIÓN Y LÍMITES
-56 pruebas automatizadas del DJ aprobadas: 32 del DJ (curvas de mezcla, tiempos,
-limitador, asignación MIDI y teclado, orden y duración de los participantes) y 24
+100 pruebas automatizadas del DJ aprobadas: 32 del DJ (curvas de mezcla, tiempos,
+limitador, asignación MIDI y teclado, orden y duración de los participantes), 24
 de «Llevar a otra PC» (formato del ZIP y su verificación, validación del paquete,
-exportar, importar, participantes sin archivo, paquetes dañados).
-41 pruebas de navegador aprobadas en Chrome 153 real (23 del DJ y 18 de «Llevar
-a otra PC»), con canciones sintéticas y midiendo el audio que sale del motor,
-no solo el estado de la pantalla.
+exportar, importar, participantes sin archivo, paquetes dañados), 24 del Worker
+nuevo (permisos por rol, validación del programa y de solicitudes mal formadas,
+subidas por partes verificadas, publicar sin pisar versiones, eliminar y
+limpieza —también con más de 100 programas y cuando alguien publica mientras se
+limpia—, rangos fuera del archivo, permiso del navegador para llamar desde la
+app, y que publicar un programa de 120 canciones no gaste más consultas al
+almacenamiento que uno de 5) y 20 de punta a punta con la app real, el Worker
+real y varios dispositivos simulados.
+60 pruebas de navegador aprobadas en Chrome 153 real (23 del DJ, 18 de «Llevar a
+otra PC» y 19 de la nube del DJ), con canciones sintéticas y midiendo el audio
+que sale del motor, no solo el estado de la pantalla.
 Del DJ:
  - Mezcla de 3 s: la que sale y la que entra siguen una curva de potencia
-   constante (potencia total medida entre 0.94 y 1.00; 1.00 = constante).
+   constante (potencia total medida entre 0.93 y 1.00; 1.00 = constante).
  - Cambio de idea a mitad de la mezcla: sin saltos de volumen.
  - Corte directo sin chasquidos; pausa, reanudación, parar con fade y pánico.
  - Limitador de seguridad: con dos canciones al 95 % mezcladas y el volumen al
@@ -196,20 +306,47 @@ sin nada guardado):
  - Arrastrar un paquete a la pantalla lo abre como paquete (no lo toma por una
    canción); los archivos que no son un paquete se rechazan con un aviso claro y
    no cambian nada.
- - Paquete grande de 24 canciones (114 MB): armado y descargado en 1.5 a 1.6 s y
-   traído y guardado, con las canciones idénticas, en 1.3 a 1.4 s, sin que la
-   pantalla se trabara más de 67 ms.
+ - Paquete grande de 24 canciones (114 MB): armado y descargado en 1.1 a 1.6 s y
+   traído y guardado, con las canciones idénticas, en 0.9 a 1.4 s (según la
+   corrida), sin que la pantalla se trabara más de 67 ms.
  - Paquete con una canción dañada: se guarda lo sano y la dañada queda esperando.
  - Teléfono de 390 px: el botón y las dos ventanas caben sin desplazarse de lado.
+ - Sin errores en la consola ni peticiones fuera del servidor local.
+De la nube del DJ (dos dispositivos de Chrome real, cada uno con su propia base
+de datos y entrando con la clave como lo haría una persona; la nube es el código
+real del Worker con un almacenamiento R2 simulado en memoria):
+ - Subir un programa de 4 canciones, una de más de 8 MB (viaja en dos partes):
+   las 4 llegan a la nube idénticas byte a byte, se ve el avance con «Cancelar»
+   y el programa queda vinculado.
+ - Otro dispositivo lo ve en la lista y lo trae: quedan el programa, las canciones
+   (idénticas), el pad y la mezcla, y las canciones suenan de verdad (se mide la
+   salida).
+ - Actualizar: se sube solo el cambio (ninguna canción se repite) y el otro
+   dispositivo actualiza su programa en su sitio, sin duplicarlo y sin bajar
+   las canciones otra vez.
+ - Conflicto: el segundo dispositivo no pisa al primero; «Subir como programa
+   nuevo» reutiliza las canciones (en la nube siguen siendo 4).
+ - Cancelar a mitad de una subida: no queda nada a medias, el programa no se
+   publica y se puede repetir.
+ - Eliminar (con confirmación): se borra el programa y la canción que solo él
+   usaba; las demás siguen. Un programa eliminado se puede volver a crear desde
+   el dispositivo que lo tiene.
+ - Permisos: el editor sube (con su nombre) y no ve el botón de eliminar; el
+   músico ve y trae, pero no puede subir.
+ - Con un Worker anterior: avisa que hay que publicar el Worker nuevo y no
+   intenta subir nada. Sin internet: avisa, no se cuelga y todo vuelve al
+   reconectar.
+ - Teléfono de 390 px: la sección, la lista, el aviso de avance (con «Cancelar»
+   que se puede tocar) y la ventana de traer caben sin desplazarse de lado.
  - Sin errores en la consola ni peticiones fuera del servidor local.
 Todo se repitió con la regla normal de Chrome para el audio (solo suena después
 de tocar la página) y desde una copia limpia de tu proyecto con este ZIP aplicado.
 Tiempo medido en el navegador: con la canción ya preparada, la orden llega al
 motor en milisegundos y el sonido apareció en la salida del navegador a 73 a
-83 ms de la pulsación (medido con una ventana de análisis de unos 93 ms, así que
-el tiempo real es igual o menor). Escena prepara la siguiente y la que sigue a
-ella mientras suena; una canción que no estaba preparada puede tardar más según
-el dispositivo.
+83 ms de la pulsación según la corrida (medido con una ventana de análisis de
+unos 93 ms, así que el tiempo real es igual o menor). Escena prepara la
+siguiente y la que sigue a ella mientras suena; una canción que no estaba
+preparada puede tardar más según el dispositivo.
 Las pruebas que ya tenía Escena dieron lo mismo con y sin este cambio (se corrieron
 en una copia limpia de tu proyecto y en esa misma copia con este ZIP aplicado):
 los scripts de audio y las 56 de acceso/nube aprobados, y cuatro de las cinco
@@ -231,6 +368,57 @@ LÍMITES DE «LLEVAR A OTRA PC»
  - Los tiempos de arriba se midieron en un equipo de pruebas; en una computadora
    modesta o con una USB lenta serán mayores.
 
+LÍMITES DE LA NUBE DEL DJ
+ - Una canción puede pesar hasta 5 GB; un programa, hasta 1000 canciones y 2000
+   participantes (su descripción debe caber en 1 MB). Si se pasa, Escena lo
+   avisa y propone dividirlo en dos programas.
+ - Una subida interrumpida (se cierra la app, se corta internet) no se reanuda
+   sola: al repetir «Subir», las canciones que ya quedaron completas no se
+   suben otra vez y solo se repite la que estaba a medias.
+ - Si una subida se cancela o falla, las canciones que ya llegaron completas
+   quedan en la nube aunque el programa no se haya publicado: ocupan espacio y se
+   aprovechan si lo repites, pero no hay limpieza automática de ese caso.
+   Eliminar un programa sí limpia las canciones que ya nadie usa.
+ - La limpieza de canciones sin uso (al eliminar un programa, o al actualizarlo
+   quitándole canciones) vuelve a mirar los programas antes de borrar: si alguien
+   publicó, cambió o eliminó algo mientras tanto, no borra nada y la canción queda
+   guardada ocupando espacio. Aun así queda un margen de milisegundos: si justo
+   ahí otra persona publica un programa que usa esa canción, «Traer» avisa que
+   «ya no está en la nube» y basta volver a subir el programa desde el
+   dispositivo que la tiene («Subir los cambios» sigue disponible aunque el
+   programa figure al día).
+ - Si el propietario elimina un programa en el mismo instante en que un editor lo
+   actualiza, puede ganar la eliminación aunque el editor reciba «publicado»: el
+   programa queda eliminado y las canciones nuevas de esa actualización quedan
+   sin uso.
+ - Plan gratuito de Workers: según la documentación de Cloudflare al preparar esta
+   entrega, cada solicitud puede hacer hasta 50 consultas al almacenamiento y usar
+   10 ms de cálculo (el plan de pago permite mucho más). Publicar un programa usa
+   unas 5 consultas, tenga 5 canciones o 1000 (medido con el Worker real y un
+   almacenamiento simulado), así que el número de canciones no lo acerca al límite.
+   La limpieza automática lee cada programa guardado en la nube: con más de unos 40
+   programas guardados se omite sola en ese plan (no se borra nada: las canciones
+   sin uso quedan ocupando espacio; queda anotado en el registro de Cloudflare).
+   El tiempo de cálculo real en Cloudflare no lo pude medir: si publicar un
+   programa larguísimo (cientos de canciones) falla por tiempo, divídelo en dos
+   programas.
+ - Subir y traer necesitan internet y la autorización verificada. No se trae ni se
+   actualiza un programa mientras suena música.
+ - Cada dispositivo guarda sus canciones en el navegador (el mismo espacio de
+   siempre); Escena avisa si no hay lugar para las canciones nuevas.
+ - Quien tiene permiso de editor es de confianza, y su poder es grande: puede
+   actualizar CUALQUIER programa (eso reemplaza todo su contenido; sin historial,
+   lo anterior se pierde y las canciones que quedan sin uso se liberan). Y si
+   quisiera hacer daño, podría subir una canción defectuosa con el identificador
+   de otra (cada parte se comprueba al bajarla y lo dañado se rechaza, pero esa
+   canción no se podría bajar) o dejar guardada una con un tamaño falso, que
+   impide subir la verdadera. El propietario puede eliminar el programa y volver
+   a subirlo; en el segundo caso, el archivo sobrante solo se puede quitar desde
+   el panel de Cloudflare (R2, carpeta dj/audio/). Da el permiso de editor solo
+   a quien de verdad confías.
+ - No hay historial de versiones: «Subir los cambios» reemplaza la versión de la
+   nube. Programas con el mismo nombre se distinguen por quién los subió y cuándo.
+
 NO SE PROBÓ: un controlador MIDI físico (el MIDI se simuló con un puerto falso
 que manda los mismos mensajes), parlantes ni la latencia real de tu tarjeta de
 audio, Safari/iPhone, las apps EXE/APK/DMG ni un bloqueo real de autorización
@@ -239,12 +427,20 @@ copiado real entre dos computadoras (se simuló con un perfil limpio del mismo
 Chrome), abrir el ZIP con el explorador de Windows o de Mac (sí con «unzip» y
 con Python), descargar o abrir paquetes desde un teléfono o desde la app
 instalada, ni paquetes de varios GB (el aviso del límite de 4 GB solo se probó
-simulando el tamaño).
+simulando el tamaño). De la nube del DJ tampoco: tu cuenta real de Cloudflare ni
+su almacenamiento (se usó el código real del Worker con un almacenamiento
+simulado en memoria; por eso la primera prueba real es con dos canciones
+cortas), los límites del plan gratuito de Workers (se contaron las consultas al
+almacenamiento, no se midió el tiempo de cálculo), la velocidad de tu conexión,
+subidas de varios GB, la app de escritorio y su puente hacia la nube (se revisó
+que reenvía las rutas nuevas, no se ejecutó), teléfonos reales, ni cambios de
+permisos de una cuenta en plena subida.
 NO INCLUYE: ajuste de tempo ni sincronía de compases (beatmatching), efectos ni
 un crossfader manual: la mezcla se hace sola con la duración elegida, y lo
 manual es el volumen general. Cada canción suena a su velocidad original.
-Tampoco subir las canciones o el programa a la nube de Escena: se resolvió con
-archivos y sin tocar el Worker; una nube para el DJ sería una mejora aparte.
+Tampoco, en la nube del DJ: reanudar una subida cortada a la mitad, historial de
+versiones ni limpieza automática de canciones que quedaron en la nube sin
+programa.
 Mantén Escena visible con la pantalla encendida: un navegador que mande la
 ventana a segundo plano puede retrasar los temporizadores (el avance automático
 podría moverse hasta un segundo) y en iPhone bloquear la pantalla puede cortar

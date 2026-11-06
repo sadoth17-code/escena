@@ -68,7 +68,7 @@ export function world() {
   const env = { ESCENA_BUCKET: bucket, ESCENA_KEY: MASTER, ALLOWED_ORIGINS: 'https://app.example.test' };
   const requests = [], toasts = [];
   const w = {
-    bucket, requests, toasts, hideFeatures: false, hideDelete: false,
+    bucket, env, requests, toasts, hideFeatures: false, hideDelete: false,
     count: (from, path) => requests.slice(from).filter(item => item.path === path).length,
     async request(path, key = MASTER, { method = 'GET', body, headers = {} } = {}) {
       const h = new Headers(headers);

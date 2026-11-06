@@ -671,6 +671,45 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
     return { programs: chosen.length, participants, songs: songs.size + waiting.size, withAudio: songs.size, waiting: waiting.size, skipped, bytes, tooBig: bytes > ZIP_MAX_BYTES };
   }
 
+  // Ordena lo que llevan los programas elegidos: cada canción de la biblioteca (o que sigue esperando su archivo) recibe una
+  // referencia dentro del paquete (t1, t2…). Lo comparten el paquete para otra PC y la nube.
+  //   programs: [{ name, items: [{ track: ref, label, start, maxDur, gainDb }] }]    list: [{ ref, track } | { ref, want }]
+  function gatherPrograms(chosen) {
+    const refs = new Map(); // canción de la biblioteca -> referencia dentro del paquete
+    const waiting = new Map(); // canciones que ya esperaban su archivo -> referencia
+    const list = [];
+    let skipped = 0;
+    const programs = chosen.map((entry) => {
+      const items = [];
+      for (const item of entry.items) {
+        const track = trackOf(item.trackId);
+        let ref = null;
+        if (track) {
+          ref = refs.get(track.id);
+          if (!ref) {
+            ref = `t${list.length + 1}`;
+            refs.set(track.id, ref);
+            list.push({ ref, track });
+          }
+        } else if (item.want) {
+          const key = `${relinkKey(item.want.file)}|${item.want.size || 0}`;
+          ref = waiting.get(key);
+          if (!ref) {
+            ref = `t${list.length + 1}`;
+            waiting.set(key, ref);
+            list.push({ ref, want: item.want });
+          }
+        } else {
+          skipped++; // su canción ya no existe y no se sabe cuál era
+          continue;
+        }
+        items.push({ track: ref, label: item.label, start: item.start, maxDur: item.maxDur, gainDb: item.gainDb });
+      }
+      return { name: entry.name, items };
+    });
+    return { programs, list, skipped };
+  }
+
   // Arma el archivo para llevarse el programa: { blob, fileName, ... }. No lo descarga (eso lo hace la pantalla).
   //   scope 'current' = el programa abierto · 'all' = todos      audio true = ZIP con canciones · false = solo el programa
   async function exportPackage({ scope = 'current', audio = true } = {}) {
@@ -686,38 +725,7 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
     state.exporting = { done: 0, total: 1, name: '' };
     emit();
     try {
-      const refs = new Map(); // canción de la biblioteca -> referencia dentro del paquete
-      const waiting = new Map(); // canciones que ya esperaban su archivo -> referencia
-      const list = [];
-      let skipped = 0;
-      const programs = chosen.map((entry) => {
-        const items = [];
-        for (const item of entry.items) {
-          const track = trackOf(item.trackId);
-          let ref = null;
-          if (track) {
-            ref = refs.get(track.id);
-            if (!ref) {
-              ref = `t${list.length + 1}`;
-              refs.set(track.id, ref);
-              list.push({ ref, track });
-            }
-          } else if (item.want) {
-            const key = `${relinkKey(item.want.file)}|${item.want.size || 0}`;
-            ref = waiting.get(key);
-            if (!ref) {
-              ref = `t${list.length + 1}`;
-              waiting.set(key, ref);
-              list.push({ ref, want: item.want });
-            }
-          } else {
-            skipped++; // su canción ya no existe y no se sabe cuál era
-            continue;
-          }
-          items.push({ track: ref, label: item.label, start: item.start, maxDur: item.maxDur, gainDb: item.gainDb });
-        }
-        return { name: entry.name, items };
-      });
+      const { programs, list, skipped } = gatherPrograms(chosen);
 
       const tracks = [];
       const files = [];
@@ -792,6 +800,59 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
     }
   }
 
+  // Lo que se sube a la nube de un programa: su descripción (la misma que lleva un paquete, con las canciones por
+  // referencia) y el audio de cada canción que está en este dispositivo. No lee todavía los archivos: entrega sus Blob.
+  //   { program, manifest, files: [{ ref, name, blob }], waiting, skipped }     o null si el programa ya no existe
+  async function cloudSource(programId) {
+    const entry = state.programs.find((item) => item.id === programId);
+    if (!entry) return null;
+    const { programs, list, skipped } = gatherPrograms([entry]);
+    const tracks = [];
+    const files = [];
+    for (const item of list) {
+      const source = item.track || item.want;
+      const row = {
+        ref: item.ref,
+        name: item.track ? item.track.name : item.want.name || cleanName(item.want.file),
+        file: item.track ? item.track.file || item.track.name : item.want.file,
+        type: item.track ? item.track.type || '' : '',
+        size: source.size || 0,
+        duration: source.duration || 0,
+        entry: '',
+      };
+      if (item.track) {
+        const blob = await readBlob(item.track.id);
+        if (!blob) throw new Error(`No se encontró en este dispositivo el archivo de «${item.track.name}». Bórrala de la biblioteca y vuelve a añadirla.`);
+        row.size = blob.size;
+        files.push({ ref: item.ref, name: row.file, blob });
+      }
+      tracks.push(row);
+    }
+    const manifest = buildManifest({
+      audio: true,
+      created: new Date(now()),
+      programs,
+      tracks,
+      settings: { fade: state.settings.fade, autoAdvance: state.settings.autoAdvance, bindings: effectiveBindings() },
+    });
+    return { program: entry, manifest, files, waiting: tracks.length - files.length, skipped };
+  }
+
+  // Anota (o quita) a qué programa de la nube corresponde uno de este dispositivo. `syncedAt` es el momento de la última
+  // edición local que ya está en la nube: si el programa se edita después, se sabe que tiene cambios sin subir.
+  function setCloudLink(programId, link) {
+    const entry = state.programs.find((item) => item.id === programId);
+    if (!entry) return false;
+    if (link) entry.cloud = { endpoint: link.endpoint, id: link.id, revision: link.revision, syncedAt: link.syncedAt === undefined ? entry.updated : link.syncedAt };
+    else delete entry.cloud;
+    emit(true);
+    later(`program:${entry.id}`, () => saveProgram(entry));
+    return true;
+  }
+
+  // Los programas de este dispositivo que vienen de (o se subieron a) ese programa de la nube.
+  const programsLinkedTo = (endpoint, cloudId) => state.programs.filter((entry) => entry.cloud && entry.cloud.endpoint === endpoint && entry.cloud.id === cloudId);
+
   // Qué trae un paquete y qué pasaría al abrirlo, sin cambiar nada todavía.
   function summarizePackage(opened) {
     const manifest = opened.manifest;
@@ -854,7 +915,10 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
   // Trae a este dispositivo lo que trae el paquete: guarda las canciones, crea los programas y, si se pide, usa también
   // los pads y la mezcla del paquete. Lo que ya está en la biblioteca no se duplica; lo que no trae audio queda esperando
   // su archivo (se vincula por nombre al añadirlo). No interrumpe la música que esté en pausa y no corre mientras suena.
-  async function importPackage(opened, { applySettings = false } = {}) {
+  //   replaceId  actualiza ese programa de este dispositivo (en vez de crear uno nuevo); solo con la música detenida
+  //   signal     permite cancelar: se detiene al terminar la canción en curso; lo ya guardado queda y se aprovecha si se repite
+  // `opened.cloud` ({ endpoint, id, revision }) indica de qué programa de la nube viene, y el programa queda vinculado a él.
+  async function importPackage(opened, { applySettings = false, replaceId = null, signal = null } = {}) {
     if (destroyed || !opened || !opened.manifest) return null;
     if (state.importing || state.exporting) {
       toast('Espera a que termine lo anterior.');
@@ -864,15 +928,28 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
       toast('Detén la música antes de traer un programa.', 'error');
       return null;
     }
+    const target = replaceId ? state.programs.find((entry) => entry.id === replaceId) : null;
+    if (replaceId && !target) {
+      toast('Ese programa ya no está en este dispositivo.', 'error');
+      return null;
+    }
+    if (target && state.transport !== 'idle') {
+      toast('Detén la música antes de actualizar el programa.', 'error');
+      return null;
+    }
     const manifest = opened.manifest;
     const used = new Set(manifest.programs.flatMap((entry) => entry.items.map((item) => item.track)));
     const defs = manifest.tracks.filter((track) => used.has(track.ref));
-    const report = { programs: 0, participants: 0, saved: 0, reused: 0, linked: 0, waiting: 0, damaged: [], failed: [], programIds: [], selected: false };
+    const report = { programs: 0, participants: 0, saved: 0, reused: 0, linked: 0, waiting: 0, damaged: [], failed: [], programIds: [], selected: false, replaced: false, aborted: false };
     const resolved = new Map();
     state.importing = { done: 0, total: defs.length, name: '', label: 'Trayendo el programa…' };
     emit();
     try {
       for (const def of defs) {
+        if (signal && signal.aborted) {
+          report.aborted = true;
+          break;
+        }
         state.importing.name = def.file;
         emit();
         let storedId = null;
@@ -912,6 +989,10 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
           }
         } catch (error) {
           if (storedId) store.remove('blobs', storedId).catch(() => {});
+          if ((signal && signal.aborted) || (error && error.name === 'AbortError')) {
+            report.aborted = true;
+            break;
+          }
           if (error && error.code === 'damaged') report.damaged.push(def.file);
           else report.failed.push(`${def.file}: ${(error && error.message) || 'no se pudo guardar'}`);
           report.waiting++;
@@ -919,42 +1000,72 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
         state.importing.done++;
       }
 
-      const taken = new Set(state.programs.map((entry) => entry.name.toLowerCase()));
-      const defsByRef = new Map(defs.map((def) => [def.ref, def]));
-      const created = manifest.programs.map((spec) => {
-        const items = spec.items.map((entry) => {
-          const def = defsByRef.get(entry.track);
-          const trackId = resolved.get(entry.track) || '';
-          const track = trackOf(trackId);
-          const item = { id: uid(), trackId, label: entry.label, start: entry.start, maxDur: entry.maxDur, gainDb: entry.gainDb };
-          if (track) {
-            if (track.duration) item.start = clamp(item.start, 0, Math.max(0, track.duration - 1));
-          } else {
-            item.want = { name: def.name, file: def.file, size: def.size, duration: def.duration };
+      if (!report.aborted) {
+        const taken = new Set(state.programs.map((entry) => entry.name.toLowerCase()));
+        const defsByRef = new Map(defs.map((def) => [def.ref, def]));
+        const itemsOf = (spec) =>
+          spec.items.map((entry) => {
+            const def = defsByRef.get(entry.track);
+            const trackId = resolved.get(entry.track) || '';
+            const track = trackOf(trackId);
+            const item = { id: uid(), trackId, label: entry.label, start: entry.start, maxDur: entry.maxDur, gainDb: entry.gainDb };
+            if (track) {
+              if (track.duration) item.start = clamp(item.start, 0, Math.max(0, track.duration - 1));
+            } else {
+              item.want = { name: def.name, file: def.file, size: def.size, duration: def.duration };
+            }
+            return item;
+          });
+        const linkTo = (entry) => {
+          if (opened.cloud) entry.cloud = { endpoint: opened.cloud.endpoint, id: opened.cloud.id, revision: opened.cloud.revision, syncedAt: entry.updated };
+        };
+        const created = [];
+        if (target) {
+          // Se actualiza el programa que ya estaba: conserva su lugar y su nombre; cambian sus participantes.
+          for (const old of target.items) engine.drop(old.id);
+          target.items = itemsOf(manifest.programs[0]);
+          target.updated = now();
+          linkTo(target);
+          if (state.programId === target.id) {
+            state.nowId = null;
+            state.cueId = null;
           }
-          return item;
-        });
-        return { id: uid(), name: uniqueProgramName(spec.name, taken), items, created: now(), updated: now() };
-      });
-      for (const entry of created) {
-        state.programs.push(entry);
-        await saveProgram(entry);
-        report.programs++;
-        report.participants += entry.items.length;
-        report.programIds.push(entry.id);
-      }
+          report.replaced = true;
+          created.push(target);
+        } else {
+          manifest.programs.forEach((spec, index) => {
+            const entry = { id: uid(), name: uniqueProgramName(spec.name, taken), items: itemsOf(spec), created: now(), updated: now() };
+            if (index === 0) linkTo(entry);
+            state.programs.push(entry);
+            created.push(entry);
+          });
+        }
+        for (const entry of created) {
+          await saveProgram(entry);
+          report.programs++;
+          report.participants += entry.items.length;
+          report.programIds.push(entry.id);
+        }
 
-      if (applySettings && manifest.settings) {
-        const incoming = manifest.settings;
-        if ('fade' in incoming) state.settings.fade = incoming.fade;
-        if ('autoAdvance' in incoming) state.settings.autoAdvance = incoming.autoAdvance;
-        if (incoming.bindings) state.settings.bindings = incoming.bindings;
-        saveSettingsSoon();
+        if (applySettings && manifest.settings) {
+          const incoming = manifest.settings;
+          if ('fade' in incoming) state.settings.fade = incoming.fade;
+          if ('autoAdvance' in incoming) state.settings.autoAdvance = incoming.autoAdvance;
+          if (incoming.bindings) state.settings.bindings = incoming.bindings;
+          saveSettingsSoon();
+        }
       }
     } catch (error) {
       fail(error);
     } finally {
       state.importing = null;
+    }
+    if (report.aborted) {
+      // Lo que alcanzó a guardarse queda en la biblioteca y no se repite al volver a intentarlo.
+      emit(true);
+      prefetch();
+      preload();
+      return report;
     }
     // Con la música detenida se abre de una vez el programa que llegó; si está en pausa se deja donde estaba.
     if (report.programIds.length && state.transport === 'idle') {
@@ -966,7 +1077,7 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
       const first = state.programs.find((entry) => entry.id === report.programIds[0]);
       const saved = report.saved ? ` · ${report.saved === 1 ? '1 canción guardada' : `${report.saved} canciones guardadas`}` : '';
       const where = report.selected ? '' : ' Elígelo en la lista de programas.';
-      toast(report.programs === 1 ? `Programa «${first.name}» traído: ${report.participants} participantes${saved}.${where}` : `${report.programs} programas traídos: ${report.participants} participantes${saved}.${where}`);
+      toast(report.programs === 1 ? `Programa «${first.name}» ${report.replaced ? 'actualizado' : 'traído'}: ${report.participants} participantes${saved}.${where}` : `${report.programs} programas traídos: ${report.participants} participantes${saved}.${where}`);
     }
     if (report.waiting) toast(report.waiting === 1 ? 'Falta 1 canción. Añádela con «Añadir canciones»: se vincula sola por el nombre del archivo.' : `Faltan ${report.waiting} canciones. Añádelas con «Añadir canciones»: se vinculan solas por el nombre del archivo.`);
     if (report.damaged.length) toast(report.damaged.length === 1 ? `«${report.damaged[0]}» llegó dañada en el paquete. Vuelve a copiar el paquete.` : `${report.damaged.length} canciones llegaron dañadas en el paquete. Vuelve a copiar el paquete.`, 'error');
@@ -985,7 +1096,10 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
     for (const item of state.programs) {
       const before = item.items.length;
       item.items = item.items.filter((entry) => entry.trackId !== trackId);
-      if (item.items.length !== before) later(`program:${item.id}`, () => saveProgram(item));
+      if (item.items.length !== before) {
+        item.updated = now();
+        later(`program:${item.id}`, () => saveProgram(item));
+      }
     }
     for (const entry of used) engine.drop(entry.id);
     if (used.some((entry) => entry.id === state.nowId)) state.nowId = null;
@@ -1428,6 +1542,11 @@ export function createDj({ store, engine, host = {}, probe = async () => ({ dura
     exportPackage,
     openPackage,
     importPackage,
+    summarizePackage,
+    // programas en la nube (dj-cloud.js)
+    cloudSource,
+    setCloudLink,
+    programsLinkedTo,
     // MIDI y teclado
     enableMidi,
     disableMidi,

@@ -66,7 +66,7 @@ export async function openCloudUpload() {
 }
 
 export function createCloudView() {
-  const header = h('div', { class: 'cloud-heading' }, h('div', {}, h('b', { text: 'Tu música, en tus equipos' }), h('p', { text: 'Descarga solo las canciones que vas a usar.' })));
+  const header = h('div', { class: 'cloud-heading' }, h('div', {}, h('b', { text: 'Tu música, en tus equipos' }), h('p', { text: 'Descarga solo las canciones que vas a usar. Los programas del DJ van en esta misma nube: se suben y se traen desde la pestaña DJ → «Llevar a otra PC».' })));
   const tools = h('div', { class: 'cloud-tools' });
   const connection = h('div', { class: 'cloud-connection' });
   const transfers = h('div', { class: 'cloud-transfers', 'aria-live': 'polite' });

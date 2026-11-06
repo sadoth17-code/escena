@@ -289,6 +289,231 @@ function validateManifest(m, songId) {
 
 }
 
+// ───────────────────────── Programas del DJ en la nube ─────────────────────────
+// Se guardan aparte de las canciones multitrack, con las mismas cuentas y permisos:
+//   dj/programs/<id>.json   el programa (orden, tiempos, pads y a qué canciones apunta)
+//   dj/audio/<contenido>    cada canción, una sola vez aunque la usen varios programas
+// <contenido> es el SHA-256 de «tamaño:hash de cada parte», así una canción ya subida no se repite.
+// Nada de esto toca catalog/, audio/ ni auth/. Músico: ver y descargar. Editor: además subir.
+// Propietario: además eliminar. Las rutas nuevas son /v1/dj/…; las de siempre no cambian.
+const DJ_FEATURE = 1;
+const DJ_PROGRAMS = 'dj/programs/';
+const DJ_AUDIO = 'dj/audio/';
+const DJ_MAX_TRACKS = 1000;
+const DJ_MAX_ITEMS = 2000;
+const plainObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const djProgramKey = id => `${DJ_PROGRAMS}${id}.json`;
+function djAudioKey(content) { if (!HASH.test(content || '')) fail('Identificador de canción inválido'); return `${DJ_AUDIO}${content}`; }
+async function djBody(request) { const data = await bodyJson(request); if (!plainObject(data)) fail('Datos inválidos'); return data; }
+const djContent = (size, hashes) => digest(textEncoder.encode(`${size}:${hashes.join(',')}`));
+const djContents = manifest => new Set((Array.isArray(manifest?.files) ? manifest.files : []).map(file => file?.content).filter(content => HASH.test(content || '')));
+
+async function validateDjManifest(m, programId) {
+  if (!plainObject(m) || m.schema !== 1 || m.kind !== 'dj-program' || m.id !== programId || typeof m.revision !== 'string' || !ID.test(m.revision) || m.chunkSize !== CHUNK) fail('Programa DJ inválido');
+  const pack = m.package;
+  if (!plainObject(pack) || pack.format !== 'escena-dj' || !Array.isArray(pack.programs) || pack.programs.length !== 1 || !plainObject(pack.programs[0]) || !Array.isArray(pack.tracks) || pack.tracks.length > DJ_MAX_TRACKS) fail('Programa DJ inválido');
+  const spec = pack.programs[0];
+  if (typeof spec.name !== 'string' || !spec.name.trim() || spec.name.length > 200) fail('El programa debe tener un nombre de hasta 200 caracteres');
+  if (!Array.isArray(spec.items) || spec.items.length < 1 || spec.items.length > DJ_MAX_ITEMS || spec.items.some(item => !plainObject(item))) fail('El programa debe tener entre 1 y 2000 participantes');
+  const refs = new Set();
+  for (const track of pack.tracks) {
+    if (!plainObject(track) || typeof track.ref !== 'string' || !track.ref || track.ref.length > 64 || refs.has(track.ref) || typeof track.file !== 'string' || track.file.length > 300) fail('Canciones del programa inválidas');
+    refs.add(track.ref);
+  }
+  if (!Array.isArray(m.files) || m.files.length > pack.tracks.length) fail('Archivos del programa inválidos');
+  const seen = new Set(); let total = 0;
+  for (const file of m.files) {
+    if (!plainObject(file) || !refs.has(file.ref) || seen.has(file.ref)) fail('Archivos del programa inválidos');
+    if (!Number.isSafeInteger(file.size) || file.size < 1 || file.size > MAX_FILE) fail('Tamaño de canción inválido (máximo 5 GiB)');
+    seen.add(file.ref); total += file.size;
+    if (!Array.isArray(file.hashes) || file.hashes.length !== Math.ceil(file.size / CHUNK) || file.hashes.some(hash => typeof hash !== 'string' || !HASH.test(hash))) fail('Comprobación de canciones incompleta');
+    if (file.content !== await djContent(file.size, file.hashes)) fail('La identificación de una canción no coincide con su contenido');
+  }
+  return { total, name: spec.name.trim().slice(0, 200), participants: spec.items.length, songs: m.files.length };
+}
+
+// ¿Están completas en la nube todas las canciones del programa? Se revisa el listado, que entrega hasta 1000 a la vez,
+// y no una consulta por canción: Cloudflare cuenta cada consulta a R2 como una petición más, y el plan gratuito de
+// Workers permite 50 por solicitud, así que con una consulta por canción un programa largo no se podría publicar.
+async function djHasAudio(bucket, files) {
+  const pending = new Map(files.map(file => [djAudioKey(file.content), file.size]));
+  let cursor;
+  while (pending.size) {
+    const page = await bucket.list({ prefix: DJ_AUDIO, limit: 1000, cursor });
+    for (const object of page.objects) if (pending.get(object.key) === object.size) pending.delete(object.key);
+    if (!page.truncated) break;
+    cursor = page.cursor;
+  }
+  return !pending.size;
+}
+
+// Libera las canciones que ningún programa usa ya. Es mejor dejar una canción de más que quitarle el audio a un
+// programa que la necesita, así que NO se borra nada si:
+//  - algún archivo de la carpeta de programas no se puede leer o no es un programa del DJ, o
+//  - mientras se revisaba, alguien publicó, cambió o eliminó un programa (se vuelve a mirar la lista al terminar).
+// Lo que queda sin borrar es solo espacio ocupado; las canciones nunca se pierden por esta limpieza.
+async function djSweep(bucket, candidates) {
+  if (!candidates.size) return 0;
+  const used = new Set(), seen = new Map(); let cursor;
+  do {
+    const page = await bucket.list({ prefix: DJ_PROGRAMS, limit: 100, cursor });
+    for (const entry of page.objects) {
+      seen.set(entry.key, entry.etag);
+      const object = await bucket.get(entry.key);
+      if (!object) continue;
+      let manifest;
+      try { manifest = await object.json(); } catch { manifest = null; }
+      if (!plainObject(manifest) || manifest.schema !== 1 || manifest.kind !== 'dj-program' || object.etag !== entry.etag) return djSweepSkipped('un programa no se pudo leer o cambió');
+      for (const content of djContents(manifest)) used.add(content);
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  const now = new Map(); cursor = undefined;
+  do {
+    const page = await bucket.list({ prefix: DJ_PROGRAMS, limit: 1000, cursor });
+    for (const entry of page.objects) now.set(entry.key, entry.etag);
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  if (now.size !== seen.size || [...now].some(([key, etag]) => seen.get(key) !== etag)) return djSweepSkipped('otra persona cambió programas durante la revisión');
+  const doomed = [...candidates].filter(content => !used.has(content));
+  for (let index = 0; index < doomed.length; index += 500) await bucket.delete(doomed.slice(index, index + 500).map(djAudioKey));
+  return doomed.length;
+}
+function djSweepSkipped(reason) { console.warn(`dj: limpieza omitida (${reason}); las canciones quedan guardadas`); return 0; }
+
+async function djRoute(request, env, principal, url) {
+  const bucket = env.ESCENA_BUCKET, path = url.pathname, method = request.method;
+
+  if (path === '/v1/dj/programs' && method === 'GET') {
+    const page = await bucket.list({ prefix: DJ_PROGRAMS, limit: 100, cursor: url.searchParams.get('cursor') || undefined, include: ['customMetadata'] });
+    const programs = page.objects.map(object => {
+      try { return JSON.parse(object.customMetadata.summary); } catch { return null; }
+    }).filter(Boolean);
+    return json({ programs, cursor: page.truncated ? page.cursor : null });
+  }
+
+  const programMatch = path.match(/^\/v1\/dj\/programs\/([a-zA-Z0-9_-]+)(?:\/(publish|delete))?$/);
+  if (programMatch) {
+    const id = validId(programMatch[1]), action = programMatch[2], key = djProgramKey(id);
+
+    if (!action && method === 'GET') {
+      const object = await bucket.get(key);
+      if (!object) fail('El programa ya no está en la nube', 404);
+      return new Response(object.body, { headers: { 'content-type': 'application/json', etag: object.httpEtag } });
+    }
+
+    if (action === 'publish' && method === 'POST') {
+      if (principal.role === 'player') fail('Solo el propietario o un editor pueden subir programas', 403);
+      const data = await djBody(request), m = data.manifest;
+      const info = await validateDjManifest(m, id);
+      // Si el programa guardado no se pudiera leer, se trata como si no tuviera versión: no bloquea para siempre.
+      const old = await bucket.get(key), previous = old ? await old.json().catch(() => null) : null;
+      if (previous?.revision === m.revision) return json({ published: true });
+      if ((previous?.revision || null) !== (data.expectedRevision || null)) fail('La nube tiene una versión más reciente de este programa. Tráela o súbelo como programa nuevo.', 409);
+      if (!await djHasAudio(bucket, m.files)) fail('Una canción del programa no terminó de subirse. Vuelve a subir el programa.', 409);
+      m.publishedAt = Date.now();
+      const summary = { id, revision: m.revision, name: info.name, participants: info.participants, songs: info.songs, size: info.total, updatedAt: m.publishedAt, by: String(principal.name || '').slice(0, 100) };
+      const result = await bucket.put(key, JSON.stringify(m), {
+        httpMetadata: jsonMetadata, customMetadata: { summary: JSON.stringify(summary) },
+        onlyIf: new Headers(old ? { 'If-Match': old.httpEtag } : { 'If-None-Match': '*' }),
+      });
+      if (!result) fail('Otra actualización llegó primero. Vuelve a consultar la nube.', 409);
+      // Canciones que la versión anterior usaba y esta ya no: se liberan si ningún otro programa las usa.
+      const dropped = djContents(previous);
+      for (const content of djContents(m)) dropped.delete(content);
+      if (dropped.size) await djSweep(bucket, dropped).catch(error => djSweepSkipped(`error: ${error?.message || error}`));
+      return json({ published: true, summary });
+    }
+
+    if (action === 'delete' && method === 'POST') {
+      // Borrar es definitivo y afecta a todos los equipos: solo el propietario.
+      if (principal.role !== 'owner') fail('Solo el propietario puede eliminar programas de la nube', 403);
+      const data = await djBody(request), current = await bucket.get(key);
+      if (!current) fail('El programa ya no está en la nube', 404);
+      const previous = await current.json().catch(() => null);
+      // La revisión que el propietario vio en su lista: si otra persona subió cambios mientras tanto, no se borra.
+      // Un programa dañado (que no se puede leer) sí se puede quitar, para no dejarlo atascado en la lista.
+      if (previous && previous.revision !== validId(typeof data.revision === 'string' ? data.revision : '')) fail('El programa cambió en la nube. Actualiza la lista antes de eliminarlo.', 409);
+      await bucket.delete(key);
+      await djSweep(bucket, djContents(previous)).catch(error => djSweepSkipped(`error: ${error?.message || error}`));
+      return json({ deleted: true });
+    }
+  }
+
+  if (path === '/v1/dj/uploads/start' && method === 'POST') {
+    const data = await djBody(request), key = djAudioKey(data.content);
+    if (!Number.isSafeInteger(data.size) || data.size < 1 || data.size > MAX_FILE) fail('Tamaño de canción inválido');
+    const existing = await bucket.head(key);
+    if (existing) {
+      if (existing.size !== data.size) fail('La canción existente tiene otro tamaño', 409);
+      return json({ complete: true });
+    }
+    const upload = await bucket.createMultipartUpload(key, { httpMetadata: { contentType: 'application/octet-stream' }, customMetadata: { size: String(data.size) } });
+    return json({ uploadId: upload.uploadId });
+  }
+
+  if (path === '/v1/dj/uploads/part' && method === 'PUT') {
+    const data = Object.fromEntries(url.searchParams), key = djAudioKey(data.content);
+    const partNumber = Number(data.part), expectedHash = request.headers.get('x-chunk-sha256');
+    if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > 640 || !data.uploadId || data.uploadId.length > 2000 || !HASH.test(expectedHash || '')) fail('Parte inválida');
+    const bytes = await readLimited(request, CHUNK);
+    if (!bytes.length || await digest(bytes) !== expectedHash) fail('La comprobación del archivo no coincide', 422);
+    try {
+      return json(await bucket.resumeMultipartUpload(key, data.uploadId).uploadPart(partNumber, bytes));
+    } catch { fail('La subida parcial caducó. Cancela esta subida y vuelve a iniciarla.', 409); }
+  }
+
+  if (path === '/v1/dj/uploads/complete' && method === 'POST') {
+    const data = await djBody(request), key = djAudioKey(data.content);
+    const existing = await bucket.head(key);
+    if (existing) {
+      if (existing.size !== data.size) fail('La canción existente tiene otro tamaño', 409);
+      return json({ complete: true });
+    }
+    if (!Number.isSafeInteger(data.size) || data.size < 1 || data.size > MAX_FILE || !Array.isArray(data.parts) || data.parts.length !== Math.ceil(data.size / CHUNK)) fail('Subida incompleta');
+    if (data.parts.some((part, index) => part?.partNumber !== index + 1 || typeof part.etag !== 'string')) fail('Partes inválidas');
+    try {
+      const object = await bucket.resumeMultipartUpload(key, data.uploadId).complete(data.parts);
+      if (object.size !== data.size) { await bucket.delete(key); fail('El tamaño recibido no coincide', 422); }
+      return json({ complete: true });
+    } catch (error) { if (error.status) throw error; fail('Subida caducada o incompleta. Cancélala y vuelve a iniciarla.', 409); }
+  }
+
+  if (path === '/v1/dj/uploads/discard' && method === 'POST') {
+    const data = await djBody(request), key = djAudioKey(data.content);
+    // Solo se aborta la subida por partes pendiente: nunca se borra una canción completa que otro programa pueda usar.
+    if (typeof data.uploadId === 'string' && data.uploadId && data.uploadId.length <= 2000) {
+      try { await bucket.resumeMultipartUpload(key, data.uploadId).abort(); } catch { /* ya no existe */ }
+    }
+    return json({ discarded: true });
+  }
+
+  const audioMatch = path.match(/^\/v1\/dj\/audio\/([a-f0-9]{64})$/);
+  if (audioMatch && method === 'GET') {
+    const range = request.headers.get('range')?.match(/^bytes=(\d+)-(\d+)$/);
+    if (!range) fail('Solicita el archivo por partes', 416);
+    const start = Number(range[1]), end = Number(range[2]);
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || end - start + 1 > CHUNK) fail('Rango inválido', 416);
+    const audioKey = djAudioKey(audioMatch[1]);
+    let object;
+    try { object = await bucket.get(audioKey, { range: { offset: start, length: end - start + 1 } }); }
+    catch (error) {
+      // R2 rechaza con un error un rango que empieza después del final del archivo: eso es un 416, no una falla del servicio.
+      const whole = await bucket.head(audioKey).catch(() => null);
+      if (whole && start >= whole.size) fail('Rango fuera del archivo', 416);
+      throw error;
+    }
+    if (!object) fail('No se encontró la canción', 404);
+    if (end >= object.size) fail('Rango fuera del archivo', 416);
+    return new Response(object.body, { status: 206, headers: {
+      'content-type': 'application/octet-stream', 'content-range': `bytes ${start}-${end}/${object.size}`,
+      'content-length': String(end - start + 1), 'accept-ranges': 'bytes', etag: object.httpEtag,
+    } });
+  }
+
+  fail('Ruta no encontrada', 404);
+}
+
 async function route(request, env, principal) {
 
   const bucket = env.ESCENA_BUCKET;
@@ -299,11 +524,13 @@ async function route(request, env, principal) {
     const serverTime = Date.now();
     const { id, name, role, offlineHours } = principal;
     return json({ ok: true, schema: 1, chunkSize: CHUNK, role: role === 'player' ? 'player' : 'master', accessVersion: 2,
-      user: { id, name, role, offlineHours }, permissions: { publish: role !== 'player', manageUsers: role === 'owner' }, features: { reuseAudio: true },
+      user: { id, name, role, offlineHours }, permissions: { publish: role !== 'player', manageUsers: role === 'owner' }, features: { reuseAudio: true, dj: DJ_FEATURE },
       serverTime, offlineUntil: serverTime + offlineHours * 3600000 });
   }
 
   if (path === '/v1/users' || path.startsWith('/v1/users/')) return manageUsers(request, env, principal, path, method);
+
+  if (path.startsWith('/v1/dj/')) return djRoute(request, env, principal, url);
 
   if (path === '/v1/songs' && method === 'GET') {
 

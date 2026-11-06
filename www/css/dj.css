@@ -1240,6 +1240,105 @@
   color: var(--accent);
 }
 
+/* ---------- Programas en la nube ---------- */
+
+.dj-cloud {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.dj-cloud > .btn {
+  align-self: flex-start;
+}
+
+.dj-cloud-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dj-cloud-head h5 {
+  flex: 1;
+  margin: 0;
+  font-size: 14px;
+  color: var(--text-2);
+}
+
+.dj-cloudlist {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 260px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.dj-cloudrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+}
+
+.dj-cloudrow.is-mine {
+  border-color: var(--accent);
+}
+
+.dj-cloudrow-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.dj-cloudrow-text b {
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.dj-cloudrow-meta {
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+
+.dj-cloudrow .btn,
+.dj-cloudrow .icon-btn {
+  flex: none;
+}
+
+.dj-banner .btn {
+  flex: none;
+}
+
+/* En pantallas angostas el avance de la nube pasa a una segunda línea (el título no se aprieta) */
+@media (max-width: 560px) {
+  .dj-banner[data-banner='cloud'] {
+    flex-wrap: wrap;
+  }
+
+  .dj-banner[data-banner='cloud'] .dj-banner-sub {
+    order: 3;
+    flex: 1 0 100%;
+    max-width: none;
+    padding-left: 28px;
+  }
+}
+
+.dj-import-mode {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 /* ---------- Pantallas bajas (teléfono de lado) ---------- */
 
 @media (max-height: 560px) and (orientation: landscape) and (max-width: 959px) {

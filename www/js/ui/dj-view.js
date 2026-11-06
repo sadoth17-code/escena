@@ -29,7 +29,21 @@ const fadeText = (seconds) => (seconds <= 0 ? 'corte' : `${Number.isInteger(seco
 const plural = (count, one, many) => `${count} ${count === 1 ? one : many}`;
 const STATUS_TEXT = { ready: 'Lista', loading: 'Preparando…', cold: 'Se carga al pulsar', missing: 'Falta el archivo', none: '' };
 
-export function createDjView({ dj }) {
+// Hace cuánto fue algo, en palabras (para la lista de programas de la nube).
+function fmtAgo(time, now = Date.now()) {
+  if (!time) return '';
+  const seconds = Math.max(0, Math.round((now - time) / 1000));
+  if (seconds < 90) return 'hace un momento';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `hace ${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `hace ${hours} h`;
+  const days = Math.round(hours / 24);
+  if (days < 30) return `hace ${days} ${days === 1 ? 'día' : 'días'}`;
+  return new Date(time).toLocaleDateString('es', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+export function createDjView({ dj, djCloud = null }) {
   ensureStyles();
   const state = dj.state;
   let active = false;
@@ -50,11 +64,43 @@ export function createDjView({ dj }) {
 
   const banners = h('div', { class: 'dj-banners', role: 'status', 'aria-live': 'polite' });
 
+  // Aviso mientras se sube o se trae un programa de la nube (con «Cancelar» mientras se puede).
+  function cloudBanner(busy) {
+    const name = busy.name ? `«${busy.name}»` : 'el programa';
+    const percent = busy.bytesTotal ? Math.min(100, Math.floor((busy.bytesDone / busy.bytesTotal) * 100)) : 0;
+    const bytes = busy.bytesTotal ? `${fmtBytes(busy.bytesDone)} de ${fmtBytes(busy.bytesTotal)}` : '';
+    const withFile = (text) => [busy.file, text].filter(Boolean).join(' · ');
+    let title;
+    let sub = busy.file;
+    if (busy.kind === 'delete') title = `Eliminando ${name} de tu nube…`;
+    else if (busy.kind === 'download') {
+      title = busy.filesTotal ? `Trayendo ${name} de tu nube… ${Math.min(busy.filesDone, busy.filesTotal)} de ${busy.filesTotal}` : `Trayendo ${name} de tu nube…`;
+      sub = withFile(bytes);
+    } else if (busy.phase === 'publish') title = `Guardando ${name} en tu nube…`;
+    else if (busy.phase === 'upload') {
+      title = `Subiendo ${name} a tu nube… ${percent}%`;
+      sub = withFile(bytes);
+    } else if (busy.phase === 'hash') title = `Preparando ${name}… ${Math.min(busy.filesDone, busy.filesTotal)} de ${busy.filesTotal}`;
+    else title = `Preparando ${name}…`;
+    return h(
+      'div',
+      { class: 'dj-banner is-info', 'data-banner': 'cloud', 'data-phase': busy.phase },
+      h('span', { class: 'spinner' }),
+      h('b', { text: title }),
+      sub ? h('span', { class: 'dj-banner-sub', text: sub }) : null,
+      busy.cancelable ? h('button', { type: 'button', class: 'btn small', 'data-act': 'cloud-cancel', onClick: () => djCloud.cancel() }, 'Cancelar') : null
+    );
+  }
+
   function renderBanners() {
     const learning = state.learning;
     const importing = state.importing;
     const exporting = state.exporting;
-    const signature = [state.audioBlocked, state.storage, learning && learning.label, importing && `${importing.done}/${importing.total}/${importing.name}/${importing.label || ''}`, exporting && `${exporting.done}/${exporting.total}/${exporting.name}`].join('|');
+    const cloudBusy = djCloud ? djCloud.state.busy : null;
+    // Al traer un programa de la nube, su propio aviso (con los bytes) reemplaza al de «Trayendo el programa…».
+    const showImporting = importing && !(cloudBusy && cloudBusy.kind === 'download');
+    const cloudKey = cloudBusy && [cloudBusy.kind, cloudBusy.phase, cloudBusy.name, cloudBusy.file, cloudBusy.filesDone, cloudBusy.filesTotal, cloudBusy.bytesDone, cloudBusy.bytesTotal, cloudBusy.cancelable].join('/');
+    const signature = [state.audioBlocked, state.storage, learning && learning.label, importing && `${importing.done}/${importing.total}/${importing.name}/${importing.label || ''}`, exporting && `${exporting.done}/${exporting.total}/${exporting.name}`, cloudKey].join('|');
     refresh('banners', signature, () => {
       const list = [];
       if (learning) {
@@ -78,7 +124,7 @@ export function createDjView({ dj }) {
           )
         );
       }
-      if (importing) {
+      if (showImporting) {
         list.push(
           h(
             'div',
@@ -89,6 +135,7 @@ export function createDjView({ dj }) {
           )
         );
       }
+      if (cloudBusy) list.push(cloudBanner(cloudBusy));
       if (exporting) {
         list.push(
           h(
@@ -762,6 +809,7 @@ export function createDjView({ dj }) {
   function openTransferModal() {
     const scope = { value: 'current' };
     let modal = null;
+    let offCloud = () => {};
     const warn = h('p', { class: 'dj-hint is-warn', 'data-role': 'transfer-warn', hidden: true });
     const run = async (audio) => {
       if (modal) modal.close();
@@ -818,10 +866,112 @@ export function createDjView({ dj }) {
             },
           })
         : null;
+
+    // ---- Con tu nube: subir este programa y traer los que hay en la nube (desde cualquier dispositivo conectado a ella).
+    const cloudBox = djCloud ? h('section', { class: 'dj-cloud', 'data-role': 'cloud' }) : null;
+    const runUpload = async (asNew) => {
+      if (modal) modal.close();
+      await djCloud.upload(dj.program().id, { asNew });
+    };
+    const getFromCloud = async (entry) => {
+      const found = await djCloud.inspect(entry);
+      if (!found) return;
+      if (modal) modal.close();
+      openImportModal(found, null);
+    };
+    const removeFromCloud = async (entry) => {
+      const ok = await confirmDialog({
+        title: 'Eliminar de la nube',
+        message: `¿Eliminar «${entry.name}» de tu nube? Se borra para todos los equipos conectados; los que ya lo trajeron conservan su copia.`,
+        confirm: 'Eliminar',
+        danger: true,
+      });
+      if (ok) await djCloud.remove(entry);
+    };
+    const cloudRow = (entry, busy) => {
+      const mine = state.programs.some((item) => item.cloud && item.cloud.endpoint === djCloud.endpoint && item.cloud.id === entry.id);
+      const meta = [plural(entry.participants, 'participante', 'participantes'), plural(entry.songs, 'canción', 'canciones'), fmtBytes(entry.size), entry.by, fmtAgo(entry.updatedAt)].filter(Boolean).join(' · ');
+      const trash = djCloud.canDelete ? iconButton({ name: 'trash', label: `Eliminar «${entry.name}» de la nube`, onClick: () => removeFromCloud(entry) }) : null;
+      if (trash) trash.dataset.act = 'cloud-delete';
+      return h(
+        'li',
+        { class: `dj-cloudrow${mine ? ' is-mine' : ''}`, 'data-id': entry.id },
+        h('div', { class: 'dj-cloudrow-text' }, h('b', { text: entry.name }), h('span', { class: 'dj-cloudrow-meta', text: meta })),
+        h('button', { type: 'button', class: 'btn small', 'data-act': 'cloud-get', disabled: busy, onClick: () => getFromCloud(entry) }, icon('download', 16), 'Traer'),
+        trash
+      );
+    };
+    const drawCloud = () => {
+      if (!cloudBox) return;
+      const cs = djCloud.state;
+      const busy = Boolean(cs.busy);
+      const parts = [h('h4', { class: 'sub', text: 'Con tu nube' })];
+      if (!djCloud.connected) {
+        parts.push(h('p', { class: 'dj-hint', 'data-role': 'cloud-off', text: 'Conecta tu nube en la pestaña Nube para subir tus programas y traerlos en cualquier otro dispositivo.' }));
+        cloudBox.replaceChildren(...parts);
+        return;
+      }
+      const current = dj.program();
+      const preview = dj.previewPackage('current');
+      const status = current ? djCloud.statusOf(current) : null;
+      const remote = status && status.remote;
+      const notes = [];
+      if (status && status.linked) {
+        if (status.gone) notes.push('Este programa estuvo en tu nube, pero ya no está: al subirlo se vuelve a crear.');
+        else if (status.behind) notes.push(`La nube tiene una versión más nueva de este programa${remote && remote.by ? `, subida por ${remote.by}` : ''}. Tráela para ponerlo al día.`);
+        if (status.localChanges && !status.gone) notes.push('Tienes cambios en este programa que todavía no están en la nube.');
+        if (!status.gone && !status.behind && !status.localChanges && remote) notes.push(`Este programa está en tu nube y al día${remote.by ? ` (subido por ${remote.by}, ${fmtAgo(remote.updatedAt)})` : ''}.`);
+      }
+      if (notes.length) parts.push(h('p', { class: 'dj-hint', 'data-role': 'cloud-status', text: notes.join(' ') }));
+      const updating = Boolean(status && status.linked && !status.gone);
+      const upload = choice({
+        act: 'cloud-upload',
+        iconName: 'cloud',
+        title: current ? (updating ? `Subir los cambios de «${current.name}»` : `Subir «${current.name}» a la nube`) : 'Subir a la nube',
+        detail: '',
+        onClick: () => runUpload(false),
+      });
+      let why = '';
+      if (!djCloud.canUpload) why = djCloud.canRead && !djCloud.accountCanUpload ? 'Tu cuenta solo puede traer programas de la nube. El propietario puede darte permiso de editor para subirlos.' : 'Verifica tu acceso con internet (pestaña Nube) para subir programas.';
+      else if (!preview.withAudio) why = 'Este programa no tiene canciones con audio en este dispositivo: añádelas primero.';
+      else if (state.transport === 'playing') why = 'Detén la música para subir el programa.';
+      upload.setDetail(why || `${plural(preview.participants, 'participante', 'participantes')}, ${plural(preview.withAudio, 'canción', 'canciones')}: unos ${fmtBytes(preview.bytes)}. Las canciones que ya estén en tu nube no se vuelven a subir.`);
+      upload.el.disabled = busy || Boolean(why);
+      parts.push(upload.el);
+      if (updating) {
+        parts.push(h('button', { type: 'button', class: 'btn small', 'data-act': 'cloud-upload-new', disabled: busy || Boolean(why), onClick: () => runUpload(true) }, 'Subir como programa nuevo'));
+      }
+      parts.push(
+        h(
+          'div',
+          { class: 'dj-cloud-head' },
+          h('h5', { text: 'En tu nube' }),
+          h('button', { type: 'button', class: 'btn small', 'data-act': 'cloud-refresh', 'aria-busy': cs.loading ? 'true' : 'false', onClick: () => djCloud.refresh() }, cs.loading ? 'Consultando…' : 'Actualizar')
+        )
+      );
+      if (cs.error) parts.push(h('p', { class: 'dj-hint is-warn', 'data-role': 'cloud-error', text: cs.error }));
+      else if (!cs.loaded) parts.push(h('p', { class: 'dj-hint', 'data-role': 'cloud-loading', text: 'Consultando tu nube…' }));
+      else if (!cs.programs.length) parts.push(h('p', { class: 'dj-hint', 'data-role': 'cloud-empty', text: 'Todavía no hay programas del DJ en tu nube.' }));
+      else parts.push(h('ul', { class: 'dj-cloudlist', 'data-role': 'cloud-list' }, cs.programs.map((entry) => cloudRow(entry, busy))));
+      cloudBox.replaceChildren(...parts);
+    };
+    // Al redibujar se conserva el foco en el mismo botón (o, si ya no existe, en la ventana): así el teclado sigue funcionando y Escape cierra.
+    const renderCloud = () => {
+      if (!cloudBox) return;
+      const active = document.activeElement;
+      const spot = active && cloudBox.contains(active) ? { act: active.dataset.act || '', id: (active.closest('[data-id]') || { dataset: {} }).dataset.id || '' } : null;
+      drawCloud();
+      if (!spot || !modal) return;
+      const next = spot.act ? cloudBox.querySelector(`${spot.id ? `[data-id="${spot.id}"] ` : ''}[data-act="${spot.act}"]`) : null;
+      if (next && !next.disabled) next.focus({ preventScroll: true });
+      else modal.el.focus({ preventScroll: true });
+    };
+
     const body = h(
       'div',
       { class: 'dj-transfer-body' },
-      h('p', { class: 'dj-hint', text: 'Las canciones del DJ se guardan solo en este dispositivo: no se suben a internet. Para usar el mismo programa en otra computadora, crea un archivo aquí, cópialo (USB, correo, tu nube personal…) y ábrelo allá.' }),
+      h('p', { class: 'dj-hint', text: 'Las canciones del DJ se guardan en este dispositivo. Para usar el mismo programa en otro, súbelo a tu nube de Escena, o crea un archivo y cópialo (USB, correo…): con el archivo las canciones no se suben a internet.' }),
+      cloudBox,
       h('h4', { class: 'sub', text: 'Llevar a otra PC' }),
       scopeSeg ? scopeSeg.el : null,
       full.el,
@@ -830,8 +980,14 @@ export function createDjView({ dj }) {
       h('h4', { class: 'sub', text: 'Traer a esta PC' }),
       pick.el
     );
-    modal = openModal({ title: 'Llevar el programa a otra PC', size: 'md', className: 'dj-modal dj-transfer', body, actions: [{ label: 'Cerrar', onClick: (api) => api.close() }] });
+    modal = openModal({ title: 'Llevar el programa a otra PC', size: 'md', className: 'dj-modal dj-transfer', body, onClose: () => offCloud(), actions: [{ label: 'Cerrar', onClick: (api) => api.close() }] });
     update();
+    if (djCloud) {
+      renderCloud();
+      offCloud = djCloud.on('change', renderCloud);
+      // Se consulta la nube al abrir: pudo cambiar desde otro dispositivo.
+      if (djCloud.connected) djCloud.refresh();
+    }
     return modal;
   }
 
@@ -840,26 +996,71 @@ export function createDjView({ dj }) {
     if (result) openImportModal(result, file);
   }
 
-  function openImportModal({ opened, summary }, file) {
+  // Qué trae un paquete (archivo) o un programa de la nube, y qué pasará al traerlo. `linked` (solo nube): el programa de
+  // este dispositivo que ya viene de ese mismo programa de la nube.
+  function openImportModal({ opened, summary, linked = null }, file) {
+    const fromCloud = summary.kind === 'cloud';
     const playing = state.transport === 'playing';
     let useSettings = summary.hasSettings && !(summary.hasBindings && summary.customBindings);
     const shown = summary.programs.slice(0, 8);
     const facts = [];
     if (summary.withAudio) facts.push(h('li', { 'data-fact': 'audio' }, h('b', { text: String(summary.withAudio) }), ` ${summary.withAudio === 1 ? 'canción nueva' : 'canciones nuevas'} con audio · ${fmtBytes(summary.audioBytes)} · se guardan en este dispositivo`));
     if (summary.reused) facts.push(h('li', { 'data-fact': 'reused' }, h('b', { text: String(summary.reused) }), ` ${summary.reused === 1 ? 'ya estaba' : 'ya estaban'} en esta PC · no se repiten`));
-    if (summary.linked) facts.push(h('li', { 'data-fact': 'linked' }, h('b', { text: String(summary.linked) }), ` sin audio en el paquete, pero ya ${summary.linked === 1 ? 'tienes un archivo con ese nombre' : 'tienes archivos con esos nombres'} · se vinculan solas`));
+    if (summary.linked) facts.push(h('li', { 'data-fact': 'linked' }, h('b', { text: String(summary.linked) }), ` sin audio en ${fromCloud ? 'la nube' : 'el paquete'}, pero ya ${summary.linked === 1 ? 'tienes un archivo con ese nombre' : 'tienes archivos con esos nombres'} · se vinculan solas`));
     if (summary.waiting) facts.push(h('li', { 'data-fact': 'waiting' }, h('b', { text: String(summary.waiting) }), ` sin audio · ${summary.waiting === 1 ? 'queda esperando su archivo' : 'quedan esperando su archivo'}: al añadirlo con «Añadir canciones» se vincula por el nombre`));
+    const source = fromCloud ? 'de la nube' : 'del paquete';
     const settingsRow = summary.hasSettings
       ? (() => {
-          const toggle = createSwitch({ value: useSettings, label: 'Usar también la mezcla y los pads del paquete', onChange: (value) => (useSettings = value) });
-          const detail = summary.hasBindings ? (summary.customBindings ? 'Reemplaza los pads y las teclas que tienes asignados en este equipo.' : 'Los pads y las teclas quedan asignados igual que en la otra PC.') : 'Duración de la mezcla y avance automático.';
-          return h('div', { class: 'dj-switch-row', 'data-role': 'import-settings' }, h('div', { class: 'dj-switch-text' }, h('strong', { text: 'Usar también la mezcla y los pads del paquete' }), h('span', { text: detail })), toggle.el);
+          const toggle = createSwitch({ value: useSettings, label: `Usar también la mezcla y los pads ${source}`, onChange: (value) => (useSettings = value) });
+          const detail = summary.hasBindings ? (summary.customBindings ? 'Reemplaza los pads y las teclas que tienes asignados en este equipo.' : `Los pads y las teclas quedan asignados igual que en ${fromCloud ? 'el equipo que lo subió' : 'la otra PC'}.`) : 'Duración de la mezcla y avance automático.';
+          return h('div', { class: 'dj-switch-row', 'data-role': 'import-settings' }, h('div', { class: 'dj-switch-text' }, h('strong', { text: `Usar también la mezcla y los pads ${source}` }), h('span', { text: detail })), toggle.el);
         })()
       : null;
+
+    // Si ese programa ya está en este dispositivo (se trajo o se subió desde aquí), se puede actualizar en vez de duplicarlo.
+    let mode = 'new';
+    let modeBlock = null;
+    let modeNote = null;
+    let modalApi = null;
+    if (fromCloud && linked) {
+      const changed = Boolean(djCloud && djCloud.statusOf(linked).localChanges);
+      const canUpdate = state.transport === 'idle';
+      const describe = () => {
+        if (mode === 'update') return `Se reemplazan los participantes de «${linked.name}» por los de la nube.${changed ? ' Los cambios de este equipo que no subiste se pierden.' : ''}`;
+        return `Se crea un programa nuevo y «${linked.name}» no cambia.`;
+      };
+      if (canUpdate) {
+        mode = changed ? 'new' : 'update';
+        const seg = createSegmented({
+          options: [
+            { value: 'update', label: 'Actualizar mi programa' },
+            { value: 'new', label: 'Traer como programa nuevo' },
+          ],
+          value: mode,
+          label: 'Qué hacer con el programa de la nube',
+          className: 'dj-scope',
+          onChange: (value) => {
+            mode = value;
+            setText(modeNote, describe());
+            if (modalApi) modalApi.setActions(actions());
+          },
+        });
+        modeNote = h('p', { class: `dj-hint${changed ? ' is-warn' : ''}`, 'data-role': 'import-mode', text: describe() });
+        modeBlock = h('div', { class: 'dj-import-mode', 'data-role': 'import-linked' }, h('p', { class: 'dj-hint', text: `Ya tienes «${linked.name}» en este dispositivo, vinculado a este programa de la nube.` }), seg.el, modeNote);
+      } else {
+        modeBlock = h('p', { class: 'dj-hint', 'data-role': 'import-linked', text: `Ya tienes «${linked.name}» en este dispositivo. Para actualizarlo detén primero la música; ahora se traería como programa nuevo.` });
+      }
+    }
+
+    const by = fromCloud && opened.info ? opened.info.by : '';
+    const when = fromCloud && opened.info ? opened.info.publishedAt : 0;
+    const fileLine = fromCloud
+      ? ` · en tu nube${by ? ` · subido por ${by}` : ''}${when ? ` · ${fmtAgo(when)}` : ''}`
+      : ` · ${summary.kind === 'zip' ? fmtBytes(file.size) : 'solo el programa, sin audio'}`;
     const body = h(
       'div',
       { class: 'dj-import' },
-      h('p', { class: 'dj-import-file' }, h('b', { text: summary.fileName || 'Paquete' }), ` · ${summary.kind === 'zip' ? fmtBytes(file.size) : 'solo el programa, sin audio'}`),
+      h('p', { class: 'dj-import-file' }, h('b', { text: summary.fileName || 'Paquete' }), fileLine),
       h(
         'ul',
         { class: 'dj-sumlist', 'data-role': 'programs' },
@@ -867,27 +1068,30 @@ export function createDjView({ dj }) {
         summary.programs.length > shown.length ? h('li', { text: `y ${summary.programs.length - shown.length} más` }) : null
       ),
       facts.length ? h('ul', { class: 'dj-sumlist is-facts', 'data-role': 'songs' }, facts) : null,
+      modeBlock,
       settingsRow,
       playing ? h('p', { class: 'dj-hint is-warn', text: 'Hay música sonando. Detenla (o ponla en pausa) antes de traer el programa.' }) : null
     );
-    openModal({
-      title: summary.programs.length === 1 ? 'Traer un programa' : 'Traer programas',
+    const actions = () => [
+      { label: 'Cancelar', onClick: (api) => api.close() },
+      {
+        label: fromCloud && linked && mode === 'update' ? 'Actualizar el programa' : summary.programs.length === 1 ? 'Traer el programa' : 'Traer los programas',
+        kind: 'primary',
+        icon: 'check',
+        disabled: playing,
+        onClick: (api) => {
+          api.close();
+          if (fromCloud) djCloud.download(opened, { applySettings: useSettings, replaceId: linked && mode === 'update' ? linked.id : null });
+          else dj.importPackage(opened, { applySettings: useSettings });
+        },
+      },
+    ];
+    modalApi = openModal({
+      title: fromCloud ? 'Traer un programa de la nube' : summary.programs.length === 1 ? 'Traer un programa' : 'Traer programas',
       size: 'md',
       className: 'dj-modal dj-import-modal',
       body,
-      actions: [
-        { label: 'Cancelar', onClick: (api) => api.close() },
-        {
-          label: summary.programs.length === 1 ? 'Traer el programa' : 'Traer los programas',
-          kind: 'primary',
-          icon: 'check',
-          disabled: playing,
-          onClick: (api) => {
-            api.close();
-            dj.importPackage(opened, { applySettings: useSettings });
-          },
-        },
-      ],
+      actions: actions(),
     });
   }
 
@@ -1068,6 +1272,7 @@ export function createDjView({ dj }) {
   }
 
   const offChange = dj.on('change', schedule);
+  const offCloudChange = djCloud ? djCloud.on('change', schedule) : () => {};
   const offSignal = dj.on('signal', () => {
     if (active) updateMonitor();
   });
@@ -1090,6 +1295,7 @@ export function createDjView({ dj }) {
     openItemEditor,
     destroy() {
       offChange();
+      offCloudChange();
       offSignal();
       window.removeEventListener('keydown', onKeyDown, true);
       window.removeEventListener('keyup', onKeyUp, true);
